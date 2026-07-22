@@ -1152,6 +1152,35 @@ const ownCommands = [
       .addStringOption(o => o.setName('items').setDescription('Items to add, separated by commas or newlines').setRequired(true)))
     .addSubcommand(sub => sub.setName('check').setDescription('Check stock count for a product')
       .addStringOption(o => o.setName('product_id').setDescription('Product tier ID').setRequired(true))),
+  new SlashCommandBuilder().setName('web-balance').setDescription('Staff: View or adjust a website account balance')
+    .addSubcommand(sub => sub.setName('view').setDescription('View a linked account balance by Discord user')
+      .addUserOption(o => o.setName('user').setDescription('Discord user linked to the website account').setRequired(true)))
+    .addSubcommand(sub => sub.setName('adjust').setDescription('Credit or debit a website account balance')
+      .addUserOption(o => o.setName('user').setDescription('Discord user linked to the website account').setRequired(true))
+      .addNumberOption(o => o.setName('amount').setDescription('Dollar amount — positive to credit, negative to debit').setRequired(true))
+      .addStringOption(o => o.setName('reason').setDescription('Reason / note for the ledger').setRequired(false))),
+  new SlashCommandBuilder().setName('webstatus').setDescription('Staff: Set a website product status (undetected/updating/detected)')
+    .addStringOption(o => o.setName('game_name').setDescription('Game / category name (exactly as on the site)').setRequired(true))
+    .addStringOption(o => o.setName('product_name').setDescription('Product name (exactly as on the site)').setRequired(true))
+    .addStringOption(o => o.setName('status').setDescription('New status').setRequired(true)
+      .addChoices(
+        { name: 'Undetected', value: 'undetected' },
+        { name: 'Updating', value: 'updating' },
+        { name: 'Detected', value: 'detected' },
+      ))
+    .addStringOption(o => o.setName('note').setDescription('Optional note shown with the status').setRequired(false)),
+  new SlashCommandBuilder().setName('webreviews').setDescription('Staff: Moderate website reviews')
+    .addSubcommand(sub => sub.setName('list').setDescription('List the latest reviews (pending shown first)'))
+    .addSubcommand(sub => sub.setName('approve').setDescription('Approve a review so it shows on the site')
+      .addStringOption(o => o.setName('review_id').setDescription('Review ID (from /webreviews list)').setRequired(true)))
+    .addSubcommand(sub => sub.setName('reject').setDescription('Unapprove a review (hide it from the site)')
+      .addStringOption(o => o.setName('review_id').setDescription('Review ID (from /webreviews list)').setRequired(true)))
+    .addSubcommand(sub => sub.setName('delete').setDescription('Permanently delete a review')
+      .addStringOption(o => o.setName('review_id').setDescription('Review ID (from /webreviews list)').setRequired(true))),
+  new SlashCommandBuilder().setName('claim-customer').setDescription('Verify a paid order and grant the customer role')
+    .addStringOption(o => o.setName('order_id').setDescription('Your order / invoice ID').setRequired(true))
+    .addStringOption(o => o.setName('email').setDescription('The email used on the order').setRequired(true))
+    .addUserOption(o => o.setName('user').setDescription('Staff only: grant to another member').setRequired(false)),
 ].map(c => c.toJSON());
 
 // Merge with support module commands
@@ -2492,6 +2521,183 @@ client.on('interactionCreate', async interaction => {
           } catch (err) {
             return interaction.editReply({ content: `❌ Failed: ${err.message}` });
           }
+        }
+      }
+
+      // ── /web-balance (website wallet — view / adjust) ──────────────────────
+      if (cmd === 'web-balance') {
+        if (!hasAccess(interaction)) return interaction.reply({ content: '❌ No permission.', flags: 64 });
+        await interaction.deferReply({ ephemeral: true });
+        const sub = interaction.options.getSubcommand();
+        const target = interaction.options.getUser('user');
+
+        if (sub === 'view') {
+          try {
+            const res = await axios.get(`${BACKEND_URL}/api/balance/by-discord/${target.id}`, { params: { secret: API_SECRET } });
+            const b = res.data;
+            const embed = new EmbedBuilder()
+              .setColor(0x00ff88).setTitle('💳 Website Balance')
+              .addFields(
+                { name: 'Account', value: b.username || 'N/A', inline: true },
+                { name: 'Email', value: b.email || 'N/A', inline: true },
+                { name: 'Balance', value: `$${Number(b.balance).toFixed(2)}`, inline: true },
+                { name: 'Discord', value: `<@${target.id}>`, inline: true },
+              ).setTimestamp();
+            return interaction.editReply({ embeds: [embed] });
+          } catch (err) {
+            const msg = err.response?.data?.error || err.message;
+            return interaction.editReply({ content: `❌ ${msg}` });
+          }
+        }
+
+        if (sub === 'adjust') {
+          const amount = interaction.options.getNumber('amount');
+          const reason = interaction.options.getString('reason') || `Manual adjustment by ${interaction.user.tag}`;
+          if (!amount || amount === 0) return interaction.editReply({ content: '❌ Amount must be non-zero.' });
+          const amount_cents = Math.round(amount * 100);
+          try {
+            const res = await axios.post(`${BACKEND_URL}/api/balance/adjust`, {
+              secret: API_SECRET, discord_id: target.id, amount_cents, description: reason,
+            });
+            const embed = new EmbedBuilder()
+              .setColor(amount >= 0 ? 0x00ff00 : 0xffb400)
+              .setTitle(amount >= 0 ? '➕ Balance Credited' : '➖ Balance Debited')
+              .addFields(
+                { name: 'User', value: `<@${target.id}>`, inline: true },
+                { name: 'Change', value: `${amount >= 0 ? '+' : '-'}$${Math.abs(amount).toFixed(2)}`, inline: true },
+                { name: 'New Balance', value: `$${Number(res.data.balance).toFixed(2)}`, inline: true },
+                { name: 'Reason', value: reason, inline: false },
+              ).setFooter({ text: `By ${interaction.user.tag}` }).setTimestamp();
+            return interaction.editReply({ embeds: [embed] });
+          } catch (err) {
+            const msg = err.response?.data?.error || err.message;
+            return interaction.editReply({ content: `❌ ${msg}` });
+          }
+        }
+      }
+
+      // ── /webstatus (website product status) ────────────────────────────────
+      if (cmd === 'webstatus') {
+        if (!hasAccess(interaction)) return interaction.reply({ content: '❌ No permission.', flags: 64 });
+        await interaction.deferReply({ ephemeral: true });
+        const game_name = interaction.options.getString('game_name');
+        const product_name = interaction.options.getString('product_name');
+        const status = interaction.options.getString('status');
+        const note = interaction.options.getString('note') || null;
+        try {
+          await axios.post(`${BACKEND_URL}/api/status/update`, {
+            secret: API_SECRET, game_name, product_name, status, note,
+          });
+          const emoji = { undetected: '🟢', updating: '🟡', detected: '🔴' }[status] || '⚪';
+          const embed = new EmbedBuilder()
+            .setColor(status === 'undetected' ? 0x00ff00 : status === 'updating' ? 0xffb400 : 0xff0000)
+            .setTitle(`${emoji} Website Status Updated`)
+            .addFields(
+              { name: 'Product', value: `${game_name} — ${product_name}`, inline: false },
+              { name: 'Status', value: status.toUpperCase(), inline: true },
+            ).setFooter({ text: `By ${interaction.user.tag}` }).setTimestamp();
+          if (note) embed.addFields({ name: 'Note', value: note, inline: false });
+          return interaction.editReply({ embeds: [embed] });
+        } catch (err) {
+          const msg = err.response?.data?.error || err.message;
+          return interaction.editReply({ content: `❌ ${msg}` });
+        }
+      }
+
+      // ── /webreviews (moderate website reviews) ─────────────────────────────
+      if (cmd === 'webreviews') {
+        if (!hasAccess(interaction)) return interaction.reply({ content: '❌ No permission.', flags: 64 });
+        await interaction.deferReply({ ephemeral: true });
+        const sub = interaction.options.getSubcommand();
+
+        if (sub === 'list') {
+          try {
+            const res = await axios.get(`${BACKEND_URL}/api/reviews/admin/all`, { params: { secret: API_SECRET } });
+            const reviews = res.data.reviews || [];
+            if (!reviews.length) return interaction.editReply({ content: 'No reviews submitted yet.' });
+            // Pending first, then most recent, cap at 15 for embed size.
+            reviews.sort((a, b) => (a.approved === b.approved ? 0 : a.approved ? 1 : -1));
+            const lines = reviews.slice(0, 15).map(r => {
+              const stars = '★'.repeat(r.rating) + '☆'.repeat(5 - r.rating);
+              const flag = r.approved ? '✅' : '🕗 PENDING';
+              const body = (r.body || '').replace(/\n/g, ' ').slice(0, 80);
+              return `\`#${r.id}\` ${flag} ${stars} — **${r.display_name || 'Anon'}**: ${body}`;
+            });
+            const embed = new EmbedBuilder()
+              .setColor(0x5865F2).setTitle('📝 Website Reviews')
+              .setDescription(lines.join('\n'))
+              .setFooter({ text: 'Use /webreviews approve|reject|delete <review_id>' }).setTimestamp();
+            return interaction.editReply({ embeds: [embed] });
+          } catch (err) {
+            const msg = err.response?.data?.error || err.message;
+            return interaction.editReply({ content: `❌ ${msg}` });
+          }
+        }
+
+        const review_id = interaction.options.getString('review_id');
+        if (sub === 'approve' || sub === 'reject') {
+          try {
+            await axios.patch(`${BACKEND_URL}/api/reviews/${review_id}/approve`, {
+              secret: API_SECRET, approved: sub === 'approve',
+            });
+            return interaction.editReply({ content: `${sub === 'approve' ? '✅ Approved' : '🚫 Unapproved'} review \`#${review_id}\`.` });
+          } catch (err) {
+            const msg = err.response?.data?.error || err.message;
+            return interaction.editReply({ content: `❌ ${msg}` });
+          }
+        }
+        if (sub === 'delete') {
+          try {
+            await axios.delete(`${BACKEND_URL}/api/reviews/${review_id}`, { params: { secret: API_SECRET } });
+            return interaction.editReply({ content: `🗑 Deleted review \`#${review_id}\`.` });
+          } catch (err) {
+            const msg = err.response?.data?.error || err.message;
+            return interaction.editReply({ content: `❌ ${msg}` });
+          }
+        }
+      }
+
+      // ── /claim-customer (verify a paid order → grant customer role) ────────
+      if (cmd === 'claim-customer') {
+        await interaction.deferReply({ ephemeral: true });
+        const order_id = interaction.options.getString('order_id');
+        const email = interaction.options.getString('email');
+        const otherUser = interaction.options.getUser('user');
+        // Only staff may grant the role to someone other than themselves.
+        if (otherUser && otherUser.id !== interaction.user.id && !hasAccess(interaction)) {
+          return interaction.editReply({ content: '❌ Only staff can grant the role to another member.' });
+        }
+        const targetMember = otherUser && hasAccess(interaction)
+          ? await interaction.guild.members.fetch(otherUser.id).catch(() => null)
+          : interaction.member;
+        if (!targetMember) return interaction.editReply({ content: '❌ Could not resolve the target member.' });
+
+        try {
+          const res = await axios.post(`${BACKEND_URL}/api/orders/verify-claim`, {
+            secret: API_SECRET, order_id, email,
+          });
+          const v = res.data;
+          if (!v.email_match) {
+            return interaction.editReply({ content: '❌ That email does not match the order on record.' });
+          }
+          if (!v.paid) {
+            return interaction.editReply({ content: `❌ Order \`${order_id}\` is **${v.status}** — only paid/delivered orders qualify.` });
+          }
+
+          const roleName = process.env.CUSTOMER_ROLE_NAME || 'Customer';
+          let role = interaction.guild.roles.cache.find(r => r.name === roleName);
+          if (!role) role = await interaction.guild.roles.create({ name: roleName, color: 0x00ff88, reason: 'Customer role for verified purchases' }).catch(() => null);
+          if (!role) return interaction.editReply({ content: '❌ Could not find or create the Customer role.' });
+
+          await targetMember.roles.add(role).catch(() => {});
+          const embed = new EmbedBuilder()
+            .setColor(0x00ff88).setTitle('✅ Customer Verified')
+            .setDescription(`<@${targetMember.id}> has been granted the **${roleName}** role for order \`${order_id}\`.`)
+            .setTimestamp();
+          return interaction.editReply({ embeds: [embed] });
+        } catch (err) {
+          const msg = err.response?.data?.error || err.message;
+          return interaction.editReply({ content: `❌ Order not found or error: ${msg}` });
         }
       }
     }
