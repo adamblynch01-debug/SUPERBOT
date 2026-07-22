@@ -84,12 +84,16 @@ CREATE TABLE IF NOT EXISTS products (
   guild_id      TEXT NOT NULL REFERENCES guilds(guild_id) ON DELETE CASCADE,
   game_name     TEXT NOT NULL,
   name          TEXT NOT NULL,
+  subtitle      TEXT,                            -- cheat.subtitle (short tagline)
+  description   TEXT,                            -- long marketing copy (optional)
   tag           TEXT,
   specs         TEXT,
   platforms     TEXT[],                          -- e.g. {'Windows','Steam'}
   spoofer       BOOLEAN NOT NULL DEFAULT false,
   sections      JSONB NOT NULL DEFAULT '[]',     -- [{title, features:[...]}]
-  media         JSONB NOT NULL DEFAULT '{}',     -- {youtube, video, screenshot, screenshot2, gif}
+  media         JSONB NOT NULL DEFAULT '{}',     -- {youtube, vimeo, video, screenshot, screenshot2, gif}
+  tab           TEXT,                            -- tabbed games (Services/HWID Spoofer/GTA V): tab name
+  dropdown      JSONB,                           -- {label, options:[{name,price}]} for dropdown products
   status        TEXT NOT NULL DEFAULT 'undetected', -- undetected | updating | detected
   hidden        BOOLEAN NOT NULL DEFAULT false,
   sort_order    INTEGER NOT NULL DEFAULT 0,
