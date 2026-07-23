@@ -95,6 +95,55 @@ async function handleDelivery(order_id, discord_id, email, goods, guildId, disco
   }
 }
 
+// Resolve the #vouches channel id from guild_settings, falling back to the
+// original guild's known channel — same precedence as index.js getGuildSettings.
+async function getVouchesChannelId(guildId) {
+  try {
+    const { rows } = await query(
+      `SELECT vouches_channel_id FROM guild_settings WHERE guild_id = $1`,
+      [guildId]
+    );
+    return rows[0]?.vouches_channel_id || process.env.VOUCHES_CHANNEL_ID || '1242134878263447552';
+  } catch (err) {
+    console.error('[PaymentBridge] Could not read vouches channel:', err.message);
+    return process.env.VOUCHES_CHANNEL_ID || '1242134878263447552';
+  }
+}
+
+// A website review was submitted → post it as a vouch in #vouches, mirroring the
+// in-Discord vouch_modal embed so web and Discord vouches look identical.
+async function handleWebReview(review, guildId, discordClient) {
+  try {
+    const channelId = await getVouchesChannelId(guildId);
+    if (!channelId) return;
+    const channel = await discordClient.channels.fetch(channelId).catch(() => null);
+    if (!channel) return;
+
+    const ratingNum = Math.min(5, Math.max(1, parseInt(review.rating, 10) || 5));
+    const stars = '⭐'.repeat(ratingNum);
+    const name = review.display_name || 'Anonymous';
+    const feedback = (review.body && String(review.body).trim()) || '_No written feedback_';
+
+    const embed = new EmbedBuilder()
+      .setColor(0x2ECC71)
+      .setTitle('New Vouch Received 🎉')
+      .addFields(
+        { name: 'Vouch ID', value: review.id ? `Nº ${review.id}` : '—', inline: false },
+        { name: 'Rating', value: stars, inline: false },
+        { name: 'Feedback', value: feedback, inline: false },
+        { name: 'Vouched By', value: review.discord_id ? `<@${review.discord_id}>` : name, inline: false },
+        { name: 'Source', value: '🌐 Website', inline: false },
+      )
+      .setFooter({ text: `Thanks for supporting the store` })
+      .setTimestamp();
+
+    const msg = await channel.send({ embeds: [embed] });
+    if (msg) { try { await msg.react('💯'); await msg.react('🔥'); } catch (_) {} }
+  } catch (err) {
+    console.error('[PaymentBridge] Web review vouch error:', err.message);
+  }
+}
+
 // Registers secret-gated internal routes onto SUPERBOT's shared Express app
 // (called from modules/auth2fa.js's startAuthServer, same pattern as panel.js).
 function registerPaymentRoutes(app, discordClient) {
@@ -109,6 +158,13 @@ function registerPaymentRoutes(app, discordClient) {
     if (req.body.secret !== process.env.API_SECRET) return res.status(401).end();
     const { order_id, discord_id, email, goods, guild_id } = req.body;
     handleDelivery(order_id, discord_id, email, goods, guild_id || process.env.GUILD_ID, discordClient);
+    res.json({ ok: true });
+  });
+
+  app.post('/internal/web_review', (req, res) => {
+    if (req.body.secret !== process.env.API_SECRET) return res.status(401).end();
+    const { review, guild_id } = req.body;
+    if (review) handleWebReview(review, guild_id || process.env.GUILD_ID, discordClient);
     res.json({ ok: true });
   });
 }

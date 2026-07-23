@@ -1102,6 +1102,8 @@ const ownCommands = [
     .addStringOption(o => o.setName('key').setDescription('The key to revoke').setRequired(true)),
   new SlashCommandBuilder().setName('postredeem').setDescription('Staff: Post a button-based key redeem panel')
     .addChannelOption(o => o.setName('channel').setDescription('Channel to post in (defaults to current channel)').setRequired(false)),
+  new SlashCommandBuilder().setName('setupclaim').setDescription('Staff: Post the customer role claim panel (Invoice ID + Email → Customer role)')
+    .addChannelOption(o => o.setName('channel').setDescription('Channel to post in (defaults to current channel)').setRequired(false)),
   new SlashCommandBuilder().setName('set-tos').setDescription('Staff: Set the Terms of Service content')
     .addAttachmentOption(o => o.setName('file').setDescription('.txt file instead of typing in a popup form').setRequired(false)),
   new SlashCommandBuilder().setName('set-rules').setDescription('Staff: Set the Rules content')
@@ -2273,6 +2275,34 @@ client.on('interactionCreate', async interaction => {
         return;
       }
 
+      // ── /setupclaim (post the customer-role claim panel) ───────────────────
+      if (cmd === 'setupclaim') {
+        if (!hasAccess(interaction)) return interaction.reply({ content: '❌ No permission.', flags: 64 });
+
+        const channel = interaction.options.getChannel('channel') || interaction.channel;
+
+        const embed = new EmbedBuilder()
+          .setColor(0x00ff88)
+          .setTitle('🎫 Claim Your Customer Role')
+          .setDescription(
+            `Purchased from the store? Claim your **Customer** role here.\n\n` +
+            `**How to claim:**\n` +
+            `• Click **Claim** below.\n` +
+            `• Enter your **Invoice ID** (order ID) and the **Email** you used at checkout.\n` +
+            `• If they match a paid order, the Customer role is granted instantly.\n\n` +
+            `Your Invoice ID and email are on your order confirmation.`
+          )
+          .setFooter({ text: BOT_NAME, iconURL: client.user.displayAvatarURL() });
+
+        const row = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('claim_customer_open').setLabel('Claim').setEmoji('🎫').setStyle(ButtonStyle.Success)
+        );
+
+        await channel.send({ embeds: [embed], components: [row] });
+        await interaction.reply({ content: `✅ Posted the claim panel in <#${channel.id}>.`, flags: 64 });
+        return;
+      }
+
       // ── /set-tos, /set-rules, /set-guide ────────────────────────────────
       if (cmd === 'set-tos' || cmd === 'set-rules' || cmd === 'set-guide' || cmd === 'set-payment-method') {
         if (!hasAccess(interaction)) return interaction.reply({ content: '❌ No permission.', flags: 64 });
@@ -2789,6 +2819,32 @@ client.on('interactionCreate', async interaction => {
         return interaction.showModal(modal);
       }
 
+      // Claim panel — opens the Invoice ID + Email modal
+      if (customId === 'claim_customer_open') {
+        const modal = new ModalBuilder().setCustomId('claim_customer_modal').setTitle('🎫 Claim Customer Role');
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId('claim_order_id')
+              .setLabel('Invoice ID')
+              .setStyle(TextInputStyle.Short)
+              .setPlaceholder('Your order / invoice ID')
+              .setRequired(true)
+              .setMaxLength(64)
+          ),
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId('claim_email')
+              .setLabel('Email used at checkout')
+              .setStyle(TextInputStyle.Short)
+              .setPlaceholder('you@example.com')
+              .setRequired(true)
+              .setMaxLength(120)
+          )
+        );
+        return interaction.showModal(modal);
+      }
+
       if (customId === 'gensteam_open') {
         if (!await canAccessStock(member)) {
           return interaction.reply({ content: `❌ You need the **💎 Gen Member** role to generate an account.`, flags: 64 });
@@ -2915,6 +2971,47 @@ client.on('interactionCreate', async interaction => {
       if (interaction.customId === 'redeem_modal') {
         const keyInput = interaction.fields.getTextInputValue('redeem_key_input');
         return redeemKey(interaction, keyInput);
+      }
+
+      // Claim panel modal — verify a paid order → grant the Customer role
+      if (interaction.customId === 'claim_customer_modal') {
+        await interaction.deferReply({ ephemeral: true });
+        const order_id = interaction.fields.getTextInputValue('claim_order_id').trim();
+        const email = interaction.fields.getTextInputValue('claim_email').trim();
+        try {
+          const res = await axios.post(`${BACKEND_URL}/api/orders/verify-claim`, {
+            secret: API_SECRET, order_id, email,
+          });
+          const v = res.data;
+          if (!v.email_match) {
+            return interaction.editReply({ content: '❌ That email does not match the invoice on record.' });
+          }
+          if (!v.paid) {
+            return interaction.editReply({ content: `❌ Invoice \`${order_id}\` is **${v.status}** — only paid/delivered orders qualify.` });
+          }
+
+          const roleName = process.env.CUSTOMER_ROLE_NAME || 'Customer';
+          let role = interaction.guild.roles.cache.find(r => r.name === roleName);
+          if (!role) role = await interaction.guild.roles.create({ name: roleName, color: 0x00ff88, reason: 'Customer role for verified purchases' }).catch(() => null);
+          if (!role) return interaction.editReply({ content: '❌ Could not find or create the Customer role.' });
+
+          await interaction.member.roles.add(role).catch(() => {});
+          const embed = new EmbedBuilder()
+            .setColor(0x00ff88)
+            .setTitle('✅ Claim Successful')
+            .addFields(
+              { name: 'Invoice ID', value: `\`${order_id}\``, inline: true },
+              { name: 'Email', value: email, inline: true },
+              { name: 'User', value: `<@${interaction.user.id}>`, inline: true },
+              { name: 'Role Added', value: `<@&${role.id}>`, inline: false },
+            )
+            .setFooter({ text: BOT_NAME, iconURL: client.user.displayAvatarURL() })
+            .setTimestamp();
+          return interaction.editReply({ embeds: [embed] });
+        } catch (err) {
+          const msg = err.response?.data?.error || err.message;
+          return interaction.editReply({ content: `❌ Invoice not found or error: ${msg}` });
+        }
       }
 
       // TOS/Rules/Guide content modal
