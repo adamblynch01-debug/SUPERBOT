@@ -85,7 +85,7 @@ function startAuthServer(discordClient, { issueKey, invalidateGuildSettings } = 
       const embed = new EmbedBuilder()
         .setColor(0xF59E0B)
         .setTitle('🔐 Two-Factor Authentication Required')
-        .setDescription(`A login attempt was made on **UHSERVICES.GG**.\n\nClick the button below to verify it's you.`)
+        .setDescription(`A login attempt was made on **UHSERVICES.XYZ**.\n\nClick the button below to verify it's you.`)
         .addFields({ name: '📧 Account', value: email, inline: true })
         .setFooter({ text: 'This request expires in 10 minutes • UH SERVICES' })
         .setTimestamp();
