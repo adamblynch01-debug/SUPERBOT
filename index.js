@@ -1197,6 +1197,9 @@ const ownCommands = [
   new SlashCommandBuilder().setName('post-status').setDescription('Post ALL website product statuses to a channel (in sync with the site)')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addChannelOption(o => o.setName('channel').setDescription('Channel to post into (defaults to here)').setRequired(false)),
+  new SlashCommandBuilder().setName('post-status-vault').setDescription('Post vault product stock (IN STOCK / SOLD OUT) to a channel')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addChannelOption(o => o.setName('channel').setDescription('Channel to post into (defaults to here)').setRequired(false)),
 ].map(c => c.toJSON());
 
 // Merge with support module commands
@@ -2837,6 +2840,72 @@ client.on('interactionCreate', async interaction => {
         } catch (err) {
           const msg = err.response?.data?.error || err.message;
           return interaction.editReply({ content: `❌ Could not post statuses: ${msg}` });
+        }
+      }
+
+      // ── /post-status-vault (post vault product stock: IN STOCK / SOLD OUT) ──
+      if (cmd === 'post-status-vault') {
+        if (!hasAccess(interaction)) return interaction.reply({ content: '❌ No permission.', flags: 64 });
+        await interaction.deferReply({ ephemeral: true });
+        const targetCh = interaction.options.getChannel('channel') || interaction.channel;
+        try {
+          // Vault catalog = products flagged vault=true. Each row is a priced
+          // tier (id = tier_id) joined with its parent product, same shape as
+          // GET /api/products.
+          const res = await axios.get(`${BACKEND_URL}/api/products/vault`);
+          const rows = Array.isArray(res.data) ? res.data : [];
+          const tiers = rows.filter(r => r.id != null);
+          if (!tiers.length) return interaction.editReply({ content: '❌ No vault products to post.' });
+
+          // One bulk stock lookup for every vault tier → tier_id: available.
+          let stock = {};
+          try {
+            const ids = Array.from(new Set(tiers.map(t => t.id))).join(',');
+            const sr = await axios.get(`${BACKEND_URL}/api/stock/bulk?ids=${ids}`);
+            stock = (sr.data && sr.data.stock) || {};
+          } catch (e) { /* stock lookup failed — treat all as 0 below */ }
+
+          const availFor = t => {
+            const n = stock[t.id];
+            return typeof n === 'number' ? n : 0;
+          };
+          let inStockCount = 0, soldOutCount = 0;
+          tiers.forEach(t => { availFor(t) > 0 ? inStockCount++ : soldOutCount++; });
+
+          // Group by category (game_name) so the embed mirrors the vault page.
+          const byCat = {};
+          tiers.forEach(t => {
+            const c = t.category || 'VAULT';
+            (byCat[c] = byCat[c] || []).push(t);
+          });
+
+          const fields = Object.keys(byCat).sort().map(cat => ({
+            name: cat,
+            value: byCat[cat].map(t => {
+              const n = availFor(t);
+              const badge = n > 0 ? `🟢 **IN STOCK**${n <= 5 ? ` · ${n} left` : ''}` : '🔴 **SOLD OUT**';
+              return `${badge} — ${t.product_name}${t.tier_label ? ` (${t.tier_label})` : ''}`;
+            }).join('\n').slice(0, 1024),
+            inline: false,
+          }));
+
+          const header = new EmbedBuilder()
+            .setColor(0x00ffe7)
+            .setTitle('🔐 VAULT STOCK')
+            .setDescription(`🟢 ${inStockCount} In Stock  •  🔴 ${soldOutCount} Sold Out`)
+            .setFooter({ text: `${BOT_NAME}${SITE_URL ? ' | ' + SITE_URL : ''}`, iconURL: client.user.displayAvatarURL() })
+            .setTimestamp();
+
+          const embeds = [];
+          for (let i = 0; i < fields.length; i += 25) {
+            const e = new EmbedBuilder().setColor(0x00ffe7).addFields(fields.slice(i, i + 25));
+            embeds.push(e);
+          }
+          await targetCh.send({ embeds: [header, ...embeds] });
+          return interaction.editReply({ content: `✅ Posted ${tiers.length} vault products to ${targetCh}.` });
+        } catch (err) {
+          const msg = err.response?.data?.error || err.message;
+          return interaction.editReply({ content: `❌ Could not post vault stock: ${msg}` });
         }
       }
     }
