@@ -1183,6 +1183,16 @@ const ownCommands = [
     .addStringOption(o => o.setName('order_id').setDescription('Your order / invoice ID').setRequired(true))
     .addStringOption(o => o.setName('email').setDescription('The email used on the order').setRequired(true))
     .addUserOption(o => o.setName('user').setDescription('Staff only: grant to another member').setRequired(false)),
+  new SlashCommandBuilder().setName('web-promote').setDescription('Master recovery: set a website account\'s role (admin lockout fix)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addStringOption(o => o.setName('username').setDescription('Website username or email of the account').setRequired(true))
+    .addStringOption(o => o.setName('role').setDescription('Role to assign').setRequired(true)
+      .addChoices(
+        { name: 'admin', value: 'admin' },
+        { name: 'staff', value: 'staff' },
+        { name: 'reseller', value: 'reseller' },
+        { name: 'member', value: 'member' },
+      )),
 ].map(c => c.toJSON());
 
 // Merge with support module commands
@@ -2728,6 +2738,40 @@ client.on('interactionCreate', async interaction => {
         } catch (err) {
           const msg = err.response?.data?.error || err.message;
           return interaction.editReply({ content: `❌ Order not found or error: ${msg}` });
+        }
+      }
+
+      // ── /web-promote (master recovery: set a website account's role) ───────
+      // Lockout fix — the bot holds API_SECRET (the "master key" on Railway),
+      // so a Discord Administrator can promote a website account to admin even
+      // when no admin is logged into the site. Gated to Administrator both by
+      // setDefaultMemberPermissions and this server-side check.
+      if (cmd === 'web-promote') {
+        await interaction.deferReply({ ephemeral: true });
+        if (!interaction.member.permissions.has('Administrator')) {
+          return interaction.editReply({ content: '❌ Administrator only.' });
+        }
+        if (!API_SECRET) {
+          return interaction.editReply({ content: '❌ API_SECRET is not configured on the bot — cannot reach the backend.' });
+        }
+        const username = interaction.options.getString('username');
+        const role = interaction.options.getString('role');
+        try {
+          const res = await axios.post(`${BACKEND_URL}/api/auth/set-role`, {
+            secret: API_SECRET, username, role,
+          });
+          const u = res.data?.user || {};
+          const embed = new EmbedBuilder()
+            .setColor(0x00ff88).setTitle('✅ Website Role Updated')
+            .setDescription(`**${u.username || username}** is now **${u.role || role}** on the website.`)
+            .setFooter({ text: 'Master recovery via bot — API_SECRET' })
+            .setTimestamp();
+          return interaction.editReply({ embeds: [embed] });
+        } catch (err) {
+          const status = err.response?.status;
+          if (status === 404) return interaction.editReply({ content: `❌ No website account found for \`${username}\`.` });
+          const msg = err.response?.data?.error || err.message;
+          return interaction.editReply({ content: `❌ Could not set role: ${msg}` });
         }
       }
     }
