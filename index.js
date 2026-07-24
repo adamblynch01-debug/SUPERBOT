@@ -1193,6 +1193,10 @@ const ownCommands = [
         { name: 'reseller', value: 'reseller' },
         { name: 'member', value: 'member' },
       )),
+
+  new SlashCommandBuilder().setName('post-status').setDescription('Post ALL website product statuses to a channel (in sync with the site)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addChannelOption(o => o.setName('channel').setDescription('Channel to post into (defaults to here)').setRequired(false)),
 ].map(c => c.toJSON());
 
 // Merge with support module commands
@@ -2772,6 +2776,67 @@ client.on('interactionCreate', async interaction => {
           if (status === 404) return interaction.editReply({ content: `❌ No website account found for \`${username}\`.` });
           const msg = err.response?.data?.error || err.message;
           return interaction.editReply({ content: `❌ Could not set role: ${msg}` });
+        }
+      }
+
+      // ── /post-status (post ALL website product statuses, in sync w/ site) ──
+      if (cmd === 'post-status') {
+        if (!hasAccess(interaction)) return interaction.reply({ content: '❌ No permission.', flags: 64 });
+        await interaction.deferReply({ ephemeral: true });
+        const targetCh = interaction.options.getChannel('channel') || interaction.channel;
+        try {
+          const res = await axios.get(`${BACKEND_URL}/api/status`);
+          const raw = Array.isArray(res.data) ? res.data : (res.data.statuses || []);
+          // Respect the site's admin hide-map so Discord stays in sync with the page
+          let hidden = {};
+          try {
+            const hs = await axios.get(`${BACKEND_URL}/api/state/global/ghostStatusHidden`);
+            hidden = (hs.data && hs.data.value) || {};
+          } catch (e) { /* no hide-map yet — show all */ }
+          const rows = raw.filter(r => !hidden[String(r.product_id)]);
+          if (!rows.length) return interaction.editReply({ content: '❌ No product statuses to post.' });
+
+          const STAT = {
+            undetected: { emoji: '🟢', label: 'UNDETECTED' },
+            updating:   { emoji: '🔵', label: 'UPDATING' },
+            detected:   { emoji: '🔴', label: 'DETECTED' },
+          };
+          const byGame = {};
+          rows.forEach(r => {
+            const g = r.game_name || 'Other';
+            (byGame[g] = byGame[g] || []).push(r);
+          });
+          const counts = { undetected: 0, updating: 0, detected: 0 };
+          rows.forEach(r => { if (counts[r.status] != null) counts[r.status]++; });
+
+          const fields = Object.keys(byGame).sort().map(game => ({
+            name: game,
+            value: byGame[game].map(r => {
+              const s = STAT[r.status] || { emoji: '⚪', label: (r.status || '?').toUpperCase() };
+              const note = r.note ? ` — _${r.note}_` : '';
+              return `${s.emoji} **${r.product_name}** · ${s.label}${note}`;
+            }).join('\n').slice(0, 1024),
+            inline: false,
+          }));
+
+          const header = new EmbedBuilder()
+            .setColor(0x00ff88)
+            .setTitle('📊 PRODUCT STATUS')
+            .setDescription(`🟢 ${counts.undetected} Undetected  •  🔵 ${counts.updating} Updating  •  🔴 ${counts.detected} Detected`)
+            .setFooter({ text: `${BOT_NAME}${SITE_URL ? ' | ' + SITE_URL : ''}`, iconURL: client.user.displayAvatarURL() })
+            .setTimestamp();
+
+          // Discord caps at 25 fields per embed — chunk if needed
+          const embeds = [];
+          for (let i = 0; i < fields.length; i += 25) {
+            const e = new EmbedBuilder().setColor(0x00ff88).addFields(fields.slice(i, i + 25));
+            embeds.push(e);
+          }
+          await targetCh.send({ embeds: [header, ...embeds] });
+          return interaction.editReply({ content: `✅ Posted ${rows.length} product statuses to ${targetCh}.` });
+        } catch (err) {
+          const msg = err.response?.data?.error || err.message;
+          return interaction.editReply({ content: `❌ Could not post statuses: ${msg}` });
         }
       }
     }
