@@ -907,6 +907,59 @@ function hasAccess(interaction) {
   return false;
 }
 
+// Pack {name, value} fields into embeds that respect BOTH of Discord's limits:
+// 25 fields per embed AND 6000 characters of total embed text. The vault grew
+// from 13 products to ~90 when the site started auto-seeding its real catalog,
+// and chunking on the field count alone produced a single 25-field embed that
+// blew the 6000-char cap ("MAX_EMBED_SIZE_EXCEEDED").
+//
+// A single field's value is also capped at 1024 chars, so an over-long category
+// is split across repeated fields ("VPN (cont.)") rather than truncated — the
+// old .slice(0, 1024) silently dropped products off the end of big categories.
+function packEmbedFields(fields, color, budget = 5000) {
+  const MAX_FIELDS = 25, MAX_VALUE = 1024;
+
+  const split = [];
+  for (const f of fields) {
+    const lines = String(f.value).split('\n');
+    let buf = '', part = 0;
+    for (const line of lines) {
+      // +1 for the newline we'd add. A single line longer than MAX_VALUE is
+      // hard-truncated; nothing we render comes close.
+      if (buf && buf.length + 1 + line.length > MAX_VALUE) {
+        split.push({ name: part === 0 ? f.name : `${f.name} (cont.)`, value: buf, inline: false });
+        part++; buf = line.slice(0, MAX_VALUE);
+      } else {
+        buf = buf ? buf + '\n' + line : line.slice(0, MAX_VALUE);
+      }
+    }
+    split.push({ name: part === 0 ? f.name : `${f.name} (cont.)`, value: buf || '—', inline: false });
+  }
+
+  const embeds = [];
+  let cur = [], size = 0;
+  const flush = () => {
+    if (!cur.length) return;
+    embeds.push(new EmbedBuilder().setColor(color).addFields(cur));
+    cur = []; size = 0;
+  };
+  for (const f of split) {
+    const cost = f.name.length + f.value.length;
+    if (cur.length >= MAX_FIELDS || (cur.length && size + cost > budget)) flush();
+    cur.push(f); size += cost;
+  }
+  flush();
+  return embeds;
+}
+
+// Discord also caps a single message at 10 embeds.
+async function sendEmbedBatches(channel, header, embeds) {
+  const all = [header, ...embeds];
+  for (let i = 0; i < all.length; i += 10) {
+    await channel.send({ embeds: all.slice(i, i + 10) });
+  }
+}
+
 // Only true for the bot owner's own Discord account — used for commands
 // that operate across every server the bot is in (list/leave a guild),
 // not just the guild the command was run from. Set OWNER_DISCORD_ID in
@@ -2818,7 +2871,7 @@ client.on('interactionCreate', async interaction => {
               const s = STAT[r.status] || { emoji: '⚪', label: (r.status || '?').toUpperCase() };
               const note = r.note ? ` — _${r.note}_` : '';
               return `${s.emoji} **${r.product_name}** · ${s.label}${note}`;
-            }).join('\n').slice(0, 1024),
+            }).join('\n'),
             inline: false,
           }));
 
@@ -2829,13 +2882,7 @@ client.on('interactionCreate', async interaction => {
             .setFooter({ text: `${BOT_NAME}${SITE_URL ? ' | ' + SITE_URL : ''}`, iconURL: client.user.displayAvatarURL() })
             .setTimestamp();
 
-          // Discord caps at 25 fields per embed — chunk if needed
-          const embeds = [];
-          for (let i = 0; i < fields.length; i += 25) {
-            const e = new EmbedBuilder().setColor(0x00ff88).addFields(fields.slice(i, i + 25));
-            embeds.push(e);
-          }
-          await targetCh.send({ embeds: [header, ...embeds] });
+          await sendEmbedBatches(targetCh, header, packEmbedFields(fields, 0x00ff88));
           return interaction.editReply({ content: `✅ Posted ${rows.length} product statuses to ${targetCh}.` });
         } catch (err) {
           const msg = err.response?.data?.error || err.message;
@@ -2869,23 +2916,38 @@ client.on('interactionCreate', async interaction => {
             const n = stock[t.id];
             return typeof n === 'number' ? n : 0;
           };
+
+          // Roll tiers up to their parent product. A vault item like a VPN has
+          // several plan tiers that all deliver from the same key pool, so one
+          // line per tier listed the same product 4-5 times and tripled the
+          // embed for no extra information.
+          const products = new Map();
+          tiers.forEach(t => {
+            const key = t.product_id != null ? String(t.product_id) : `${t.category}||${t.product_name}`;
+            const p = products.get(key) || { category: t.category || 'VAULT', name: t.product_name || t.name, avail: 0 };
+            p.avail += availFor(t);
+            products.set(key, p);
+          });
+          const items = Array.from(products.values());
+
           let inStockCount = 0, soldOutCount = 0;
-          tiers.forEach(t => { availFor(t) > 0 ? inStockCount++ : soldOutCount++; });
+          items.forEach(p => { p.avail > 0 ? inStockCount++ : soldOutCount++; });
 
           // Group by category (game_name) so the embed mirrors the vault page.
           const byCat = {};
-          tiers.forEach(t => {
-            const c = t.category || 'VAULT';
-            (byCat[c] = byCat[c] || []).push(t);
+          items.forEach(p => {
+            const c = p.category || 'VAULT';
+            (byCat[c] = byCat[c] || []).push(p);
           });
 
           const fields = Object.keys(byCat).sort().map(cat => ({
             name: cat,
-            value: byCat[cat].map(t => {
-              const n = availFor(t);
-              const badge = n > 0 ? `🟢 **IN STOCK**${n <= 5 ? ` · ${n} left` : ''}` : '🔴 **SOLD OUT**';
-              return `${badge} — ${t.product_name}${t.tier_label ? ` (${t.tier_label})` : ''}`;
-            }).join('\n').slice(0, 1024),
+            value: byCat[cat]
+              .sort((a, b) => a.name.localeCompare(b.name))
+              .map(p => {
+                const badge = p.avail > 0 ? `🟢 **IN STOCK**${p.avail <= 5 ? ` · ${p.avail} left` : ''}` : '🔴 **SOLD OUT**';
+                return `${badge} — ${p.name}`;
+              }).join('\n'),
             inline: false,
           }));
 
@@ -2896,13 +2958,8 @@ client.on('interactionCreate', async interaction => {
             .setFooter({ text: `${BOT_NAME}${SITE_URL ? ' | ' + SITE_URL : ''}`, iconURL: client.user.displayAvatarURL() })
             .setTimestamp();
 
-          const embeds = [];
-          for (let i = 0; i < fields.length; i += 25) {
-            const e = new EmbedBuilder().setColor(0x00ffe7).addFields(fields.slice(i, i + 25));
-            embeds.push(e);
-          }
-          await targetCh.send({ embeds: [header, ...embeds] });
-          return interaction.editReply({ content: `✅ Posted ${tiers.length} vault products to ${targetCh}.` });
+          await sendEmbedBatches(targetCh, header, packEmbedFields(fields, 0x00ffe7));
+          return interaction.editReply({ content: `✅ Posted ${items.length} vault products to ${targetCh}.` });
         } catch (err) {
           const msg = err.response?.data?.error || err.message;
           return interaction.editReply({ content: `❌ Could not post vault stock: ${msg}` });
