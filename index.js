@@ -868,7 +868,7 @@ const productLastStatus  = {};
 const websiteMessages    = {};
 const resellerMessages   = {};
 const pendingUpdates     = {};
-const resellerLinks      = { apply: 'https://uhservicess.netlify.app/', panel: 'https://uhservicess.netlify.app/' };
+const resellerLinks      = { apply: 'https://uhservices.xyz/', panel: 'https://uhservices.xyz/' };
 // Competitor-detection: server IDs to watch for on join, role to tag flagged members with, and a staff log channel.
 const competitorWatch    = { guildIds: [], roleId: null, logChannel: 'mod-log' };
 
