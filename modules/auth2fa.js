@@ -6,7 +6,7 @@ const cors    = require('cors');
 const crypto  = require('crypto');
 const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const { registerPanelRoutes } = require('./panel');
-const { registerPaymentRoutes } = require('./paymentBridge');
+const { registerInternalRoutes } = require('./internalEvents');
 
 const app = express();
 app.use(cors());
@@ -68,7 +68,7 @@ async function handle2FAInteraction(interaction) {
 // saveKeys, this module just exposes an authenticated HTTP door to it.
 function startAuthServer(discordClient, { issueKey, invalidateGuildSettings } = {}) {
   registerPanelRoutes(app, discordClient, { invalidateGuildSettings });
-  registerPaymentRoutes(app, discordClient);
+  registerInternalRoutes(app, discordClient);
 
   // POST /api/auth/initiate-2fa
   app.post('/api/auth/initiate-2fa', async (req, res) => {
