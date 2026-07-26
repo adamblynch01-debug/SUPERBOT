@@ -1236,16 +1236,22 @@ const ownCommands = [
     .addStringOption(o => o.setName('order_id').setDescription('Your order / invoice ID').setRequired(true))
     .addStringOption(o => o.setName('email').setDescription('The email used on the order').setRequired(true))
     .addUserOption(o => o.setName('user').setDescription('Staff only: grant to another member').setRequired(false)),
-  new SlashCommandBuilder().setName('web-promote').setDescription('Master recovery: set a website account\'s role (admin lockout fix)')
+  // `role` is the only required option. Identify the target EITHER by picking a
+  // Discord member (resolved through their linked web account) OR by typing the
+  // website username/email — the handler enforces that exactly one is given.
+  // Discord's option ordering requires all required options first, so `role`
+  // leads.
+  new SlashCommandBuilder().setName('web-promote').setDescription('Set a website account\'s role — grant admin panel access (also fixes lockouts)')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-    .addStringOption(o => o.setName('username').setDescription('Website username or email of the account').setRequired(true))
     .addStringOption(o => o.setName('role').setDescription('Role to assign').setRequired(true)
       .addChoices(
         { name: 'admin', value: 'admin' },
         { name: 'staff', value: 'staff' },
         { name: 'reseller', value: 'reseller' },
         { name: 'member', value: 'member' },
-      )),
+      ))
+    .addUserOption(o => o.setName('user').setDescription('Discord member to promote (must have linked their website account)').setRequired(false))
+    .addStringOption(o => o.setName('username').setDescription('Or: website username or email of the account').setRequired(false)),
 
   new SlashCommandBuilder().setName('post-status').setDescription('Post ALL website product statuses to a channel (in sync with the site)')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
@@ -2801,11 +2807,13 @@ client.on('interactionCreate', async interaction => {
         }
       }
 
-      // ── /web-promote (master recovery: set a website account's role) ───────
-      // Lockout fix — the bot holds API_SECRET (the "master key" on Railway),
-      // so a Discord Administrator can promote a website account to admin even
-      // when no admin is logged into the site. Gated to Administrator both by
-      // setDefaultMemberPermissions and this server-side check.
+      // ── /web-promote (grant website roles, incl. admin panel access) ───────
+      // The bot holds API_SECRET (the "master key" on Railway), so a Discord
+      // Administrator can set a website account's role without being logged
+      // into the site — which is both how you hand someone admin panel access
+      // and how you recover from an admin lockout. Gated to Administrator both
+      // by setDefaultMemberPermissions and this server-side check (the former
+      // alone is a UI hint that server settings can override).
       if (cmd === 'web-promote') {
         await interaction.deferReply({ ephemeral: true });
         if (!interaction.member.permissions.has('Administrator')) {
@@ -2814,23 +2822,53 @@ client.on('interactionCreate', async interaction => {
         if (!API_SECRET) {
           return interaction.editReply({ content: '❌ API_SECRET is not configured on the bot — cannot reach the backend.' });
         }
+        const targetUser = interaction.options.getUser('user');
         const username = interaction.options.getString('username');
         const role = interaction.options.getString('role');
+
+        if (!targetUser && !username) {
+          return interaction.editReply({ content: '❌ Pick a Discord member in `user`, or type a website `username` / email. One of the two is required.' });
+        }
+        if (targetUser && username) {
+          return interaction.editReply({ content: '❌ Give **either** `user` **or** `username`, not both — they could point at two different accounts.' });
+        }
+
+        // Snowflakes stay STRINGS end to end. A 19-digit Discord id exceeds
+        // Number.MAX_SAFE_INTEGER, so any numeric round-trip silently rewrites
+        // it into a different, non-existent id.
+        const payload = targetUser
+          ? { secret: API_SECRET, discord_id: String(targetUser.id), role }
+          : { secret: API_SECRET, username, role };
+        const label = targetUser ? `<@${targetUser.id}>` : `\`${username}\``;
+
         try {
-          const res = await axios.post(`${BACKEND_URL}/api/auth/set-role`, {
-            secret: API_SECRET, username, role,
-          });
+          const res = await axios.post(`${BACKEND_URL}/api/auth/set-role`, payload);
           const u = res.data?.user || {};
+          const prev = res.data?.previous_role;
           const embed = new EmbedBuilder()
             .setColor(0x00ff88).setTitle('✅ Website Role Updated')
-            .setDescription(`**${u.username || username}** is now **${u.role || role}** on the website.`)
-            .setFooter({ text: 'Master recovery via bot — API_SECRET' })
+            .setDescription(
+              `**${u.username || username}** is now **${u.role || role}** on the website.` +
+              (prev && prev !== (u.role || role) ? `\nPrevious role: \`${prev}\`` : '')
+            )
+            .setFooter({ text: 'Set via bot — API_SECRET' })
             .setTimestamp();
+          if ((u.role || role) === 'admin') {
+            embed.addFields({
+              name: 'Admin panel access',
+              value: 'They log in to the site as normal, then unlock the panel with the panel password (set in Railway).',
+            });
+          }
           return interaction.editReply({ embeds: [embed] });
         } catch (err) {
           const status = err.response?.status;
-          if (status === 404) return interaction.editReply({ content: `❌ No website account found for \`${username}\`.` });
           const msg = err.response?.data?.error || err.message;
+          // The backend's 404 for a Discord lookup already explains that the
+          // account has to be linked first, so pass it through rather than
+          // flattening it to a generic "not found".
+          if (status === 404) return interaction.editReply({ content: `❌ ${msg} (${label})` });
+          if (status === 409) return interaction.editReply({ content: `❌ ${msg}` });
+          if (status === 429) return interaction.editReply({ content: '❌ Rate limited by the backend — wait a minute and try again.' });
           return interaction.editReply({ content: `❌ Could not set role: ${msg}` });
         }
       }
