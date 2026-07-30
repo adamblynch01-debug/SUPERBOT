@@ -42,7 +42,7 @@ const antiscam   = require('./modules/antiscam');
 const support    = require('./modules/support');
 const { startAuthServer, handle2FAInteraction } = require('./modules/auth2fa');
 const { getAllProducts, getProduct, setProductUrl, getProductChunks, getProductByName } = require('./modules/downloads');
-const { commands: smsCommands, handleSMSInteraction } = require('./modules/sms-gen');
+const { commands: smsCommands, handleSMSInteraction, setSMSAccessGate } = require('./modules/sms-gen');
 
 // ─── ENV Config ───────────────────────────────────────────────────────────────
 const TOKEN          = process.env.DISCORD_TOKEN;
@@ -242,12 +242,35 @@ async function getStockCooldown(guildId, userId, type) {
 }
 
 async function setStockCooldown(guildId, userId, type) {
+  await db.ensureGuild(guildId);
   await db.query(
     `INSERT INTO stock_cooldowns (guild_id, user_id, type, last_claimed_at) VALUES ($1,$2,$3, now())
      ON CONFLICT (guild_id, user_id, type) DO UPDATE SET last_claimed_at = now()`,
     [guildId, userId, type]
   );
 }
+
+// Used when a claim is stamped optimistically and then fails — see the SMS gen
+// purchase path, which reserves the day's number before spending credit.
+async function clearStockCooldown(guildId, userId, type) {
+  await db.query(
+    'DELETE FROM stock_cooldowns WHERE guild_id = $1 AND user_id = $2 AND type = $3',
+    [guildId, userId, type]
+  );
+}
+
+// SMS gen borrows the Steam gen's access rules — 💎 Gen Member to use it, one
+// number per day, staff/OVERSEER unlimited — instead of keeping a second
+// definition of who counts as staff, which is how a gate ends up open on one
+// command and shut on another. Installed at load, not in ready(): sms-gen
+// refuses every request until this runs, so it must not be able to run late.
+setSMSAccessGate({
+  canAccess:     canAccessStock,
+  hasUnlimited:  hasUnlimitedGen,
+  getCooldown:   getStockCooldown,
+  setCooldown:   setStockCooldown,
+  clearCooldown: clearStockCooldown,
+});
 
 // Useful links — persisted to DATA_DIR so /addusefullink and /removeusefullink
 // changes survive restarts, same as stock/giveaways/vouches. Seeded once from
@@ -595,11 +618,42 @@ async function redeemKey(interaction, rawKeyInput) {
 // One action row holds at most 5 buttons — adding a 6th type here needs a
 // second row, so the panel builder splits them rather than throwing.
 const GEN_PANEL_TYPES = [
-  { type: 'steam',           label: 'Steam',                 emoji: '🎮' },
+  { type: 'standard',        label: 'Steam',                 emoji: '🎮' },
   { type: 'phone-verified',  label: 'Steam Phone Verified',  emoji: '📱' },
   { type: 'activision',      label: 'Activision',            emoji: '🔫' },
   { type: 'email-outlook',   label: 'Email: Outlook',        emoji: '📧' },
 ];
+
+// `/addstock` with no type slugs to 'standard', but the panel's Steam button
+// asked for 'steam'. Two names for one bucket: 134 uploaded accounts sat in
+// stock while the button answered "Out of stock for steam". Aliases collapse
+// them. 'standard' stays canonical so no existing row has to be rewritten.
+const STOCK_TYPE_ALIASES = {
+  'steam': 'standard',
+  'steam-account': 'standard',
+  'steam-standard': 'standard',
+  'steam-phone-verified': 'phone-verified',
+  'phoneverified': 'phone-verified',
+  'pv': 'phone-verified',
+  'outlook': 'email-outlook',
+  'email': 'email-outlook',
+  'emailoutlook': 'email-outlook',
+  'activision-account': 'activision',
+  'acti': 'activision',
+  'cod': 'activision',
+};
+
+// Staff type slugs; buyers see these.
+const STOCK_TYPE_LABELS = {
+  'standard': 'Steam',
+  'phone-verified': 'Steam Phone Verified',
+  'email-outlook': 'Email: Outlook',
+  'activision': 'Activision',
+};
+
+function stockTypeLabel(type) {
+  return STOCK_TYPE_LABELS[type] || type;
+}
 
 function normalizeStockType(raw) {
   const t = (raw || '')
@@ -607,7 +661,8 @@ function normalizeStockType(raw) {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '');
-  return t || 'standard';
+  if (!t) return 'standard';
+  return STOCK_TYPE_ALIASES[t] || t;
 }
 
 // Stock access roles — set as env vars if you ever need to change them without a redeploy.
@@ -708,7 +763,7 @@ async function buildStockEmbed(guildId) {
   if (!types.length) {
     embed.setDescription('No stock has been added yet.');
   } else {
-    embed.setDescription(types.map(t => `**${t.type}** — ${t.count} available`).join('\n'));
+    embed.setDescription(types.map(t => `**${stockTypeLabel(t.type)}** — ${t.count} available`).join('\n'));
   }
   return embed;
 }
@@ -728,14 +783,14 @@ async function claimStockAccount(interaction, type) {
       const cooldownMs = STOCK_COOLDOWN_HOURS * 60 * 60 * 1000;
       if (elapsedMs < cooldownMs) {
         const readyAt = Math.floor((new Date(lastGen).getTime() + cooldownMs) / 1000);
-        return interaction.reply({ content: `⏳ You can generate another **${type}** account <t:${readyAt}:R>.`, flags: 64 });
+        return interaction.reply({ content: `⏳ You can generate another **${stockTypeLabel(type)}** account <t:${readyAt}:R>.`, flags: 64 });
       }
     }
   }
 
   const account = await claimOneStockAccount(guildId, type);
   if (!account) {
-    return interaction.reply({ content: `❌ Out of stock for **${type}**. Check back later!`, flags: 64 });
+    return interaction.reply({ content: `❌ Out of stock for **${stockTypeLabel(type)}**. Check back later!`, flags: 64 });
   }
 
   if (!unlimited) await setStockCooldown(guildId, userId, type);
@@ -746,7 +801,7 @@ async function claimStockAccount(interaction, type) {
     .setColor(0x2ECC71)
     .setTitle('🔐 Your Account')
     .addFields(
-      { name: 'Type', value: type, inline: true },
+      { name: 'Type', value: stockTypeLabel(type), inline: true },
       { name: 'Remaining Stock', value: `${remaining}`, inline: true },
     )
     .setFooter({ text: `${BOT_NAME} | Keep this safe — it will not be shown again`, iconURL: client.user.displayAvatarURL() });
@@ -1319,12 +1374,12 @@ const ownCommands = [
   new SlashCommandBuilder().setName('commands').setDescription('Show all available bot commands'),
   new SlashCommandBuilder().setName('addstock').setDescription('Staff: Add accounts to stock')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-    .addStringOption(o => o.setName('type').setDescription('Account type (e.g. phone-verified). Leave blank for standard').setRequired(false))
+    .addStringOption(o => o.setName('type').setDescription('steam | phone-verified | activision | email-outlook (blank = steam)').setRequired(false))
     .addAttachmentOption(o => o.setName('file').setDescription('.txt file, one account per line').setRequired(false))
     .addStringOption(o => o.setName('accounts').setDescription('Paste accounts here (one per line) if not using a file').setRequired(false)),
   new SlashCommandBuilder().setName('stock').setDescription('Check how much stock is available'),
-  new SlashCommandBuilder().setName('gensteam').setDescription('Generate a Steam account')
-    .addStringOption(o => o.setName('type').setDescription('Account type (e.g. phone-verified). Leave blank for standard').setRequired(false)),
+  new SlashCommandBuilder().setName('gensteam').setDescription('Generate an account')
+    .addStringOption(o => o.setName('type').setDescription('steam | phone-verified | activision | email-outlook (blank = steam)').setRequired(false)),
   new SlashCommandBuilder().setName('postgensteam').setDescription('Staff: Post the Steam account generator panel')
     .addChannelOption(o => o.setName('channel').setDescription('Channel to post in (defaults to current channel)').setRequired(false)),
   new SlashCommandBuilder().setName('clearstock').setDescription('Staff: Remove stock accounts (fix a bad upload)')
@@ -2416,7 +2471,7 @@ client.on('interactionCreate', async interaction => {
         const totalNow = await getStockCount(interaction.guild.id, type);
 
         await interaction.editReply({
-          content: `✅ Added **${lines.length}** account${lines.length === 1 ? '' : 's'} to **${type}**. Total in stock: **${totalNow}**.`,
+          content: `✅ Added **${lines.length}** account${lines.length === 1 ? '' : 's'} to **${stockTypeLabel(type)}** (\`${type}\`). Total in stock: **${totalNow}**.`,
         });
         return;
       }
@@ -2485,7 +2540,7 @@ client.on('interactionCreate', async interaction => {
         const { removed, types } = await clearStockDB(interaction.guild.id, type);
 
         if (type) {
-          return interaction.reply({ content: `🗑️ Cleared **${removed}** account${removed === 1 ? '' : 's'} from **${type}**.`, flags: 64 });
+          return interaction.reply({ content: `🗑️ Cleared **${removed}** account${removed === 1 ? '' : 's'} from **${stockTypeLabel(type)}**.`, flags: 64 });
         }
         return interaction.reply({
           content: `🗑️ Cleared **${removed}** account${removed === 1 ? '' : 's'} across **${types}** type${types === 1 ? '' : 's'}. Stock is now empty.`,

@@ -149,6 +149,74 @@ function saveConfig(cfg) {
 // ─── Active order tracker ─────────────────────────────────────────────────────
 const activeOrders = new Map();
 
+// ─── Access gate ──────────────────────────────────────────────────────────────
+// Same rules as the Steam gen: 💎 Gen Member (or higher) to use it, one number
+// per person per day, staff/OVERSEER unlimited. The role logic lives in
+// index.js and reads the per-guild `/setup` config, so it is INJECTED here
+// rather than reimplemented — two copies of "who counts as staff" is exactly
+// how a gate ends up open on one command and shut on another.
+const SMS_COOLDOWN_HOURS = parseInt(process.env.SMS_COOLDOWN_HOURS || '24');
+const SMS_QUOTA_KEY      = 'sms-number';
+
+let accessGate = null;
+function setAccessGate(gate) { accessGate = gate; }
+
+// Returns null when the member may proceed, or a ready-to-send reply object.
+// Fails CLOSED throughout — no gate installed, a thrown gate, a DM with no
+// member object. Every path past this point spends real provider credit, so
+// "we couldn't tell" must never resolve to "go ahead".
+async function checkSmsAccess(interaction, { consume = false } = {}) {
+  if (!accessGate) {
+    console.error('[SMS] access gate not installed — refusing. index.js must call setSMSAccessGate().');
+    return { content: '❌ SMS Gen is not configured right now. Please tell staff.', flags: 64 };
+  }
+  if (!interaction.guild || !interaction.member) {
+    return { content: '❌ SMS Gen only works inside the server, not in DMs.', flags: 64 };
+  }
+
+  let allowed, unlimited;
+  try {
+    allowed   = await accessGate.canAccess(interaction.member);
+    unlimited = await accessGate.hasUnlimited(interaction.member);
+  } catch (e) {
+    console.error('[SMS] access gate failed:', e.message);
+    return { content: '❌ Could not verify your access right now. Try again in a moment.', flags: 64 };
+  }
+
+  if (!allowed) {
+    return { content: `❌ You need the **💎 Gen Member** role to generate a number.`, flags: 64 };
+  }
+  if (unlimited) return null;
+
+  const last = await accessGate.getCooldown(interaction.guild.id, interaction.user.id, SMS_QUOTA_KEY);
+  if (last) {
+    const readyMs = new Date(last).getTime() + SMS_COOLDOWN_HOURS * 60 * 60 * 1000;
+    if (Date.now() < readyMs) {
+      return {
+        content: `⏳ You've already generated a number today. You can generate another <t:${Math.floor(readyMs / 1000)}:R>.`,
+        flags: 64,
+      };
+    }
+  }
+  // Only stamped once the number is actually in hand — checking the picker
+  // twice must not burn the day's allowance.
+  if (consume) await accessGate.setCooldown(interaction.guild.id, interaction.user.id, SMS_QUOTA_KEY);
+  return null;
+}
+
+// Hand the day's allowance back when the purchase it was stamped for never
+// happened. Best-effort: failing to release is a worse outcome for the member
+// than for the business, but it must not turn into a thrown error on a path
+// that is already reporting a failure.
+async function releaseSmsQuota(interaction) {
+  if (!accessGate || !interaction.guild) return;
+  try {
+    await accessGate.clearCooldown(interaction.guild.id, interaction.user.id, SMS_QUOTA_KEY);
+  } catch (e) {
+    console.error('[SMS] could not release quota for', interaction.user.id, '-', e.message);
+  }
+}
+
 // ─── Where order cards go ─────────────────────────────────────────────────────
 // Numbers used to be posted into whatever channel the buyer ran /gennumber in,
 // which flooded #sms-verify with order cards. They now go to a dedicated
@@ -465,6 +533,9 @@ function buildPanelEmbed() {
     .setDescription(
       '**Get a temporary phone number for SMS verification on any platform.**\n\n' +
       '> Click **Get Number** below to choose your network, service, and country.\n\n' +
+      '**Access**\n' +
+      '> You need the **💎 Gen Member** role (or higher) to use this.\n' +
+      `> Limit: **one number per person every ${SMS_COOLDOWN_HOURS}h**. Staff/OVERSEER have no limit.\n\n` +
       '**Available Networks**\n' +
       `> ${PROVIDER_EMOJI.smspool} — ${PROVIDER_BLURB.smspool}\n` +
       `> ${PROVIDER_EMOJI['5sim']} — ${PROVIDER_BLURB['5sim']}\n\n` +
@@ -668,7 +739,7 @@ const userSessionCache = new Map();
 const commands = [
   new SlashCommandBuilder()
     .setName('gennumber')
-    .setDescription('📲 Generate a phone number for SMS verification'),
+    .setDescription('📲 Generate a phone number for SMS verification (💎 Gen Member — 1 per day)'),
 
   new SlashCommandBuilder()
     .setName('post-smsgen')
@@ -735,11 +806,17 @@ async function handleSMSInteraction(interaction, client) {
 
   // ── /gennumber ─────────────────────────────────────────────────────────────
   if (interaction.commandName === 'gennumber') {
+    const denied = await checkSmsAccess(interaction);
+    if (denied) return interaction.reply(denied);
     return showProviderPicker(interaction);
   }
 
   // ── Panel button → open provider picker ────────────────────────────────────
   if (interaction.isButton() && interaction.customId === 'sms_open_panel') {
+    // Checked BEFORE the defer so a denial is a one-shot ephemeral reply
+    // rather than an empty "thinking" state the member has to interpret.
+    const denied = await checkSmsAccess(interaction);
+    if (denied) return interaction.reply(denied);
     await interaction.deferReply({ ephemeral: true });
     return showProviderPicker(interaction);
   }
@@ -1142,6 +1219,23 @@ async function handleSMSInteraction(interaction, client) {
 async function purchaseNumber(interaction, client, provider, apiKey, session, country, operator) {
   const { serviceVal, serviceName } = session;
 
+  // The authoritative check. The picker gate above is only fast feedback — a
+  // member could sit on an open picker past midnight, or hold one from before
+  // the role was taken away, and every step from here on spends real credit.
+  const denied = await checkSmsAccess(interaction, { consume: true });
+  if (denied) {
+    return interaction.editReply({
+      embeds: [
+        new EmbedBuilder()
+          .setColor(0xed4245)
+          .setTitle('❌ Not Available')
+          .setDescription(denied.content)
+          .setFooter({ text: 'UH SERVICES • SMS Gen' }),
+      ],
+      components: [],
+    });
+  }
+
   let orderId, number;
   try {
     if (provider === '5sim') {
@@ -1150,6 +1244,11 @@ async function purchaseNumber(interaction, client, provider, apiKey, session, co
       ({ orderId, number } = await smspoolBuyNumber(apiKey, serviceVal, country, serviceName));
     }
   } catch (e) {
+    // The quota was stamped BEFORE the buy — otherwise two clicks in the same
+    // second both pass the check and both spend credit. So a failed buy has to
+    // hand the day's allowance back, or a provider outage costs the member
+    // their number.
+    await releaseSmsQuota(interaction);
     return interaction.editReply({
       embeds: [
         new EmbedBuilder()
@@ -1203,4 +1302,10 @@ async function purchaseNumber(interaction, client, provider, apiKey, session, co
   await startPolling(client, orderId, orderData);
 }
 
-module.exports = { commands, handleSMSInteraction, rehydrateOrders };
+module.exports = {
+  commands, handleSMSInteraction, rehydrateOrders,
+  setAccessGate, setSMSAccessGate: setAccessGate,
+  // Exported for test_sms_gate.js. This gate stands between a button click and
+  // real provider credit, so its fail-closed behaviour is asserted, not assumed.
+  _internals: { checkSmsAccess, releaseSmsQuota, SMS_COOLDOWN_HOURS, SMS_QUOTA_KEY },
+};
