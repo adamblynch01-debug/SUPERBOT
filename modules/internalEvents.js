@@ -213,9 +213,62 @@ function registerInternalRoutes(app, client) {
   }
 
   // ─── new_order ─────────────────────────────────────────────────────────────
+  //
+  // Duplicate suppression. On 2026-07-30 a single order (id 4 — one row, one
+  // debit) produced THREE identical embeds. The backend provably sent one
+  // notify: botNotify.js has no retry, the two call sites in routes/orders.js
+  // are mutually exclusive, and a retried checkout would have left cancelled
+  // order rows behind — there were none. This route is registered exactly once
+  // and ends the response itself, so Express cannot run it twice either.
+  //
+  // That leaves the discord.js REST layer retrying a slow or 5xx-ing Discord
+  // API where the message actually landed each time — a known duplicate cause,
+  // and consistent with the same checkout hanging the storefront on the notify
+  // timeout. Rather than chase an unprovable retry (Railway's log window no
+  // longer reaches that far), post at most once per order id and let the cause
+  // be moot.
+  const recentOrderPosts = new Map();   // order id → ms timestamp
+  const ORDER_POST_TTL_MS = 10 * 60 * 1000;
+
+  // Deliberately split from markPosted: an order is only recorded once the
+  // send actually succeeded, so a failed post can still be retried rather than
+  // being suppressed as a "duplicate" of a message that never landed.
+  function alreadyPosted(orderId) {
+    const now = Date.now();
+    for (const [id, at] of recentOrderPosts) {
+      if (now - at > ORDER_POST_TTL_MS) recentOrderPosts.delete(id);
+    }
+    return recentOrderPosts.has(String(orderId));
+  }
+
+  function markPosted(orderId) {
+    recentOrderPosts.set(String(orderId), Date.now());
+  }
+
+  // The status used to be the hardcoded string '⏳ Pending Payment', so a
+  // balance order that was already paid AND delivered before the embed was
+  // even built still announced itself as awaiting payment.
+  const STATUS_LABELS = {
+    waiting:          '⏳ Pending Payment',
+    paid:             '💰 Paid',
+    delivered:        '✅ Delivered',
+    cancelled:        '❌ Cancelled',
+    expired:          '⌛ Expired',
+    expired_paid:     '⚠️ Paid After Expiry',
+    needs_attention:  '⚠️ Needs Attention',
+  };
+
   app.post('/internal/new_order', requireSecret, async (req, res) => {
     const { order = {}, payment_info = {} } = req.body || {};
     try {
+      if (order.id != null && alreadyPosted(order.id)) {
+        console.warn(`[Internal] new_order for order ${order.id} suppressed — already posted within the last ${ORDER_POST_TTL_MS / 60000}m`);
+        // No `posted:false` here — that is botNotify's signal for "the route
+        // ran but there was no channel", and it would log a bogus
+        // "check ORDER_LOG_CHANNEL_ID" error for what is a healthy suppression.
+        return res.json({ ok: true, duplicate: true });
+      }
+
       const ch = await ordersChannel(order.guild_id || process.env.GUILD_ID);
       if (!ch) {
         // 503, NOT 200. This used to answer `{ok:true, posted:false}`, and the
@@ -237,7 +290,7 @@ function registerInternalRoutes(app, client) {
           { name: 'Payment', value: clip(String(order.payment_method || 'unknown').toUpperCase(), LIMIT.value), inline: true },
           { name: 'Total', value: clip(formatAmount(order, payment_info), LIMIT.value), inline: true },
           { name: 'Email', value: clip(order.email || order.discord_id || 'unknown', LIMIT.value), inline: true },
-          { name: 'Status', value: '⏳ Pending Payment', inline: true },
+          { name: 'Status', value: STATUS_LABELS[String(order.status || 'waiting')] || `❔ ${order.status}`, inline: true },
         )
         .setTimestamp();
 
@@ -246,6 +299,7 @@ function registerInternalRoutes(app, client) {
       }
 
       await ch.send({ embeds: [embed] });
+      if (order.id != null) markPosted(order.id);
       return res.json({ ok: true, posted: true });
     } catch (err) {
       console.error('[Internal] new_order failed:', err.message);

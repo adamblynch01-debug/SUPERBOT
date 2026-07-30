@@ -200,8 +200,12 @@ const field = (embed, name) => (embed.fields || []).find(f => f.name === name);
   LOG_CHANNEL_ROW = null;
   {
     const r = await post('/internal/new_order', { secret: SECRET, order: { id: '504' }, payment_info: {} });
-    ok(r.status === 200 && r.body.posted === false,
-      'no configured channel is reported, not thrown — the backend must not see an error');
+    // 503, not 200. This assertion still expected the old 200 answer after the
+    // route was deliberately changed: "no channel to post to" is an outage the
+    // backend must be able to see, and answering 200 was exactly how every
+    // order notification vanished silently.
+    ok(r.status === 503 && r.body.posted === false && r.body.handled === false,
+      'no configured channel is reported as 503, not thrown — the backend must see it');
   }
 
   reset();
@@ -218,6 +222,55 @@ const field = (embed, name) => (embed.fields || []).find(f => f.name === name);
   {
     const r = await post('/internal/new_order', { secret: SECRET, order: { id: '506' }, payment_info: {} });
     ok(r.status === 200 && r.body.posted === true, 'a database outage falls back to the env var');
+  }
+
+  // A single order (id 4) once produced three identical embeds in #order-log
+  // while the database held one row and one debit. The backend sent one
+  // notify, so the duplication happened at or below this route — most likely
+  // discord.js retrying a failing send that had in fact landed. These pin the
+  // suppression that makes the cause moot.
+  reset();
+  DB_THROWS = false;
+  LOG_CHANNEL_ROW = null;
+  process.env.ORDERS_CHANNEL_ID = ORDERS_CH;
+  {
+    const a = await post('/internal/new_order', { secret: SECRET, order: { id: '777' }, payment_info: {} });
+    const b = await post('/internal/new_order', { secret: SECRET, order: { id: '777' }, payment_info: {} });
+    const c = await post('/internal/new_order', { secret: SECRET, order: { id: '777' }, payment_info: {} });
+    ok(a.status === 200 && a.body.posted === true, 'the first notify for an order posts');
+    ok(SENT.length === 1, 'three notifies for one order produce exactly one embed');
+    ok(b.body.duplicate === true && c.body.duplicate === true, 'the repeats report themselves as duplicates');
+    // posted:false is botNotify's "there was no channel" signal and would make
+    // the backend log a bogus ORDER_LOG_CHANNEL_ID error for a healthy skip.
+    ok(b.body.posted === undefined, 'a suppressed duplicate does not claim the channel was missing');
+    ok(b.status === 200, 'and it is not an error the backend has to handle');
+  }
+
+  reset();
+  {
+    const r = await post('/internal/new_order', { secret: SECRET, order: { id: '778' }, payment_info: {} });
+    ok(r.body.posted === true, 'a different order still posts');
+    ok(SENT.length === 1, 'suppression is per order id, not global');
+  }
+
+  // The status field was the hardcoded string '⏳ Pending Payment', so a
+  // balance order that was paid and delivered before the embed was even built
+  // still announced itself as awaiting payment.
+  reset();
+  {
+    await post('/internal/new_order', { secret: SECRET, order: { id: '779', status: 'paid' }, payment_info: {} });
+    ok(field(SENT[0].embed, 'Status').value === '💰 Paid', 'a paid order does not read "Pending Payment"');
+
+    await post('/internal/new_order', { secret: SECRET, order: { id: '780', status: 'delivered' }, payment_info: {} });
+    ok(field(SENT[1].embed, 'Status').value === '✅ Delivered', 'a delivered order reads delivered');
+
+    await post('/internal/new_order', { secret: SECRET, order: { id: '781' }, payment_info: {} });
+    ok(field(SENT[2].embed, 'Status').value === '⏳ Pending Payment',
+      'an order with no status still defaults to pending payment');
+
+    await post('/internal/new_order', { secret: SECRET, order: { id: '782', status: 'wat' }, payment_info: {} });
+    ok(/wat/.test(field(SENT[3].embed, 'Status').value),
+      'an unrecognised status is shown rather than silently mislabelled');
   }
 
   console.log('\n── deliver_goods ──');
