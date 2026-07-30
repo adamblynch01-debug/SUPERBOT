@@ -129,7 +129,10 @@ const client = new Client({
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.DirectMessages,
   ],
-  partials: [Partials.Channel, Partials.Message],
+  // GuildMember partial: without it, a GUILD_MEMBER_REMOVE for a member who is
+  // not in the cache is dropped entirely, and the invite tracker never learns
+  // they left. Every consumer below already handles a partial member.
+  partials: [Partials.Channel, Partials.Message, Partials.GuildMember],
 });
 
 // ─── Invite Tracking (Verify module) ────────────────────────────────────────
@@ -589,9 +592,12 @@ async function redeemKey(interaction, rawKeyInput) {
 
 // Fixed types shown as dedicated panel buttons (staff still use /addstock with
 // these same slugs — e.g. /addstock type:steam, type:steam phone verified, etc.)
+// One action row holds at most 5 buttons — adding a 6th type here needs a
+// second row, so the panel builder splits them rather than throwing.
 const GEN_PANEL_TYPES = [
   { type: 'steam',           label: 'Steam',                 emoji: '🎮' },
   { type: 'phone-verified',  label: 'Steam Phone Verified',  emoji: '📱' },
+  { type: 'activision',      label: 'Activision',            emoji: '🔫' },
   { type: 'email-outlook',   label: 'Email: Outlook',        emoji: '📧' },
 ];
 
@@ -906,6 +912,122 @@ function getUserInviteData(gid, uid) {
   return g.get(uid);
 }
 
+// ─── Invite stats persistence ────────────────────────────────────────────────
+// The Map above is the hot path; Postgres is the truth. It is loaded once on
+// ready and written through on every change. Redeeming a reward is gated on
+// `floor(real / needed) - usedKeys`, so when this was memory-only a restart
+// zeroed usedKeys and handed every member their keys again — a free key per
+// deploy. Writes swallow their errors: a DB blip must not break a join.
+async function loadInviteStats() {
+  try {
+    const { rows } = await db.query(`SELECT * FROM invite_stats`);
+    for (const r of rows) {
+      getGuildData(String(r.guild_id)).set(String(r.user_id), {
+        total: r.total || 0, real: r.real_count || 0, left: r.left_count || 0,
+        fake: r.fake_count || 0, usedKeys: r.used_keys || 0,
+      });
+    }
+    if (rows.length) console.log(`[Invites] loaded stats for ${rows.length} inviter(s)`);
+  } catch (e) {
+    console.error('[Invites] could not load stats:', e.message);
+  }
+}
+
+async function saveInviteStats(gid, uid) {
+  const d = getUserInviteData(gid, uid);
+  try {
+    await db.query(
+      `INSERT INTO invite_stats (guild_id, user_id, total, real_count, left_count, fake_count, used_keys, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7, now())
+       ON CONFLICT (guild_id, user_id) DO UPDATE SET
+         total = EXCLUDED.total, real_count = EXCLUDED.real_count,
+         left_count = EXCLUDED.left_count, fake_count = EXCLUDED.fake_count,
+         used_keys = EXCLUDED.used_keys, updated_at = now()`,
+      [String(gid), String(uid), d.total, d.real, d.left, d.fake, d.usedKeys]
+    );
+  } catch (e) {
+    console.error('[Invites] could not save stats for', uid, '-', e.message);
+  }
+}
+
+// Returns the row as it was BEFORE this join, so the caller can tell a first
+// join from a rejoin — a rejoin must not credit the inviter a second time.
+async function recordJoin(gid, memberId, inviterId, code, fake) {
+  try {
+    const { rows } = await db.query(
+      `INSERT INTO invite_joins (guild_id, member_id, inviter_id, invite_code, fake, joined_at, left_at)
+       VALUES ($1,$2,$3,$4,$5, now(), NULL)
+       ON CONFLICT (guild_id, member_id) DO UPDATE SET
+         inviter_id  = COALESCE(invite_joins.inviter_id, EXCLUDED.inviter_id),
+         invite_code = COALESCE(EXCLUDED.invite_code, invite_joins.invite_code),
+         joined_at   = now(),
+         left_at     = NULL
+       RETURNING (xmax <> 0) AS existed, inviter_id`,
+      [String(gid), String(memberId), inviterId ? String(inviterId) : null, code || null, !!fake]
+    );
+    return rows[0] || { existed: false, inviter_id: inviterId };
+  } catch (e) {
+    console.error('[Invites] could not record join for', memberId, '-', e.message);
+    return null;
+  }
+}
+
+// Accounts younger than this are counted but not rewarded.
+const FAKE_ACCOUNT_AGE_MS = Number(process.env.FAKE_ACCOUNT_AGE_DAYS || 7) * 24 * 60 * 60 * 1000;
+
+// "Who invited who", posted in the invites channel on every join. The tracker
+// kept the numbers but never said this out loud anywhere, so the only way to
+// see it was to press a button on your own profile.
+async function announceInvite(member, inviterId, fake, isRejoin) {
+  try {
+    const settings = await getGuildSettings(member.guild.id);
+    const ch = (settings.invitesChannelId && member.guild.channels.cache.get(settings.invitesChannelId))
+      || findChannelByName(member.guild, settings.invitesChannelName);
+    if (!ch) return;
+
+    const created = `<t:${Math.floor(member.user.createdTimestamp / 1000)}:R>`;
+    let line;
+    if (!inviterId) {
+      line = `**${member.user.tag}** joined — inviter unknown (vanity URL, or the invite was deleted).`;
+    } else {
+      const d = getUserInviteData(member.guild.id, inviterId);
+      const suffix = isRejoin
+        ? ' — **rejoin**, not counted again'
+        : fake
+          ? ' — flagged **fake** (account too new), not counted toward rewards'
+          : ` — they now have **${d.real}** real invite${d.real === 1 ? '' : 's'}`;
+      line = `**${member.user.tag}** was invited by <@${inviterId}>${suffix}.`;
+    }
+
+    const embed = new EmbedBuilder()
+      .setColor(fake ? 0xFEE75C : 0x57F287)
+      .setAuthor({ name: member.user.tag, iconURL: member.user.displayAvatarURL() })
+      .setDescription(`📨 ${line}`)
+      .addFields({ name: 'Account created', value: created, inline: true })
+      .setFooter({ text: 'UH SERVICES • Invite Tracker' })
+      .setTimestamp();
+
+    await ch.send({ embeds: [embed] });
+  } catch (e) {
+    console.error('[Invites] could not announce join:', e.message);
+  }
+}
+
+async function recordLeave(gid, memberId) {
+  try {
+    const { rows } = await db.query(
+      `UPDATE invite_joins SET left_at = now()
+       WHERE guild_id = $1 AND member_id = $2 AND left_at IS NULL
+       RETURNING inviter_id`,
+      [String(gid), String(memberId)]
+    );
+    return rows[0]?.inviter_id || null;
+  } catch (e) {
+    console.error('[Invites] could not record leave for', memberId, '-', e.message);
+    return null;
+  }
+}
+
 // ─── Updates module state ────────────────────────────────────────────────────
 const PRODUCT_COLORS = [
   0x5865F2,0xEB459E,0x57F287,0xFEE75C,0xED4245,
@@ -1154,6 +1276,9 @@ const ownCommands = [
   new SlashCommandBuilder().setName('setup-verify').setDescription('Sets up the verification channel').setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
   new SlashCommandBuilder().setName('setup-invites').setDescription('Sets up the invite reward channel').setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+  new SlashCommandBuilder().setName('show-voucher-stats').setDescription('📊 Invite leaderboard — everybody\'s invite tracker stats')
+    .addUserOption(o => o.setName('user').setDescription('Show one member\'s stats instead of the leaderboard').setRequired(false))
+    .addBooleanOption(o => o.setName('public').setDescription('Post it in the channel for everyone (staff only)').setRequired(false)),
   // Updates module
   new SlashCommandBuilder().setName('postupdate').setDescription('Open the product update form'),
   new SlashCommandBuilder().setName('announce').setDescription('Send a custom announcement to any channel'),
@@ -1375,6 +1500,16 @@ client.once('ready', async () => {
     } catch (_) {}
   }
 
+  // Invite counters + claimed-reward counts. Loaded before anything can read
+  // them, so a join arriving seconds after boot does not write a zeroed row
+  // back over a member's real total.
+  await loadInviteStats();
+
+  // Moderation lists. Same reason: a message arriving before these load would
+  // be judged against the hardcoded defaults, so an allow-listed gif link would
+  // still get deleted for the first few seconds after every deploy.
+  try { await antiscam.loadModLists(); } catch (e) { console.error('[AntiScam] load failed:', e.message); }
+
   // Resume SMS orders that were still open when the process died. Each one
   // represents provider credit already spent, so leaving them unpolled means
   // the refund window closes with nobody watching.
@@ -1512,19 +1647,37 @@ client.on('guildMemberAdd', async member => {
   try {
     const newInvites = await member.guild.invites.fetch();
     const oldCache   = inviteCache.get(member.guild.id) || new Map();
-    let inviterId = null;
+    let inviterId  = null;
+    let usedCode   = null;
     newInvites.forEach(inv => {
       const old = oldCache.get(inv.code);
-      if (old && inv.uses > old.uses) inviterId = old.inviterId;
+      if (old && inv.uses > old.uses) { inviterId = old.inviterId; usedCode = inv.code; }
     });
     const newCache = new Map();
     newInvites.forEach(inv => newCache.set(inv.code, { inviterId: inv.inviter?.id, uses: inv.uses }));
     inviteCache.set(member.guild.id, newCache);
-    if (inviterId) {
-      const d = getUserInviteData(member.guild.id, inviterId);
-      d.total++; d.real++;
+
+    // An account made minutes ago is the classic self-invite: it counts as an
+    // invite, but not as a REAL one, so it earns no reward progress.
+    const accountAgeMs = Date.now() - member.user.createdTimestamp;
+    const fake = accountAgeMs < FAKE_ACCOUNT_AGE_MS;
+
+    const prior = await recordJoin(member.guild.id, member.id, inviterId, usedCode, fake);
+    // A rejoin must not credit the same inviter twice. `existed` is null only
+    // when the write itself failed, in which case fall back to crediting —
+    // under-counting a genuine invite is the worse of the two errors here.
+    const isRejoin = prior ? prior.existed === true : false;
+    const creditTo = inviterId || (prior && prior.inviter_id) || null;
+
+    if (creditTo && !isRejoin) {
+      const d = getUserInviteData(member.guild.id, creditTo);
+      d.total++;
+      if (fake) d.fake++; else d.real++;
+      await saveInviteStats(member.guild.id, creditTo);
     }
-  } catch (_) {}
+
+    await announceInvite(member, creditTo, fake, isRejoin);
+  } catch (err) { console.error('Invite tracking error:', err); }
 
   const settings = await getGuildSettings(member.guild.id);
   const verifyChForDM = (settings.verifyChannelId && member.guild.channels.cache.get(settings.verifyChannelId))
@@ -1548,6 +1701,36 @@ client.on('guildMemberAdd', async member => {
       files: [new AttachmentBuilder(buf, { name: 'welcome.png' })],
     });
   } catch (err) { console.error('Welcome card error:', err); }
+});
+
+// ─── Member leaves ───────────────────────────────────────────────────────────
+// There was no guildMemberRemove handler at all, so `left` was permanently 0
+// and `real` only ever grew. The #invites panel promises "users who leave don't
+// count" — this is what makes that true.
+client.on('guildMemberRemove', async member => {
+  try {
+    const inviterId = await recordLeave(member.guild.id, member.id);
+    if (!inviterId) return;
+    const d = getUserInviteData(member.guild.id, inviterId);
+    // Clamped: a stats row rebuilt from a partial history could otherwise be
+    // driven negative by leaves whose joins predate the table.
+    if (d.real > 0) d.real--;
+    d.left++;
+    await saveInviteStats(member.guild.id, inviterId);
+
+    const settings = await getGuildSettings(member.guild.id);
+    const ch = (settings.invitesChannelId && member.guild.channels.cache.get(settings.invitesChannelId))
+      || findChannelByName(member.guild, settings.invitesChannelName);
+    if (!ch) return;
+    await ch.send({
+      embeds: [new EmbedBuilder()
+        .setColor(0xED4245)
+        .setAuthor({ name: member.user?.tag || member.id, iconURL: member.user?.displayAvatarURL?.() })
+        .setDescription(`👋 **${member.user?.tag || member.id}** left — invited by <@${inviterId}>, who is now on **${d.real}** real invite${d.real === 1 ? '' : 's'}.`)
+        .setFooter({ text: 'UH SERVICES • Invite Tracker' })
+        .setTimestamp()],
+    }).catch(() => {});
+  } catch (err) { console.error('Invite leave-tracking error:', err); }
 });
 
 // ─── Messages ─────────────────────────────────────────────────────────────────
@@ -1603,7 +1786,7 @@ client.on('interactionCreate', async interaction => {
     // SMS Gen (commands + select menus + buttons)
     const _smsCmd = interaction.commandName || '';
     const _smsId  = interaction.customId || '';
-    if (['gennumber', 'post-smsgen', 'set-5sim-api', 'set-smspool-api'].includes(_smsCmd) || _smsId.startsWith('sms_')) {
+    if (['gennumber', 'post-smsgen', 'set-5sim-api', 'set-smspool-api', 'set-smsgen-channel'].includes(_smsCmd) || _smsId.startsWith('sms_')) {
       // await, not a bare return: inside an async fn  resolves this
       // function WITH p, so a rejection escapes the enclosing try/catch and
       // becomes an unhandled rejection — which Node 20 turns into process exit.
@@ -1628,7 +1811,7 @@ client.on('interactionCreate', async interaction => {
         const embed = new EmbedBuilder()
           .setTitle('🤖 UH Super Bot — All Commands').setColor(0x5865F2)
           .addFields(
-            { name: '🔐 Verification & Invites', value: '`/setup-verify` — Set up verification channel\n`/setup-invites` — Set up invite reward channel', inline: false },
+            { name: '🔐 Verification & Invites', value: '`/setup-verify` — Set up verification channel\n`/setup-invites` — Set up invite reward channel\n`/show-voucher-stats` — Invite leaderboard / one member\'s stats', inline: false },
             { name: '📦 Products & Downloads', value: '`/downloads` — Browse & download products\n`/setupdownloads` — Post download panel to #downloads\n`/setdownload` — Set a product download link', inline: false },
             { name: '📣 Updates & Status', value: '`/postupdate` — Post a product update\n`/statusupdate` — Post a status update\n`/announce` — Send a custom announcement', inline: false },
             { name: '🌐 Server Setup', value: '`/setwebsite` — Pin website URL\n`/setupreseller` — Post reseller panel\n`/setresellerlinks` — Update reseller button links\n`/postimage` — Post an image', inline: false },
@@ -1697,6 +1880,82 @@ client.on('interactionCreate', async interaction => {
       }
 
       // ── /setup-invites ────────────────────────────────────────────────────
+      // ── /show-voucher-stats ───────────────────────────────────────────────
+      if (cmd === 'show-voucher-stats') {
+        const guild    = interaction.guild;
+        const wantsPublic = interaction.options.getBoolean('public') === true;
+        const isStaff  = interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
+        // Anyone can look, but only staff can put the leaderboard in a channel —
+        // otherwise it is a one-command spam tool.
+        const ephemeral = !(wantsPublic && isStaff);
+        await interaction.deferReply({ ephemeral });
+
+        const settings = await getGuildSettings(guild.id);
+        const N        = settings.invitesNeeded || 10;
+        const target   = interaction.options.getUser('user');
+
+        if (target) {
+          const d = getUserInviteData(guild.id, target.id);
+          const available = Math.max(0, Math.floor(d.real / N) - d.usedKeys);
+          const filled    = Math.round(((d.real % N) / N) * 10);
+          const bar       = '█'.repeat(filled) + '░'.repeat(10 - filled);
+          // Who they actually brought in, straight from the join log — the
+          // counters cannot answer this.
+          let names = [];
+          try {
+            const { rows } = await db.query(
+              `SELECT member_id, left_at FROM invite_joins
+               WHERE guild_id = $1 AND inviter_id = $2
+               ORDER BY joined_at DESC LIMIT 15`,
+              [String(guild.id), String(target.id)]
+            );
+            names = rows.map(r => `${r.left_at ? '👋' : '✅'} <@${r.member_id}>`);
+          } catch (e) { console.error('[Invites] join list failed:', e.message); }
+
+          const embed = new EmbedBuilder()
+            .setColor(0x00e5ff)
+            .setAuthor({ name: target.tag, iconURL: target.displayAvatarURL() })
+            .setTitle('📊 Invite Stats')
+            .setDescription(`**Progress to next reward**\n${bar} ${d.real % N}/${N}`)
+            .addFields(
+              { name: '📨 Total',  value: `\`${d.total}\``, inline: true },
+              { name: '✅ Real',   value: `\`${d.real}\``,  inline: true },
+              { name: '👋 Left',   value: `\`${d.left}\``,  inline: true },
+              { name: '🚫 Fake',   value: `\`${d.fake}\``,  inline: true },
+              { name: '🎁 Available', value: `\`${available}\``, inline: true },
+              { name: '🔑 Used',   value: `\`${d.usedKeys}\``, inline: true },
+              { name: `👥 Invited (${names.length})`, value: names.length ? names.join('\n').slice(0, 1024) : '_nobody yet_', inline: false },
+            )
+            .setFooter({ text: 'UH SERVICES • Invite Tracker' })
+            .setTimestamp();
+          return interaction.editReply({ embeds: [embed] });
+        }
+
+        const board = [...getGuildData(guild.id).entries()]
+          .filter(([, d]) => d.total > 0)
+          .sort((a, b) => b[1].real - a[1].real || b[1].total - a[1].total);
+
+        if (!board.length) {
+          return interaction.editReply({ content: '📭 No invites tracked yet.' });
+        }
+
+        const medals = ['🥇', '🥈', '🥉'];
+        // Discord caps a description at 4096 chars; 25 rows is well inside it
+        // and past the point anyone reads.
+        const lines = board.slice(0, 25).map(([uid, d], i) => {
+          const avail = Math.max(0, Math.floor(d.real / N) - d.usedKeys);
+          return `${medals[i] || `\`${String(i + 1).padStart(2)}\``} <@${uid}> — **${d.real}** real · ${d.total} total · ${d.left} left · ${d.fake} fake${avail ? ` · 🎁 ${avail}` : ''}`;
+        });
+
+        const embed = new EmbedBuilder()
+          .setColor(0x00e5ff)
+          .setTitle('📊 Invite Leaderboard')
+          .setDescription(lines.join('\n'))
+          .setFooter({ text: `${board.length} member(s) with invites • ${N} real invites = 1 key` })
+          .setTimestamp();
+        return interaction.editReply({ embeds: [embed] });
+      }
+
       if (cmd === 'setup-invites') {
         await interaction.deferReply({ ephemeral: true });
         const guild = interaction.guild;
@@ -2193,16 +2452,21 @@ client.on('interactionCreate', async interaction => {
           )
           .setFooter({ text: BOT_NAME, iconURL: client.user.displayAvatarURL() });
 
-        const genRow = new ActionRowBuilder().addComponents(
-          ...GEN_PANEL_TYPES.map(t =>
-            new ButtonBuilder().setCustomId(`gensteam_claim::${t.type}`).setLabel(t.label).setEmoji(t.emoji).setStyle(ButtonStyle.Primary)
-          )
+        // Chunked into rows of 5. Discord rejects the whole message if a row is
+        // over-full, which would silently break the panel the moment someone
+        // adds a fifth or sixth account type.
+        const genButtons = GEN_PANEL_TYPES.map(t =>
+          new ButtonBuilder().setCustomId(`gensteam_claim::${t.type}`).setLabel(t.label).setEmoji(t.emoji).setStyle(ButtonStyle.Primary)
         );
+        const genRows = [];
+        for (let i = 0; i < genButtons.length; i += 5) {
+          genRows.push(new ActionRowBuilder().addComponents(...genButtons.slice(i, i + 5)));
+        }
         const utilRow = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('gensteam_check_stock').setLabel('Check Stock').setEmoji('📦').setStyle(ButtonStyle.Secondary)
         );
 
-        await channel.send({ embeds: [embed], components: [genRow, utilRow] });
+        await channel.send({ embeds: [embed], components: [...genRows, utilRow] });
         await interaction.reply({ content: `✅ Posted the generator panel in <#${channel.id}>.`, flags: 64 });
         return;
       }
@@ -3375,6 +3639,9 @@ client.on('interactionCreate', async interaction => {
           await interaction.reply({ content: `❌ Need **${N} invites**. You have **${data.real}**. ${needed} more needed!`, ephemeral: true }); autoDelete(interaction, 5000); return;
         }
         data.usedKeys++;
+        // Persisted before the confirmation goes out: this counter is the only
+        // thing standing between a member and redeeming the same reward again.
+        await saveInviteStats(guild.id, member.user.id);
         const embed = new EmbedBuilder().setTitle('🎁 Key Redeemed!')
           .setDescription(`✅ You have successfully redeemed **1 key**!\n\nPlease open a **support ticket** or DM an admin to claim your reward.\n\n🔑 Keys used: **${data.usedKeys}**\n🎁 Keys remaining: **${available - 1}**`)
           .setColor(0x00e5ff).setTimestamp();

@@ -61,6 +61,42 @@ async function resolveOrder(orderId, status) {
   }
 }
 
+// A number is only worth reviving for about as long as a provider keeps it
+// alive. Past that, the resend would fail upstream anyway and the honest answer
+// is "generate a new one".
+const RECOVER_MAX_AGE_MS = 20 * 60 * 1000;
+
+// Rebuild an order that is no longer in memory — after a restart, or after its
+// grace window lapsed — so the buttons on an old message still mean something.
+// The last code is read back off the embed the button is attached to; it is not
+// a column, and it is only needed to avoid re-announcing it.
+async function recoverOrder(orderId, interaction) {
+  let row;
+  try {
+    const r = await db.query(`SELECT * FROM sms_orders WHERE order_id = $1`, [String(orderId)]);
+    row = (r.rows || [])[0];
+  } catch (e) {
+    console.error('[SMS] could not load order', orderId, '-', e.message);
+    return null;
+  }
+  if (!row) return null;
+  const age = Date.now() - new Date(row.created_at).getTime();
+  if (!(age >= 0) || age > RECOVER_MAX_AGE_MS) return null;
+
+  const embed = interaction?.message?.embeds?.[0];
+  const codeField = (embed?.fields || []).find(f => /Your Code/i.test(f.name));
+  const lastCode = codeField ? codeField.value.replace(/[`#\s]/g, '') || null : null;
+
+  const order = {
+    orderId: String(row.order_id), provider: row.provider, serviceName: row.service_name,
+    country: row.country, number: row.number, userId: row.user_id,
+    channelId: row.channel_id, messageId: row.message_id, guildId: row.guild_id,
+    startedAt: Date.now(), pollTimer: null, graceTimer: null, lastCode,
+  };
+  activeOrders.set(String(orderId), order);
+  return order;
+}
+
 // Called once after the Discord client is ready. Any order still open is either
 // resumed (if it is inside the refund window) or cancelled and refunded now.
 async function rehydrateOrders(client) {
@@ -112,6 +148,28 @@ function saveConfig(cfg) {
 
 // ─── Active order tracker ─────────────────────────────────────────────────────
 const activeOrders = new Map();
+
+// ─── Where order cards go ─────────────────────────────────────────────────────
+// Numbers used to be posted into whatever channel the buyer ran /gennumber in,
+// which flooded #sms-verify with order cards. They now go to a dedicated
+// channel. Override order: /set-smsgen-channel → env → this default.
+const SMS_ORDER_CHANNEL_ID = '1532424953570267376';
+
+async function resolveOrderChannel(client, interaction) {
+  const cfg = loadConfig();
+  const id = cfg.orders_channel_id || process.env.SMS_GEN_CHANNEL_ID || SMS_ORDER_CHANNEL_ID;
+  if (id) {
+    try {
+      const ch = await client.channels.fetch(String(id));
+      if (ch && typeof ch.send === 'function') return ch;
+    } catch (e) {
+      // Never let a bad channel id swallow a number that has already been paid
+      // for — fall back to the channel the buyer is standing in.
+      console.error('[SMS] order channel', id, 'unusable:', e.message);
+    }
+  }
+  return interaction.channel;
+}
 
 // ─── Safe JSON fetch — handles plain-text error responses ─────────────────────
 // Timeout added: every SMSPool/5sim call goes through here, and none of them had
@@ -264,8 +322,11 @@ async function fivesimCheckSMS(apiKey, orderId) {
   const d = await safeFetch(`${FIVESIM_BASE}/user/check/${orderId}`, {
     headers: fivesimHeaders(apiKey),
   });
-  const code = d.sms && d.sms.length > 0 ? d.sms[d.sms.length - 1].code : null;
-  return { status: d.status, code };
+  // `count` lets the poller tell a genuinely new message from the same one
+  // being served again after a resend — see the isNew check in startPolling.
+  const list = Array.isArray(d.sms) ? d.sms : [];
+  const code = list.length > 0 ? list[list.length - 1].code : null;
+  return { status: d.status, code, count: list.length };
 }
 
 async function fivesimCancel(apiKey, orderId) {
@@ -315,8 +376,27 @@ function capitalize(s) {
   return s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
 }
 
-const PROVIDER_EMOJI = { smspool: '📱', '5sim': '🌐' };
+// Providers are never named to users. Which upstream a number came from is
+// supplier information, not customer information — the emoji is the entire
+// public identity of a network. `maskProvider` scrubs the names back out of
+// anything a provider hands us (their error strings are quoted verbatim to the
+// buyer, and several of them include their own brand).
+const PROVIDER_EMOJI = { smspool: '💬', '5sim': '5️⃣' };
 const PROVIDER_COLOR = { smspool: 0x5865f2, '5sim': 0x57f287 };
+const PROVIDER_BLURB = {
+  smspool: 'Fast, wide country coverage',
+  '5sim':  '135+ countries, operator selection',
+};
+
+function providerTag(provider) {
+  return PROVIDER_EMOJI[provider] || '📲';
+}
+
+function maskProvider(text) {
+  return String(text == null ? '' : text)
+    .replace(/\bsms\s*pool(\.net)?\b/gi, 'the network')
+    .replace(/\b5\s*sim(\.net)?\b/gi, 'the network');
+}
 
 function buildOrderEmbed(provider, serviceName, country, number, status, code) {
   const statusMap = {
@@ -330,9 +410,9 @@ function buildOrderEmbed(provider, serviceName, country, number, status, code) {
 
   return new EmbedBuilder()
     .setColor(s.color)
-    .setTitle(`${PROVIDER_EMOJI[provider] || '📲'} SMS Number Generated`)
+    .setTitle(`${providerTag(provider)} SMS Number Generated`)
     .addFields(
-      { name: '🔧 Provider', value: provider === '5sim' ? '5sim.net' : 'SMSPool.net', inline: true },
+      { name: '🔧 Network', value: providerTag(provider), inline: true },
       { name: '📋 Service',  value: serviceName,         inline: true },
       { name: '🌍 Country',  value: capitalize(country), inline: true },
       { name: '📞 Number',   value: `\`${number}\``,     inline: false },
@@ -343,14 +423,20 @@ function buildOrderEmbed(provider, serviceName, country, number, status, code) {
     .setTimestamp();
 }
 
-function buildOrderButtons(orderId, disabled = false, number = null) {
+// `disabled` closes the whole order out. `resendEnabled` is the exception that
+// matters: once a code has arrived the order is finished for refund purposes,
+// but "Request New SMS" must stay live — a code that Discord/Activision rejects
+// is the single most common reason a buyer needs a second one, and greying the
+// button out at exactly that moment was the reported bug.
+function buildOrderButtons(orderId, disabled = false, number = null, resendEnabled = null) {
+  const resendOff = resendEnabled === null ? disabled : !resendEnabled;
   const btns = [
     new ButtonBuilder()
       .setCustomId(`sms_resend_${orderId}`)
       .setLabel('Request New SMS')
       .setEmoji('🔄')
       .setStyle(ButtonStyle.Primary)
-      .setDisabled(disabled),
+      .setDisabled(resendOff),
     new ButtonBuilder()
       .setCustomId(`sms_cancel_${orderId}`)
       .setLabel('Cancel & Refund')
@@ -378,12 +464,12 @@ function buildPanelEmbed() {
     .setTitle('📲 SMS Number Generator')
     .setDescription(
       '**Get a temporary phone number for SMS verification on any platform.**\n\n' +
-      '> Click **Get Number** below to choose your provider, service, and country.\n\n' +
-      '**Supported Providers**\n' +
-      '> 📱 **SMSPool.net** — Fast, wide country coverage\n' +
-      '> 🌐 **5sim.net** — 135+ countries, operator selection\n\n' +
+      '> Click **Get Number** below to choose your network, service, and country.\n\n' +
+      '**Available Networks**\n' +
+      `> ${PROVIDER_EMOJI.smspool} — ${PROVIDER_BLURB.smspool}\n` +
+      `> ${PROVIDER_EMOJI['5sim']} — ${PROVIDER_BLURB['5sim']}\n\n` +
       '**How it works**\n' +
-      '> `1.` Choose provider → service → country\n' +
+      '> `1.` Choose network → service → country\n' +
       '> `2.` Bot purchases & displays your number\n' +
       '> `3.` Enter it on the site you\'re verifying\n' +
       '> `4.` Code arrives here automatically\n\n' +
@@ -410,6 +496,30 @@ function buildPanelButton() {
 const POLL_INTERVAL = 7000;
 const POLL_TIMEOUT  = 5 * 60 * 1000;
 
+// How long a delivered order stays clickable. Polling stops the moment a code
+// lands — but the order stays in `activeOrders` for this long so 🔄 Request New
+// SMS still resolves, because the button is needed precisely *after* a code has
+// arrived and been rejected by the site. It used to be deleted immediately and
+// the button disabled in the same breath, so it could never work.
+const RESEND_GRACE_MS = 15 * 60 * 1000;
+
+function scheduleGraceExpiry(orderId, apiKey) {
+  const order = activeOrders.get(orderId);
+  if (!order) return;
+  if (order.graceTimer) clearTimeout(order.graceTimer);
+  order.graceTimer = setTimeout(async () => {
+    const still = activeOrders.get(orderId);
+    if (!still || still.pollTimer) return; // resend restarted it — leave it alone
+    // 5sim's finish is deferred to here: calling it at code-receipt time closes
+    // the activation, and a closed activation can never deliver the second code
+    // the resend button exists to wait for. Money is already committed at
+    // purchase, and 5sim only auto-refunds when no SMS arrived, so holding the
+    // order open through the grace window costs nothing.
+    if (still.provider === '5sim') await fivesimFinish(apiKey, orderId).catch(() => {});
+    activeOrders.delete(orderId);
+  }, RESEND_GRACE_MS);
+}
+
 async function startPolling(client, orderId, orderData) {
   const cfg    = loadConfig();
   const { provider, serviceName, country, number, userId, channelId, messageId } = orderData;
@@ -422,19 +532,32 @@ async function startPolling(client, orderId, orderData) {
 
   const poll = async () => {
     if (Date.now() - start > POLL_TIMEOUT) {
+      // A number that already delivered a code has been paid for and used, so
+      // it must not be announced as "cancelled & refunded" — that is a second
+      // code that never came, not a failed purchase.
+      const hadCode = !!orderData.lastCode;
       try {
-        if (provider === '5sim') await fivesimCancel(apiKey, orderId);
-        else await smspoolCancel(apiKey, orderId);
+        if (provider === '5sim') {
+          if (hadCode) await fivesimFinish(apiKey, orderId);
+          else await fivesimCancel(apiKey, orderId);
+        } else if (!hadCode) {
+          await smspoolCancel(apiKey, orderId);
+        }
         const ch  = await client.channels.fetch(channelId);
         const msg = await ch.messages.fetch(messageId);
         await msg.edit({
-          embeds: [buildOrderEmbed(provider, serviceName, country, number, 'failed')],
+          embeds: [buildOrderEmbed(provider, serviceName, country, number, hadCode ? 'received' : 'failed', orderData.lastCode)],
           components: [buildOrderButtons(orderId, true, number)],
         });
-        await ch.send({ content: `<@${userId}> ⏰ No SMS after 5 minutes — number cancelled & balance refunded.` });
+        await ch.send({
+          content: hadCode
+            ? `<@${userId}> ⌛ No further codes arrived — this number is now closed. Generate a new one if you still need to verify.`
+            : `<@${userId}> ⏰ No SMS after 5 minutes — number cancelled & balance refunded.`,
+        });
       } catch {}
+      if (orderData.graceTimer) clearTimeout(orderData.graceTimer);
       activeOrders.delete(orderId);
-      await resolveOrder(orderId, 'failed');
+      await resolveOrder(orderId, hadCode ? 'received' : 'failed');
       return;
     }
 
@@ -446,16 +569,31 @@ async function startPolling(client, orderId, orderData) {
       const ch  = await client.channels.fetch(channelId);
       const msg = await ch.messages.fetch(messageId);
 
-      if (result.code) {
-        if (provider === '5sim') await fivesimFinish(apiKey, orderId);
+      // Both providers keep serving the LAST code from /check, so after a
+      // resend the very first poll would re-announce the code the buyer just
+      // told us didn't work. 5sim gives a message count to compare against;
+      // SMSPool only the code itself.
+      const isNew = !!result.code && (
+        result.count != null
+          ? result.count > (orderData.smsSeen || 0)
+          : result.code !== orderData.lastCode
+      );
+
+      if (isNew) {
+        orderData.lastCode = result.code;
+        if (result.count != null) orderData.smsSeen = result.count;
         await msg.edit({
           embeds: [buildOrderEmbed(provider, serviceName, country, number, 'received', result.code)],
-          components: [buildOrderButtons(orderId, true, number)],
+          components: [buildOrderButtons(orderId, true, number, true)],
         });
         await ch.send({
           content: `<@${userId}> ✅ Your SMS code: **\`${result.code}\`**\n> Code didn't work? Hit **🔄 Request New SMS** above.`,
         });
-        activeOrders.delete(orderId);
+        // Stop polling but keep the order alive so the resend button resolves.
+        if (orderData.pollTimer) clearTimeout(orderData.pollTimer);
+        orderData.pollTimer = null;
+        activeOrders.set(orderId, orderData);
+        scheduleGraceExpiry(orderId, apiKey);
         await resolveOrder(orderId, 'received');
         return;
       }
@@ -501,20 +639,20 @@ async function showProviderPicker(interaction) {
   }
 
   const options = [];
-  if (hasSmspool) options.push({ label: 'SMSPool.net', value: 'smspool', emoji: '📱', description: 'Fast, wide country coverage' });
-  if (hasFivesim) options.push({ label: '5sim.net',    value: '5sim',    emoji: '🌐', description: '135+ countries, operator selection' });
+  if (hasSmspool) options.push({ label: `${PROVIDER_EMOJI.smspool}  Network`, value: 'smspool', emoji: PROVIDER_EMOJI.smspool, description: PROVIDER_BLURB.smspool });
+  if (hasFivesim) options.push({ label: `${PROVIDER_EMOJI['5sim']}  Network`, value: '5sim',    emoji: PROVIDER_EMOJI['5sim'], description: PROVIDER_BLURB['5sim'] });
 
   const row = new ActionRowBuilder().addComponents(
     new StringSelectMenuBuilder()
       .setCustomId('sms_pick_provider')
-      .setPlaceholder('1️⃣  Choose a provider...')
+      .setPlaceholder('1️⃣  Choose a network...')
       .addOptions(options)
   );
 
   const embed = new EmbedBuilder()
     .setColor(0x5865f2)
     .setTitle('📲 SMS Number Generator')
-    .setDescription('**Step 1 of 3** — Select a provider')
+    .setDescription('**Step 1 of 3** — Select a network')
     .setFooter({ text: 'UH SERVICES • SMS Gen' });
 
   if (interaction.replied || interaction.deferred)
@@ -547,6 +685,14 @@ const commands = [
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
   new SlashCommandBuilder()
+    .setName('set-smsgen-channel')
+    .setDescription('Staff: Set the channel SMS order cards are posted to')
+    .addChannelOption(o =>
+      o.setName('channel').setDescription('Channel for generated numbers').setRequired(true)
+    )
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+
+  new SlashCommandBuilder()
     .setName('set-smspool-api')
     .setDescription('🔑 Set or rotate the SMSPool.net API key')
     .addStringOption(o => o.setName('key').setDescription('Your SMSPool API key').setRequired(true))
@@ -570,6 +716,13 @@ async function handleSMSInteraction(interaction, client) {
     const key = interaction.options.getString('key');
     saveConfig({ ...cfg, smspool_key: key });
     return interaction.reply({ content: '✅ SMSPool API key saved.', ephemeral: true });
+  }
+
+  // ── /set-smsgen-channel ────────────────────────────────────────────────────
+  if (interaction.commandName === 'set-smsgen-channel') {
+    const ch = interaction.options.getChannel('channel');
+    saveConfig({ ...cfg, orders_channel_id: String(ch.id) });
+    return interaction.reply({ content: `✅ Generated numbers will be posted in <#${ch.id}>.`, ephemeral: true });
   }
 
   // ── /post-smsgen ───────────────────────────────────────────────────────────
@@ -603,7 +756,7 @@ async function handleSMSInteraction(interaction, client) {
         ? await fivesimGetProducts(apiKey)
         : await smspoolGetServices(apiKey);
     } catch (e) {
-      return interaction.editReply({ content: `❌ Failed to fetch services: ${e.message}`, embeds: [], components: [] });
+      return interaction.editReply({ content: `❌ Failed to fetch services: ${maskProvider(e.message)}`, embeds: [], components: [] });
     }
 
     // Cache full list for this user
@@ -624,7 +777,7 @@ async function handleSMSInteraction(interaction, client) {
       embeds: [
         new EmbedBuilder()
           .setColor(PROVIDER_COLOR[provider] || 0x5865f2)
-          .setTitle(`${PROVIDER_EMOJI[provider]} ${provider === '5sim' ? '5sim.net' : 'SMSPool.net'}`)
+          .setTitle(`${providerTag(provider)} Select Service`)
           .setDescription(`**Step 2 of 3** — Find the service you need\n${total} services available — type a name to search`)
           .setFooter({ text: 'UH SERVICES • SMS Gen' }),
       ],
@@ -744,7 +897,7 @@ async function handleSMSInteraction(interaction, client) {
         embeds: [
           new EmbedBuilder()
             .setColor(PROVIDER_COLOR[provider] || 0x5865f2)
-            .setTitle(`${PROVIDER_EMOJI[provider]} ${provider === '5sim' ? '5sim.net' : 'SMSPool.net'}`)
+            .setTitle(`${providerTag(provider)} Select Service`)
             .setDescription(`**Step 2 of 3** — Page ${newPage + 1} of ${Math.ceil(total / PAGE_SIZE)}\n${total} services available`)
             .setFooter({ text: 'UH SERVICES • SMS Gen' }),
         ],
@@ -766,7 +919,7 @@ async function handleSMSInteraction(interaction, client) {
         ? await fivesimGetCountries(apiKey)
         : await smspoolGetCountries(apiKey, serviceVal);
     } catch (e) {
-      return interaction.editReply({ content: `❌ Failed to fetch countries: ${e.message}`, embeds: [], components: [] });
+      return interaction.editReply({ content: `❌ Failed to fetch countries: ${maskProvider(e.message)}`, embeds: [], components: [] });
     }
 
     if (provider === '5sim') countries.unshift({ label: '🌍 Any Country (cheapest available)', value: 'any' });
@@ -831,7 +984,7 @@ async function handleSMSInteraction(interaction, client) {
       try {
         operators = await fivesimGetOperators(apiKey, country, session.serviceVal);
       } catch (e) {
-        return interaction.editReply({ content: `❌ ${e.message}`, embeds: [], components: [] });
+        return interaction.editReply({ content: `❌ ${maskProvider(e.message)}`, embeds: [], components: [] });
       }
       session.operators = operators;
 
@@ -878,8 +1031,19 @@ async function handleSMSInteraction(interaction, client) {
     if (!order) return interaction.reply({ content: '❌ Order not found or already resolved.', ephemeral: true });
     if (order.userId !== userId) return interaction.reply({ content: '❌ Only the person who ordered this can cancel it.', ephemeral: true });
 
+    // A number that already delivered a code cannot be refunded — the order is
+    // only being held open so 🔄 Request New SMS works. Cancelling it here
+    // would promise money back that the provider will never return.
+    if (order.lastCode) {
+      return interaction.reply({
+        content: '❌ This number already received a code, so it can no longer be refunded.\nUse **🔄 Request New SMS** to ask for another code on it, or generate a fresh number.',
+        ephemeral: true,
+      });
+    }
+
     await interaction.deferUpdate();
     if (order.pollTimer) clearTimeout(order.pollTimer);
+    if (order.graceTimer) clearTimeout(order.graceTimer);
     activeOrders.delete(orderId);
 
     const apiKey = order.provider === '5sim' ? cfg.fivesim_key : cfg.smspool_key;
@@ -896,11 +1060,26 @@ async function handleSMSInteraction(interaction, client) {
   }
 
   // ── Button: Request New SMS ────────────────────────────────────────────────
+  // Reachable in two states: while still waiting for the first code, and — the
+  // case that was broken — after a code arrived and the site rejected it. In
+  // that second state the order had been deleted from memory a moment earlier,
+  // so this answered "Order not found or already resolved" every time.
   if (interaction.isButton() && interaction.customId.startsWith('sms_resend_')) {
     const orderId = interaction.customId.replace('sms_resend_', '');
-    const order   = activeOrders.get(orderId);
-    if (!order) return interaction.reply({ content: '❌ Order not found or already resolved.', ephemeral: true });
-    if (order.userId !== userId) return interaction.reply({ content: '❌ Only the person who ordered this can do this.', ephemeral: true });
+    let order = activeOrders.get(orderId);
+
+    // Restarts drop the in-memory order; the row outlives them, so rebuild from
+    // it rather than telling the buyer their paid-for number does not exist.
+    if (!order) order = await recoverOrder(orderId, interaction);
+    if (!order) {
+      return interaction.reply({
+        content: '❌ This number is closed — a new code can no longer be requested on it. Generate a fresh number with **📲 Get Number**.',
+        ephemeral: true,
+      });
+    }
+    if (String(order.userId) !== String(userId)) {
+      return interaction.reply({ content: '❌ Only the person who ordered this can do this.', ephemeral: true });
+    }
 
     await interaction.deferUpdate();
     const apiKey = order.provider === '5sim' ? cfg.fivesim_key : cfg.smspool_key;
@@ -909,18 +1088,37 @@ async function handleSMSInteraction(interaction, client) {
       const ok = await smspoolResend(apiKey, orderId);
       if (!ok) {
         return interaction.followUp({
-          content: '❌ Resend not available for this number.\nHit **🚫 Cancel & Refund** to get your balance back, then try again.',
+          content: order.lastCode
+            ? '❌ This number will not accept another code request — it has already been used once. Generate a fresh number with **📲 Get Number**.'
+            : '❌ Resend not available for this number.\nHit **🚫 Cancel & Refund** to get your balance back, then try again.',
           ephemeral: true,
         });
       }
     }
+    // 5sim has no resend endpoint — the buyer re-triggers the SMS on the site
+    // themselves and the number simply has to still be listening. That is what
+    // the deferred finish in scheduleGraceExpiry buys us.
 
     const { provider, serviceName, country, number } = order;
     await interaction.message.edit({
-      embeds: [buildOrderEmbed(provider, serviceName, country, number, 'resent')],
+      embeds: [buildOrderEmbed(provider, serviceName, country, number, 'resent', order.lastCode)],
       components: [buildOrderButtons(orderId, false, number)],
     });
-    return interaction.followUp({ content: '🔄 Re-request sent — still watching for your code...', ephemeral: true });
+
+    // Fresh watch window. startedAt is reset deliberately: this is a new wait,
+    // and the old timestamp would time the request out on its first tick.
+    if (order.graceTimer) clearTimeout(order.graceTimer);
+    order.graceTimer = null;
+    if (order.pollTimer) clearTimeout(order.pollTimer);
+    order.startedAt = Date.now();
+    await startPolling(client, orderId, order);
+
+    return interaction.followUp({
+      content: order.lastCode
+        ? '🔄 Watching for a **new** code on this number — trigger the SMS again on the site. The code above will not be repeated.'
+        : '🔄 Re-request sent — still watching for your code...',
+      ephemeral: true,
+    });
   }
 
   // ── Button: Copy Number ────────────────────────────────────────────────────
@@ -957,7 +1155,7 @@ async function purchaseNumber(interaction, client, provider, apiKey, session, co
         new EmbedBuilder()
           .setColor(0xed4245)
           .setTitle('❌ Failed to Purchase Number')
-          .setDescription(`**${e.message}**\n\nNo charge was applied. Try a different country or provider.`)
+          .setDescription(`**${maskProvider(e.message)}**\n\nNo charge was applied. Try a different country or network.`)
           .setFooter({ text: 'UH SERVICES • SMS Gen' }),
       ],
       components: [],
@@ -967,12 +1165,18 @@ async function purchaseNumber(interaction, client, provider, apiKey, session, co
   // Clean up session cache
   userSessionCache.delete(interaction.user.id);
 
+  const target = await resolveOrderChannel(client, interaction);
+
   await interaction.editReply({
-    embeds: [new EmbedBuilder().setColor(0x57f287).setDescription('✅ Number purchased! Your order is posted below.')],
+    embeds: [new EmbedBuilder().setColor(0x57f287).setDescription(
+      target.id === interaction.channel?.id
+        ? '✅ Number purchased! Your order is posted below.'
+        : `✅ Number purchased! Your order is posted in <#${target.id}>.`
+    )],
     components: [],
   });
 
-  const publicMsg = await interaction.channel.send({
+  const publicMsg = await target.send({
     content: `<@${interaction.user.id}>`,
     embeds:  [buildOrderEmbed(provider, serviceName, country, number, 'waiting')],
     components: [buildOrderButtons(orderId, false, number)],
@@ -982,10 +1186,13 @@ async function purchaseNumber(interaction, client, provider, apiKey, session, co
     orderId,
     provider, serviceName, country, number,
     userId:    interaction.user.id,
-    channelId: interaction.channel.id,
+    channelId: target.id,
     messageId: publicMsg.id,
     guildId:   interaction.guildId || null,
     pollTimer: null,
+    graceTimer: null,
+    lastCode:  null,
+    smsSeen:   0,
   };
 
   // Persist BEFORE polling starts: the money has already left the provider
