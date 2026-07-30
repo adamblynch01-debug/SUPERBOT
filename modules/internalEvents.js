@@ -83,19 +83,50 @@ function requireSecret(req, res, next) {
 }
 
 // ─── channel resolution ──────────────────────────────────────────────────────
-// Preserved from paymentBridge: the order log channel is whatever was last set
-// via /config set logchan, which writes into the same Postgres `config` table
-// the backend reads. Looking it up beats trusting a possibly-stale env var
-// duplicated across two Railway services.
+// THE ORDER LOG BUG LIVED HERE. Every order notification returned HTTP 200 and
+// posted nothing, because this lookup could never succeed:
+//
+//   * The `config` table is keyed (guild_id, key) — but it is EMPTY in
+//     production (verified 2026-07-26), and the two repos even disagreed about
+//     whether guild_id exists at all. So the SELECT returned zero rows.
+//   * The bot defaults GUILD_ID to null, so `WHERE guild_id = NULL` matches
+//     nothing even when rows do exist.
+//   * The catch swallowed any error into a console line nobody reads.
+//   * Nothing on the bot side read ORDER_LOG_CHANNEL_ID from the environment,
+//     so the one thing an operator can actually set was ignored.
+//
+// Env var first now: it is operator-settable, it survives an empty config
+// table, and it does not depend on two services agreeing on a guild id. The DB
+// lookup remains as a fallback for /config set logchan, and tolerates a table
+// with or without guild_id rather than throwing.
 async function getLogChannelId(guildId) {
+  // Railway is the source of truth, by the owner's decision (2026-07-26).
+  // The env var wins outright and the DB is never consulted when it is set.
+  const fromEnv = process.env.ORDER_LOG_CHANNEL_ID || process.env.ORDERS_CHANNEL_ID;
+  if (fromEnv && String(fromEnv).trim()) return String(fromEnv).trim();
+
+  // Only reached if the variable is missing. The backend now refuses to store
+  // this key in `config` at all, so a row here is stale — name it rather than
+  // using it silently, because a wrong channel id looks exactly like the
+  // original "orders never log" bug.
   try {
     const { rows } = await query(
-      `SELECT value FROM config WHERE guild_id = $1 AND key = 'ORDER_LOG_CHANNEL_ID'`,
-      [guildId]
+      `SELECT value FROM config
+        WHERE key = 'ORDER_LOG_CHANNEL_ID'
+          AND (guild_id = $1 OR guild_id IS NULL)
+        ORDER BY guild_id NULLS LAST
+        LIMIT 1`,
+      [guildId || null]
     );
-    return rows[0]?.value || null;
+    if (rows[0]?.value) {
+      console.warn('[Internal] ORDER_LOG_CHANNEL_ID is NOT set in the environment — falling back to a `config` table row. Set the Railway variable and delete that row.');
+      return rows[0].value;
+    }
+    return null;
   } catch (err) {
-    console.error('[Internal] Could not read log channel from config:', err.message);
+    // Loud on purpose: a schema mismatch here silently disables the entire
+    // order feed, which is exactly how this went unnoticed.
+    console.error('[Internal] ORDER_LOG_CHANNEL_ID config lookup FAILED — order log is disabled until ORDER_LOG_CHANNEL_ID is set as an env var:', err.message);
     return null;
   }
 }
@@ -131,17 +162,39 @@ async function firstSendable(client, ids) {
 }
 
 function registerInternalRoutes(app, client) {
+  // LOG_CHANNEL_ID is NOT in these chains, deliberately.
+  //
+  // It belongs to the anti-scam module (modules/antiscam.js:16) — it is the
+  // moderation log. Having it as the last fallback here meant that while
+  // ORDER_LOG_CHANNEL_ID was unset, every "Order Delivered" embed and every
+  // ops alert was posted into #ANTI-SCAM-BOT, mixed in with scam warnings.
+  // Customer emails and order ids ended up in a moderation channel, and the
+  // order log looked like it "worked" so the real misconfiguration stayed
+  // hidden.
+  //
+  // A missing order channel is now a visible failure (503 to the backend, which
+  // logs it) rather than a quiet delivery to the wrong room.
+  // Orders and ops alerts are DIFFERENT audiences and belong in different
+  // channels. Order embeds are a business feed staff read for fulfilment; ops
+  // alerts are infrastructure noise (a watcher losing its connection, a
+  // payment that could not be matched) that would drown the order feed if
+  // mixed in.
+  //
+  // So: ALERTS_CHANNEL_ID is checked FIRST for alerts and is never used for
+  // orders. If it is set, alerts go there and nowhere near the order log. The
+  // remaining entries are a safety net for the case where it is unset — an
+  // alert nobody sees is worse than an alert in the wrong room, which is the
+  // one place that trade-off is worth making. Orders have no such net: a
+  // misdelivered order embed leaks customer emails, so it fails loudly instead.
   const ordersChannel = async (guildId) => firstSendable(client, [
     await getLogChannelId(guildId),
     process.env.ORDERS_CHANNEL_ID,
-    process.env.LOG_CHANNEL_ID,
   ]);
 
   const alertsChannel = async (guildId) => firstSendable(client, [
     process.env.ALERTS_CHANNEL_ID,
     await getLogChannelId(guildId),
     process.env.ORDERS_CHANNEL_ID,
-    process.env.LOG_CHANNEL_ID,
   ]);
 
   // Last resort for anything a human must see. An ops alert with no channel
@@ -165,8 +218,15 @@ function registerInternalRoutes(app, client) {
     try {
       const ch = await ordersChannel(order.guild_id || process.env.GUILD_ID);
       if (!ch) {
-        console.warn('[Internal] new_order: no order log channel (set one with /config set logchan)');
-        return res.json({ ok: true, posted: false, reason: 'no channel configured' });
+        // 503, NOT 200. This used to answer `{ok:true, posted:false}`, and the
+        // backend's notifyBot only inspected `handled` — so "there is nowhere
+        // to send this" read as success on both sides and every order
+        // notification vanished with no log line anywhere.
+        console.error('[Internal] new_order DROPPED: no order log channel. Set ORDER_LOG_CHANNEL_ID on this service, or run /config set logchan.');
+        return res.status(503).json({
+          ok: false, posted: false, handled: false,
+          error: 'no order log channel configured',
+        });
       }
 
       const embed = new EmbedBuilder()
@@ -269,7 +329,11 @@ function registerInternalRoutes(app, client) {
         await ch.send({ embeds: [logEmbed] });
         out.posted = true;
       } else {
-        console.warn('[Internal] deliver_goods: no order log channel configured');
+        // The customer still got their keys (the DM above is what matters to
+        // them), but staff have no record of it. Say so loudly rather than
+        // reporting a clean success.
+        console.error('[Internal] deliver_goods: order log channel MISSING — delivery happened but was not logged to Discord. Set ORDER_LOG_CHANNEL_ID.');
+        out.log_channel_missing = true;
       }
 
       return res.json(out);

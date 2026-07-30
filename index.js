@@ -22,6 +22,19 @@ const fs     = require('fs');
 const path   = require('path');
 const crypto = require('crypto');
 const axios  = require('axios');
+
+// Every axios call in this file talked to the payment backend with NO timeout,
+// so a backend that accepts the TCP connection and never responds (Railway
+// mid-deploy, Supabase holding a connection) left the promise unsettled
+// forever: the deferred interaction spun until Discord gave up, the handler's
+// closure was retained, and when the socket finally errored — past the
+// 15-minute token window — the catch's editReply threw 10015 on top.
+//
+// Set on the module default rather than a new instance so it covers all 19 call
+// sites, including any added later. A timeout surfaces as ECONNABORTED, which
+// the existing `catch (err) { ... err.message }` blocks already handle.
+axios.defaults.timeout = Number(process.env.HTTP_TIMEOUT_MS) || 10000;
+
 const db     = require('./db');
 
 // ─── Modules ─────────────────────────────────────────────────────────────────
@@ -44,11 +57,17 @@ const API_SECRET     = process.env.API_SECRET;
 // Verify/Welcome module — these are now the FALLBACK defaults only, used
 // when a guild has no row in guild_settings yet (see getGuildSettings()
 // below). Your original server keeps behaving exactly as before.
+//
+// The literal snowflakes below are this store's own channels. They are only
+// ever reached when `isOriginal` is true (guildId === GUILD_ID), so a second
+// install can never post customer data into them — but they were not
+// overridable either, which meant moving a channel required a code change.
+// Env var first now, literal as the last resort.
 const VERIFIED_ROLE_ENV  = process.env.VERIFIED_ROLE_NAME  || 'Verified';
 const VERIFY_CHANNEL_ENV = process.env.VERIFY_CHANNEL_NAME || 'get-verify';
 const WELCOME_CHANNEL_ENV= process.env.WELCOME_CHANNEL_NAME|| 'welcome';
-const WELCOME_CHANNEL_ID = '1400773021274341396';
-const INVITES_CHANNEL_ID = '1482585544998256781';
+const WELCOME_CHANNEL_ID = process.env.WELCOME_CHANNEL_ID || '1400773021274341396';
+const INVITES_CHANNEL_ID = process.env.INVITES_CHANNEL_ID || '1482585544998256781';
 const INVITES_CHANNEL_ENV= process.env.INVITES_CHANNEL_NAME|| 'invites';
 const INVITES_NEEDED_ENV = parseInt(process.env.INVITES_NEEDED || '10');
 
@@ -56,17 +75,49 @@ const INVITES_NEEDED_ENV = parseInt(process.env.INVITES_NEEDED || '10');
 const BOT_NAME  = process.env.BOT_NAME  || 'UH Services';
 const SITE_URL  = process.env.SITE_URL  || '';
 
-// Vouch module
-const LEAVE_VOUCH_CHANNEL_ID = '1522983274417360896'; // #leave-vouch — panel lives here
-const VOUCHES_CHANNEL_ID     = '1242134878263447552'; // #vouches — results get posted here
+// Vouch module — env-overridable, same reasoning as the channels above.
+const LEAVE_VOUCH_CHANNEL_ID = process.env.LEAVE_VOUCH_CHANNEL_ID || '1522983274417360896'; // #leave-vouch — panel lives here
+const VOUCHES_CHANNEL_ID     = process.env.VOUCHES_CHANNEL_ID     || '1242134878263447552'; // #vouches — results get posted here
 
 // Counting game module
-const COUNTING_CHANNEL_ID = '1484663384443064510'; // #counting-game
+const COUNTING_CHANNEL_ID = process.env.COUNTING_CHANNEL_ID || '1484663384443064510'; // #counting-game
 
 if (!TOKEN || !CLIENT_ID) {
   console.error('❌ Missing DISCORD_TOKEN or CLIENT_ID in environment variables!');
   process.exit(1);
 }
+
+// ─── Startup environment check ───────────────────────────────────────────────
+// Only TOKEN and CLIENT_ID were checked, so the bot booted green and looked
+// healthy while whole subsystems were silently dead: no API_SECRET meant every
+// call to the payment backend came back 401 and was swallowed; no
+// ORDER_LOG_CHANNEL_ID meant the order feed posted nowhere (the bug that
+// prompted this audit). Fail loudly for the ones nothing works without, and
+// warn clearly for the ones that disable a feature.
+(function checkEnvironment() {
+  const required = { API_SECRET: 'the payment backend rejects every call from this bot', GUILD_ID: 'per-guild lookups resolve to nothing' };
+  const recommended = {
+    ORDER_LOG_CHANNEL_ID: 'new orders and deliveries will NOT be posted to Discord',
+    ALERTS_CHANNEL_ID: 'ops alerts (watcher failures, unmatched payments) will fall into the order log instead of their own channel',
+    BACKEND_URL: 'defaults to localhost — backend calls will fail on Railway',
+    OWNER_DISCORD_ID: 'owner-only commands fall back to Administrator only',
+    STAFF_ROLE_ID: 'staff access falls back to matching a role NAMED "MODERATOR"',
+    DATABASE_URL: 'settings, tickets and vouches cannot be read or written',
+    DATA_DIR: 'state is written to the container and lost on every deploy',
+  };
+
+  const missingRequired = Object.keys(required).filter(k => !process.env[k]);
+  const missingRecommended = Object.keys(recommended).filter(k => !process.env[k]);
+
+  for (const k of missingRequired) console.error(`❌ Missing ${k} — ${required[k]}`);
+  for (const k of missingRecommended) console.warn(`⚠  Missing ${k} — ${recommended[k]}`);
+
+  if (missingRequired.length) {
+    console.error('❌ Refusing to start with the above missing. Set them on the Railway service.');
+    process.exit(1);
+  }
+  if (!missingRecommended.length) console.log('✅ Environment check passed.');
+})();
 
 // ─── Discord Client ──────────────────────────────────────────────────────────
 const client = new Client({
@@ -900,11 +951,44 @@ function getProductColor(name) {
   return productColorMap[k];
 }
 
+// Gate for the money/config commands (/config, /order, /shopstock,
+// /web-balance, /webstatus, /webreviews, /giveaway, /addstock, /clearstock).
+//
+// This used to accept ANY member holding a role literally named 'MODERATOR' —
+// the obvious name to give a community helper. That role could then run
+// `/config set setting:btcxpub value:<their own xpub>` and redirect every
+// crypto payment the store receives, or `/web-balance adjust` to mint credit,
+// or `/order forceconfirm` to deliver an unpaid order. A role NAME is not a
+// permission: anyone who can create or rename a role can grant it.
+//
+// Now: Administrator, or the configured staff role BY ID, or an env-set
+// STAFF_ROLE_ID. The name check is kept only as a last-resort bootstrap when no
+// id is configured anywhere, and it warns loudly so it gets fixed.
 function hasAccess(interaction) {
   const member = interaction.member;
-  if (member.permissions.has('Administrator')) return true;
-  if (member.roles.cache.some(r => r.name === 'MODERATOR')) return true;
+  if (!member || !interaction.guild) return false;
+  if (member.permissions.has(PermissionFlagsBits.Administrator)) return true;
+
+  const staffRoleId = process.env.STAFF_ROLE_ID || OVERSEER_ROLE_ID_ENV || null;
+  if (staffRoleId) return member.roles.cache.has(String(staffRoleId));
+
+  if (member.roles.cache.some(r => r.name === 'MODERATOR')) {
+    console.warn('[Access] Granted by ROLE NAME "MODERATOR" — set STAFF_ROLE_ID to a role id; a name is not a permission.');
+    return true;
+  }
   return false;
+}
+
+// Stricter gate for the commands that can move money or repoint where money
+// goes. /config writes BTC_XPUB, LTC_XPUB, PAYPAL_EMAIL, CASHAPP_CASHTAG and
+// the Gmail credentials through the backend using the shared API_SECRET — that
+// is owner-level authority, not staff-level.
+function hasOwnerAccess(interaction) {
+  const member = interaction.member;
+  if (!member || !interaction.guild) return false;
+  if (member.permissions.has(PermissionFlagsBits.Administrator)) return true;
+  const owner = process.env.OWNER_DISCORD_ID;
+  return !!(owner && String(interaction.user.id) === String(owner));
 }
 
 // Pack {name, value} fields into embeds that respect BOTH of Discord's limits:
@@ -1094,6 +1178,7 @@ const ownCommands = [
     .addRoleOption(o => o.setName('flag_role').setDescription('Role to apply to flagged members').setRequired(false))
     .addStringOption(o => o.setName('log_channel').setDescription('Staff channel name to log detections in (default: mod-log)').setRequired(false)),
   new SlashCommandBuilder().setName('giveaway').setDescription('Staff: Start a giveaway')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addStringOption(o => o.setName('prize').setDescription('What are you giving away?').setRequired(true))
     .addStringOption(o => o.setName('duration').setDescription('Duration e.g. 1h, 30m, 2d, 1w, 1mo').setRequired(true))
     .addIntegerOption(o => o.setName('winners').setDescription('Number of winners 1-5 (default 1)').setMinValue(1).setMaxValue(5).setRequired(false))
@@ -1108,6 +1193,7 @@ const ownCommands = [
     .addBooleanOption(o => o.setName('repost').setDescription('Repost each vouch as an embed in the vouches channel? (default: true)').setRequired(false)),
   new SlashCommandBuilder().setName('commands').setDescription('Show all available bot commands'),
   new SlashCommandBuilder().setName('addstock').setDescription('Staff: Add accounts to stock')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addStringOption(o => o.setName('type').setDescription('Account type (e.g. phone-verified). Leave blank for standard').setRequired(false))
     .addAttachmentOption(o => o.setName('file').setDescription('.txt file, one account per line').setRequired(false))
     .addStringOption(o => o.setName('accounts').setDescription('Paste accounts here (one per line) if not using a file').setRequired(false)),
@@ -1117,6 +1203,7 @@ const ownCommands = [
   new SlashCommandBuilder().setName('postgensteam').setDescription('Staff: Post the Steam account generator panel')
     .addChannelOption(o => o.setName('channel').setDescription('Channel to post in (defaults to current channel)').setRequired(false)),
   new SlashCommandBuilder().setName('clearstock').setDescription('Staff: Remove stock accounts (fix a bad upload)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addBooleanOption(o => o.setName('confirm').setDescription('Set to True to confirm — this cannot be undone').setRequired(true))
     .addStringOption(o => o.setName('type').setDescription('Account type to clear. Leave blank to clear ALL types').setRequired(false)),
   new SlashCommandBuilder().setName('postusefullinks').setDescription('Staff: Post the full useful-links list in one go')
@@ -1179,6 +1266,7 @@ const ownCommands = [
 
   // ─── Shop payment backend (ported from p-bot) ──────────────────────────────
   new SlashCommandBuilder().setName('config').setDescription('Staff: Configure the shop payment backend')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .addSubcommand(sub => sub.setName('set').setDescription('Set a config value')
       .addStringOption(o => o.setName('setting').setDescription('Which setting to update').setRequired(true)
         .addChoices(
@@ -1192,22 +1280,26 @@ const ownCommands = [
           { name: '📉 Crypto Discount %',    value: 'cryptodc'},
           { name: '₿ BTC xPub Key',          value: 'btcxpub' },
           { name: 'Ł LTC xPub Key',          value: 'ltcxpub' },
-          { name: '📋 Order Log Channel ID', value: 'logchan' },
+          // No 'logchan' choice: the order log channel is a Railway variable,
+          // not a DB row. See the handler for why.
         ))
       .addStringOption(o => o.setName('value').setDescription('The value to set').setRequired(true)))
     .addSubcommand(sub => sub.setName('view').setDescription('View current shop payment backend config')),
   new SlashCommandBuilder().setName('order').setDescription('Staff: Look up or manage a shop order')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addSubcommand(sub => sub.setName('lookup').setDescription('Look up an order by ID')
       .addStringOption(o => o.setName('order_id').setDescription('Order ID').setRequired(true)))
     .addSubcommand(sub => sub.setName('forceconfirm').setDescription('Manually confirm a payment')
       .addStringOption(o => o.setName('order_id').setDescription('Order ID').setRequired(true))),
   new SlashCommandBuilder().setName('shopstock').setDescription('Staff: Manage shop product stock (payment backend)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addSubcommand(sub => sub.setName('add').setDescription('Add keys/accounts to a product')
       .addStringOption(o => o.setName('product_id').setDescription('Product tier ID').setRequired(true))
       .addStringOption(o => o.setName('items').setDescription('Items to add, separated by commas or newlines').setRequired(true)))
     .addSubcommand(sub => sub.setName('check').setDescription('Check stock count for a product')
       .addStringOption(o => o.setName('product_id').setDescription('Product tier ID').setRequired(true))),
   new SlashCommandBuilder().setName('web-balance').setDescription('Staff: View or adjust a website account balance')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addSubcommand(sub => sub.setName('view').setDescription('View a linked account balance by Discord user')
       .addUserOption(o => o.setName('user').setDescription('Discord user linked to the website account').setRequired(true)))
     .addSubcommand(sub => sub.setName('adjust').setDescription('Credit or debit a website account balance')
@@ -1215,6 +1307,7 @@ const ownCommands = [
       .addNumberOption(o => o.setName('amount').setDescription('Dollar amount — positive to credit, negative to debit').setRequired(true))
       .addStringOption(o => o.setName('reason').setDescription('Reason / note for the ledger').setRequired(false))),
   new SlashCommandBuilder().setName('webstatus').setDescription('Staff: Set a website product status (undetected/updating/detected)')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addStringOption(o => o.setName('game_name').setDescription('Game / category name (exactly as on the site)').setRequired(true))
     .addStringOption(o => o.setName('product_name').setDescription('Product name (exactly as on the site)').setRequired(true))
     .addStringOption(o => o.setName('status').setDescription('New status').setRequired(true)
@@ -1225,6 +1318,7 @@ const ownCommands = [
       ))
     .addStringOption(o => o.setName('note').setDescription('Optional note shown with the status').setRequired(false)),
   new SlashCommandBuilder().setName('webreviews').setDescription('Staff: Moderate website reviews')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addSubcommand(sub => sub.setName('list').setDescription('List the latest reviews (pending shown first)'))
     .addSubcommand(sub => sub.setName('approve').setDescription('Approve a review so it shows on the site')
       .addStringOption(o => o.setName('review_id').setDescription('Review ID (from /webreviews list)').setRequired(true)))
@@ -1279,6 +1373,16 @@ client.once('ready', async () => {
       inv.forEach(i => cache.set(i.code, { inviterId: i.inviter?.id, uses: i.uses }));
       inviteCache.set(guild.id, cache);
     } catch (_) {}
+  }
+
+  // Resume SMS orders that were still open when the process died. Each one
+  // represents provider credit already spent, so leaving them unpolled means
+  // the refund window closes with nobody watching.
+  try {
+    const { rehydrateOrders } = require('./modules/sms-gen');
+    if (typeof rehydrateOrders === 'function') await rehydrateOrders(client);
+  } catch (e) {
+    console.error('[SMS] rehydrate on boot failed:', e.message);
   }
 
   // Re-schedule any active giveaway timers that survived a restart
@@ -1448,30 +1552,50 @@ client.on('guildMemberAdd', async member => {
 
 // ─── Messages ─────────────────────────────────────────────────────────────────
 client.on('messageCreate', async message => {
-  // DM support (support module handles !close in DMs)
-  if (message.channel.type === ChannelType.DM) {
-    await support.handleDM(message, client);
-    return;
+  // Wrapped: this handler had no try/catch at all, so EVERY message in the
+  // guild was a crash opportunity. A Supabase blip inside getGuildSettings, a
+  // throw from the anti-scam scanner, or a DM arriving while the DB pool is
+  // saturated became an unhandled rejection — which Node 20 turns into process
+  // exit, and Railway only retries five times.
+  //
+  // The inner await is an IIFE for the same reason as interactionCreate: a
+  // bare `return asyncFn()` in one of these branches would otherwise resolve
+  // past the try. Here the branches return plain values, but the shape keeps
+  // it safe against future edits.
+  try {
+    await (async () => {
+      // DM support (support module handles !close in DMs)
+      if (message.channel.type === ChannelType.DM) {
+        await support.handleDM(message, client);
+        return;
+      }
+      // Counting game (dedicated channel — skip other message processing)
+      const msgSettings = await getGuildSettings(message.guild.id);
+      if (msgSettings.countingChannelId && message.channel.id === msgSettings.countingChannelId) {
+        if (message.author.bot) return;
+        await handleCountingMessage(message);
+        return;
+      }
+      // Anti-scam prefix commands
+      if (message.content.startsWith('!')) {
+        const handled = await antiscam.handlePrefixCommand(message, client);
+        if (handled) return;
+      }
+      // Anti-scam scanning (runs on all non-admin messages)
+      await antiscam.onMessage(message, client);
+    })();
+  } catch (err) {
+    // Log and carry on. A broken message must not take the bot down.
+    console.error('[messageCreate] error:', err && err.stack ? err.stack : err);
   }
-  // Counting game (dedicated channel — skip other message processing)
-  const msgSettings = await getGuildSettings(message.guild.id);
-  if (msgSettings.countingChannelId && message.channel.id === msgSettings.countingChannelId) {
-    if (message.author.bot) return;
-    await handleCountingMessage(message);
-    return;
-  }
-  // Anti-scam prefix commands
-  if (message.content.startsWith('!')) {
-    const handled = await antiscam.handlePrefixCommand(message, client);
-    if (handled) return;
-  }
-  // Anti-scam scanning (runs on all non-admin messages)
-  await antiscam.onMessage(message, client);
 });
 
 // ─── Interactions ─────────────────────────────────────────────────────────────
 client.on('interactionCreate', async interaction => {
   try {
+    // Awaited IIFE — see note: a bare `return asyncFn()` inside would otherwise
+    // escape this try/catch and crash the process as an unhandled rejection.
+    await (async () => {
     // 2FA button
     if (await handle2FAInteraction(interaction)) return;
     // Support module interactions
@@ -1480,12 +1604,17 @@ client.on('interactionCreate', async interaction => {
     const _smsCmd = interaction.commandName || '';
     const _smsId  = interaction.customId || '';
     if (['gennumber', 'post-smsgen', 'set-5sim-api', 'set-smspool-api'].includes(_smsCmd) || _smsId.startsWith('sms_')) {
-      return handleSMSInteraction(interaction, client);
+      // await, not a bare return: inside an async fn  resolves this
+      // function WITH p, so a rejection escapes the enclosing try/catch and
+      // becomes an unhandled rejection — which Node 20 turns into process exit.
+      return await handleSMSInteraction(interaction, client);
     }
     // Autocomplete
     if (interaction.isAutocomplete() && interaction.commandName === 'setdownload') {
       const focused = interaction.options.getFocused().toLowerCase();
-      return interaction.respond(
+      // Discord invalidates an autocomplete interaction after 3s; respond()
+      // then rejects with 10062. Unawaited, that killed the process.
+      return await interaction.respond(
         getAllProducts().filter(p => p.name.toLowerCase().includes(focused)).slice(0, 25).map(p => ({ name: p.name, value: p.id }))
       );
     }
@@ -2045,7 +2174,7 @@ client.on('interactionCreate', async interaction => {
           return interaction.reply({ content: `❌ You need the **💎 Gen Member** role to generate an account.`, flags: 64 });
         }
         const type = normalizeStockType(interaction.options.getString('type'));
-        return claimStockAccount(interaction, type);
+        return await claimStockAccount(interaction, type);
       }
 
       // ── /postgensteam ────────────────────────────────────────────────────
@@ -2484,7 +2613,12 @@ client.on('interactionCreate', async interaction => {
 
       // ── /config (shop payment backend, ported from p-bot) ──────────────────
       if (cmd === 'config') {
-        if (!hasAccess(interaction)) return interaction.reply({ content: '❌ No permission.', flags: 64 });
+        // Owner-only: /config set rewrites BTC_XPUB, LTC_XPUB, PAYPAL_EMAIL,
+        // CASHAPP_CASHTAG and the Gmail credentials through the backend. A
+        // staff member who can change the xpub can take every crypto payment.
+        if (!hasOwnerAccess(interaction)) {
+          return interaction.reply({ content: '❌ Only the server owner/admin can change payment configuration.', flags: 64 });
+        }
         await interaction.deferReply({ ephemeral: true });
         const sub = interaction.options.getSubcommand();
 
@@ -2524,10 +2658,22 @@ client.on('interactionCreate', async interaction => {
             cryptodc: { key: 'CRYPTO_DISCOUNT_PERCENT', label: 'Crypto Discount %' },
             btcxpub:  { key: 'BTC_XPUB',                label: 'BTC xPub Key' },
             ltcxpub:  { key: 'LTC_XPUB',                label: 'LTC xPub Key' },
-            logchan:  { key: 'ORDER_LOG_CHANNEL_ID',    label: 'Order Log Channel ID' },
+            // logchan removed on purpose. ORDER_LOG_CHANNEL_ID is set directly
+            // in Railway (owner's decision, 2026-07-26) and the backend now
+            // rejects it as an env-only key. Leaving the option here would have
+            // let one slash command write a `config` row that silently
+            // overrides Railway at boot and sends the whole order feed to the
+            // wrong channel — the exact failure this audit started from.
           };
           const setting = interaction.options.getString('setting');
           const value = interaction.options.getString('value');
+          if (setting === 'logchan') {
+            return interaction.editReply({
+              content: '❌ The order log channel is set in Railway, not here.\n'
+                + 'Set `ORDER_LOG_CHANNEL_ID` on the SUPERBOT service and redeploy — '
+                + 'storing it in the database would override the Railway value at boot.',
+            });
+          }
           const meta = CONFIG_KEYS[setting];
           if (!meta) return interaction.editReply({ content: '❌ Unknown setting.' });
 
@@ -3538,6 +3684,7 @@ client.on('interactionCreate', async interaction => {
       }
     }
 
+    })();
   } catch (err) {
     console.error('Interaction error:', err.stack || err);
     try {
@@ -3548,4 +3695,29 @@ client.on('interactionCreate', async interaction => {
 });
 
 // ─── Login ────────────────────────────────────────────────────────────────────
+// Last-resort process guards. There were none: any unhandled rejection
+// anywhere in the bot terminated the process on Node 20.
+process.on('unhandledRejection', (reason) => {
+  console.error('[unhandledRejection]', reason && reason.stack ? reason.stack : reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err && err.stack ? err.stack : err);
+});
+
+// Railway sends SIGTERM on every deploy and SIGKILLs ~10s later. Without a
+// handler the bot was cut off mid-work — a delivery DM half-sent, a giveaway
+// write half-flushed. Destroy the gateway connection cleanly and flush state
+// first.
+let _shuttingDown = false;
+function shutdown(signal) {
+  if (_shuttingDown) return;
+  _shuttingDown = true;
+  console.log(`[Bot] ${signal} received — shutting down cleanly…`);
+  try { if (typeof saveVouches === 'function') saveVouches(); } catch (e) { console.error('[Bot] saveVouches on shutdown failed:', e.message); }
+  try { client.destroy(); } catch (e) { console.error('[Bot] client.destroy failed:', e.message); }
+  setTimeout(() => process.exit(0), 1500).unref();
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
 client.login(TOKEN);

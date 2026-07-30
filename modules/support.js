@@ -13,7 +13,8 @@ const db   = require('../db');
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..');
 if (DATA_DIR !== path.join(__dirname, '..') && !fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 const TICKETS_FILE     = path.join(DATA_DIR, 'tickets.json');
-const SUPPORT_CHANNEL  = "1502225607348715621";
+// Env-overridable, so moving the support channel does not need a code change.
+const SUPPORT_CHANNEL  = process.env.SUPPORT_CHANNEL || "1502225607348715621";
 const TICKET_LOG_CHANNEL = process.env.TICKET_LOG_CHANNEL || null;
 const STAFF_ROLE_ID    = process.env.STAFF_ROLE_ID || null;
 

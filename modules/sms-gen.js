@@ -19,6 +19,81 @@ const {
 
 const fs   = require('fs');
 const path = require('path');
+const db   = require('../db');
+
+// ─── Order persistence ────────────────────────────────────────────────────────
+// Buying a number spends REAL provider credit. Orders used to live only in the
+// in-memory Map below, so a Railway restart (deploy, OOM, crash) meant the
+// 5-minute cancel/refund never fired, the provider kept the charge, the Discord
+// message read "waiting" forever, and 🚫 Cancel & Refund answered "Order not
+// found" — the money was only recoverable from the provider's own dashboard.
+//
+// All three helpers swallow their errors: persistence failing must not break a
+// purchase that has already happened. They log loudly instead.
+async function persistOrder(orderData) {
+  try {
+    await db.query(
+      `INSERT INTO sms_orders
+         (order_id, guild_id, provider, service_name, country, number, user_id, channel_id, message_id, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'waiting')
+       ON CONFLICT (order_id) DO UPDATE SET
+         message_id = EXCLUDED.message_id, status = 'waiting', resolved_at = NULL`,
+      [
+        String(orderData.orderId), orderData.guildId || process.env.GUILD_ID || null,
+        orderData.provider, orderData.serviceName, orderData.country,
+        orderData.number, String(orderData.userId),
+        String(orderData.channelId), String(orderData.messageId),
+      ]
+    );
+  } catch (e) {
+    console.error('[SMS] could not persist order', orderData.orderId, '-', e.message);
+  }
+}
+
+async function resolveOrder(orderId, status) {
+  try {
+    await db.query(
+      `UPDATE sms_orders SET status = $2, resolved_at = now() WHERE order_id = $1`,
+      [String(orderId), status]
+    );
+  } catch (e) {
+    console.error('[SMS] could not mark order', orderId, 'as', status, '-', e.message);
+  }
+}
+
+// Called once after the Discord client is ready. Any order still open is either
+// resumed (if it is inside the refund window) or cancelled and refunded now.
+async function rehydrateOrders(client) {
+  let rows = [];
+  try {
+    const r = await db.query(
+      `SELECT * FROM sms_orders WHERE resolved_at IS NULL ORDER BY created_at ASC LIMIT 200`
+    );
+    rows = r.rows || [];
+  } catch (e) {
+    console.error('[SMS] could not read open orders on boot:', e.message);
+    return;
+  }
+  if (!rows.length) return;
+  console.log(`[SMS] rehydrating ${rows.length} open order(s) after restart`);
+
+  for (const row of rows) {
+    const orderData = {
+      orderId: row.order_id, provider: row.provider, serviceName: row.service_name,
+      country: row.country, number: row.number, userId: row.user_id,
+      channelId: row.channel_id, messageId: row.message_id,
+      guildId: row.guild_id,
+      // Preserve the ORIGINAL purchase time so the refund window is measured
+      // from when money was actually spent, not from this restart.
+      startedAt: new Date(row.created_at).getTime(),
+    };
+    try {
+      startPolling(client, row.order_id, orderData);
+    } catch (e) {
+      console.error('[SMS] rehydrate failed for', row.order_id, '-', e.message);
+    }
+  }
+}
 
 // ─── Persistent config ────────────────────────────────────────────────────────
 const DATA_DIR    = process.env.DATA_DIR || './data';
@@ -39,8 +114,29 @@ function saveConfig(cfg) {
 const activeOrders = new Map();
 
 // ─── Safe JSON fetch — handles plain-text error responses ─────────────────────
+// Timeout added: every SMSPool/5sim call goes through here, and none of them had
+// one. A provider that accepts the connection and stalls left the promise
+// unsettled forever — the interaction spun until Discord gave up, and for a
+// purchase that meant real provider credit was spent with the bot unable to
+// report or cancel it.
+const FETCH_TIMEOUT_MS = Number(process.env.SMS_TIMEOUT_MS) || 15000;
+
 async function safeFetch(url, opts = {}) {
-  const r = await fetch(url, opts);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  let r;
+  try {
+    r = await fetch(url, { ...opts, signal: controller.signal });
+  } catch (e) {
+    // Give the caller something it can put in front of a user; the raw
+    // AbortError message ("This operation was aborted") explains nothing.
+    if (e && (e.name === 'AbortError' || e.code === 'ABORT_ERR')) {
+      throw new Error(`The SMS provider did not respond within ${Math.round(FETCH_TIMEOUT_MS / 1000)}s — try again.`);
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
   const text = await r.text();
   try {
     return JSON.parse(text);
@@ -318,7 +414,11 @@ async function startPolling(client, orderId, orderData) {
   const cfg    = loadConfig();
   const { provider, serviceName, country, number, userId, channelId, messageId } = orderData;
   const apiKey = provider === '5sim' ? cfg.fivesim_key : cfg.smspool_key;
-  const start  = Date.now();
+  // On a rehydrated order this is the ORIGINAL purchase time, so the refund
+  // window is measured from when the money was spent — a restart must not hand
+  // the order a fresh 5 minutes, and an order already past the window is
+  // cancelled and refunded on the first tick instead of hanging forever.
+  const start  = orderData.startedAt || Date.now();
 
   const poll = async () => {
     if (Date.now() - start > POLL_TIMEOUT) {
@@ -334,6 +434,7 @@ async function startPolling(client, orderId, orderData) {
         await ch.send({ content: `<@${userId}> ⏰ No SMS after 5 minutes — number cancelled & balance refunded.` });
       } catch {}
       activeOrders.delete(orderId);
+      await resolveOrder(orderId, 'failed');
       return;
     }
 
@@ -355,6 +456,7 @@ async function startPolling(client, orderId, orderData) {
           content: `<@${userId}> ✅ Your SMS code: **\`${result.code}\`**\n> Code didn't work? Hit **🔄 Request New SMS** above.`,
         });
         activeOrders.delete(orderId);
+        await resolveOrder(orderId, 'received');
         return;
       }
 
@@ -366,6 +468,7 @@ async function startPolling(client, orderId, orderData) {
         });
         await ch.send({ content: `<@${userId}> ❌ Number expired/banned by provider — no charge applied.` });
         activeOrders.delete(orderId);
+        await resolveOrder(orderId, 'failed');
         return;
       }
     } catch (e) {
@@ -377,7 +480,10 @@ async function startPolling(client, orderId, orderData) {
     if (existing) existing.pollTimer = timer;
   };
 
-  orderData.pollTimer = setTimeout(poll, POLL_INTERVAL);
+  // A rehydrated order that is already past its refund window must not wait a
+  // further POLL_INTERVAL before being cancelled — run the first check now.
+  const overdue = Date.now() - start > POLL_TIMEOUT;
+  orderData.pollTimer = setTimeout(poll, overdue ? 0 : POLL_INTERVAL);
   activeOrders.set(orderId, orderData);
 }
 
@@ -781,6 +887,7 @@ async function handleSMSInteraction(interaction, client) {
     else await smspoolCancel(apiKey, orderId);
 
     const { provider, serviceName, country, number } = order;
+    await resolveOrder(orderId, 'failed');
     await interaction.message.edit({
       embeds: [buildOrderEmbed(provider, serviceName, country, number, 'cancelled')],
       components: [buildOrderButtons(orderId, true, number)],
@@ -871,13 +978,22 @@ async function purchaseNumber(interaction, client, provider, apiKey, session, co
     components: [buildOrderButtons(orderId, false, number)],
   });
 
-  await startPolling(client, orderId, {
+  const orderData = {
+    orderId,
     provider, serviceName, country, number,
     userId:    interaction.user.id,
     channelId: interaction.channel.id,
     messageId: publicMsg.id,
+    guildId:   interaction.guildId || null,
     pollTimer: null,
-  });
+  };
+
+  // Persist BEFORE polling starts: the money has already left the provider
+  // balance by this point, so the row must exist even if the process dies on
+  // the very next line.
+  await persistOrder(orderData);
+
+  await startPolling(client, orderId, orderData);
 }
 
-module.exports = { commands, handleSMSInteraction };
+module.exports = { commands, handleSMSInteraction, rehydrateOrders };
