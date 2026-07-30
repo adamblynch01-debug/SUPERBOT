@@ -746,11 +746,77 @@ async function hasUnlimitedGen(member) {
 // into { username, password, email, emailPassword, phone }. Phone is optional.
 // Returns null if the line doesn't match — callers should fall back to raw display,
 // so accounts in any other format (or other stock types) still work fine.
+// Split one stock line into labelled fields.
+//
+// This used to insist on exactly ONE shape — `user:pass|email:emailpass` —
+// and return null for anything else, and the caller's fallback dumps the raw
+// line into a code block. Every account actually in stock is written
+// `user:pass:email:emailpass`, with no pipe, so the fallback was the ONLY
+// path that ever ran: buyers were handed an undelimited blob and left to work
+// out which of the four values was which.
+//
+// So this is deliberately tolerant now. The pipe form still parses; so does
+// plain colon separation, a bare `user:pass`, and an email-as-username login.
+//
+// Colons are the separator AND legal inside a password, so position alone
+// cannot be trusted. The email is the one field that identifies itself, so it
+// anchors the split and whatever sits between the username and it is the
+// password, however many colons that spans.
 function parseStockAccountLine(raw) {
-  const m = raw.match(/^\s*(\S+):(\S+)\|(\S+):(\S+?)(?:\s*\(([^)]+)\))?\s*$/);
-  if (!m) return null;
-  const [, username, password, email, emailPassword, phone] = m;
-  return { username, password, email, emailPassword, phone: phone || null };
+  if (typeof raw !== 'string') return null;
+  let line = raw.trim();
+  if (!line) return null;
+
+  // Optional trailing "(+1 555 0100)" — a phone note, not a credential.
+  let phone = null;
+  const phoneMatch = line.match(/\s*\(([^)]+)\)\s*$/);
+  if (phoneMatch) { phone = phoneMatch[1].trim() || null; line = line.slice(0, phoneMatch.index).trim(); }
+
+  const out = { username: null, password: null, email: null, emailPassword: null, phone, extra: null };
+
+  // Pipe form: the pipe is an unambiguous boundary, so honour it first and
+  // split each half on its FIRST colon only.
+  if (line.includes('|')) {
+    const cut = line.indexOf('|');
+    const left = line.slice(0, cut).trim();
+    const right = line.slice(cut + 1).trim();
+    const li = left.indexOf(':');
+    if (li === -1) return null;
+    out.username = left.slice(0, li);
+    out.password = left.slice(li + 1);
+    const ri = right.indexOf(':');
+    if (ri === -1) { out.email = right || null; }
+    else { out.email = right.slice(0, ri); out.emailPassword = right.slice(ri + 1); }
+    return out.username && out.password ? out : null;
+  }
+
+  const parts = line.split(':');
+  if (parts.length < 2) return null;
+
+  const emailIdx = parts.findIndex(p => p.includes('@'));
+
+  if (emailIdx > 0) {
+    out.username     = parts[0];
+    out.password     = parts.slice(1, emailIdx).join(':');
+    out.email        = parts[emailIdx];
+    out.emailPassword = parts[emailIdx + 1] || null;
+    // Anything past the email password (a Steam Guard secret, a note) is kept
+    // rather than dropped — losing part of a line the buyer paid for is worse
+    // than showing a field we cannot name.
+    const rest = parts.slice(emailIdx + 2).join(':');
+    out.extra = rest || null;
+  } else if (emailIdx === 0) {
+    // The email IS the login. Labelling it "Username" would be a lie, so it
+    // is reported as the email and the password beside it.
+    out.email    = parts[0];
+    out.password = parts.slice(1).join(':');
+    out.username = parts[0];
+  } else {
+    out.username = parts[0];
+    out.password = parts.slice(1).join(':');
+  }
+
+  return out.username && out.password ? out : null;
 }
 
 async function buildStockEmbed(guildId) {
@@ -800,24 +866,43 @@ async function claimStockAccount(interaction, type) {
   const embed = new EmbedBuilder()
     .setColor(0x2ECC71)
     .setTitle('🔐 Your Account')
-    .addFields(
-      { name: 'Type', value: stockTypeLabel(type), inline: true },
-      { name: 'Remaining Stock', value: `${remaining}`, inline: true },
-    )
     .setFooter({ text: `${BOT_NAME} | Keep this safe — it will not be shown again`, iconURL: client.user.displayAvatarURL() });
+
+  const stockFields = [
+    { name: 'Type', value: stockTypeLabel(type), inline: true },
+    { name: 'Remaining Stock', value: `${remaining}`, inline: true },
+  ];
 
   const parsed = parseStockAccountLine(account);
   if (parsed) {
-    embed.addFields(
-      { name: 'Username', value: `\`${parsed.username}\``, inline: true },
-      { name: 'Password', value: `\`${parsed.password}\``, inline: true },
-      { name: '\u200B', value: '\u200B', inline: true }, // spacer so the row breaks evenly
-      { name: 'Email', value: `\`${parsed.email}\``, inline: true },
-      { name: 'Email Password', value: `\`${parsed.emailPassword}\``, inline: true },
-    );
-    if (parsed.phone) embed.addFields({ name: 'Phone', value: `\`${parsed.phone}\``, inline: true });
+    // Credentials lead. Type and Remaining Stock used to sit at the top, so
+    // the first thing a buyer read was our inventory count rather than the
+    // thing they had just paid for.
+    //
+    // Each value is its own code span, which on mobile is a one-tap copy —
+    // the reason they are NOT joined back into a single block. Every field is
+    // full-width: the old three-per-row layout truncated a long password into
+    // a narrow column, and the zero-width spacer it needed to keep the rows
+    // even rendered as a blank entry of its own.
+    embed.addFields({ name: '👤 Username', value: `\`${parsed.username}\``, inline: false });
+    embed.addFields({ name: '🔑 Password', value: `\`${parsed.password}\``, inline: false });
+    // A bare user:pass line has no email. An empty field would read as a
+    // value we lost rather than one that was never there.
+    if (parsed.email && parsed.email !== parsed.username) {
+      embed.addFields({ name: '📧 Email', value: `\`${parsed.email}\``, inline: false });
+    }
+    if (parsed.emailPassword) {
+      embed.addFields({ name: '📨 Email Password', value: `\`${parsed.emailPassword}\``, inline: false });
+    }
+    if (parsed.phone) embed.addFields({ name: '📞 Phone', value: `\`${parsed.phone}\``, inline: false });
+    // Anything past the email password — a Steam Guard secret, a note. Kept
+    // rather than dropped: losing part of a line the buyer paid for is worse
+    // than showing a field we cannot name precisely.
+    if (parsed.extra) embed.addFields({ name: '➕ Extra', value: `\`${parsed.extra}\``, inline: false });
+    embed.addFields(...stockFields);
   } else {
-    // Doesn't match the expected schema — show it raw rather than lose data.
+    // Matches no known schema — show it raw rather than lose data.
+    embed.addFields(...stockFields);
     embed.setDescription(`\`\`\`${account}\`\`\``);
   }
 

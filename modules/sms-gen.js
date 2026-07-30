@@ -485,7 +485,10 @@ function buildOrderEmbed(provider, serviceName, country, number, status, code) {
       { name: '🌍 Country',  value: capitalize(country), inline: true },
       { name: '📞 Number',   value: `\`${number}\``,     inline: false },
       { name: '📡 Status',   value: s.label,             inline: false },
-      ...(code ? [{ name: '🔑 Your Code', value: `# \`${code}\``, inline: false }] : []),
+      // No `# ` heading prefix: inside an embed field Discord prints the hash
+      // literally, so the code read "# 544600" and a tap-to-copy took the
+      // stray character with it.
+      ...(code ? [{ name: '🔑 Your Code', value: `\`${code}\``, inline: false }] : []),
     )
     .setFooter({ text: "UH SERVICES • SMS Gen  |  Code didn't work? Hit 🔄 for a new one or 🚫 to cancel & refund" })
     .setTimestamp();
@@ -1206,9 +1209,19 @@ async function handleSMSInteraction(interaction, client) {
     const number = order?.number ||
       interaction.message?.embeds?.[0]?.fields?.find(f => f.name.includes('Number'))?.value?.replace(/`/g, '').trim();
     if (!number) return interaction.reply({ content: '❌ Could not retrieve number.', ephemeral: true });
+    // Wrapped in a code span, and nothing else in the message.
+    //
+    // This used to send the bare digits, on the assumption that a bare string
+    // is the easiest thing to copy. On mobile it is the hardest: plain text
+    // has to be long-pressed, then the selection handles dragged to the right
+    // ends. Discord renders a code span with a one-tap copy affordance — the
+    // exact reason the arriving CODE could be copied with a single tap while
+    // the number, the one thing this button exists for, could not.
+    //
+    // Any label text has to stay out of the message: the tap copies the code
+    // span alone, but a stray prefix invites the user to select the line.
     return interaction.reply({
-      content: number,   // plain number — tap to select & copy
-
+      content: `\`${number}\``,
       ephemeral: true,
     });
   }
