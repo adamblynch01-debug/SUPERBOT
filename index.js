@@ -171,6 +171,35 @@ function saveVouches() {
   saveJSON(VOUCHES_FILE, obj);
 }
 
+// A vouch left in Discord is also a review of the store, so it belongs on the
+// storefront next to the ones left there — and, more importantly, in Postgres.
+// vouches.json lives on the container filesystem: DATA_DIR defaults to the
+// bot's own directory, which Railway rebuilds on every deploy, so the JSON file
+// is a cache, not a record. Pushing each vouch to the backend puts the durable
+// copy in the same database as everything else, which is what makes
+// `/importvouches source:website` able to rebuild a brand-new server.
+//
+// Fire-and-forget on purpose: the member has already been thanked and the embed
+// already posted, so a backend hiccup must not surface as a failed vouch.
+// external_id is the vouch message's own snowflake where there is one, so a
+// retry — or a redeploy that replays nothing — cannot double-post it.
+async function syncVouchToWebsite(guildId, entry, externalId) {
+  if (!API_SECRET) return;
+  try {
+    await axios.post(`${BACKEND_URL}/api/reviews/bot`, {
+      secret: API_SECRET,
+      guild_id: guildId,
+      display_name: entry.username || 'Anonymous',
+      rating: entry.rating,
+      body: entry.feedback || null,
+      discord_id: entry.userId || null,
+      external_id: String(externalId || `${guildId}:${entry.id}:${entry.timestamp}`),
+    }, { timeout: 8000 });
+  } catch (e) {
+    console.error('[Vouch] website sync failed:', e.response?.data?.error || e.message);
+  }
+}
+
 // vouches: { [guildId]: { count, channelId, entries: [{id, userId, username, rating, feedback, imageUrl, timestamp}] } }
 const vouchDataRaw = loadJSON(VOUCHES_FILE, {});
 const vouchData    = new Map(Object.entries(vouchDataRaw).map(([gid, v]) => [gid, { count: v.count || 0, channelId: v.channelId || null, entries: v.entries || [] }]));
@@ -1475,8 +1504,13 @@ const ownCommands = [
     .addStringOption(o => o.setName('channel').setDescription('Panel channel (defaults to #leave-vouch)').setRequired(false))
     .addStringOption(o => o.setName('results_channel').setDescription('Where received vouches post (defaults to #vouches)').setRequired(false)),
   new SlashCommandBuilder().setName('exportvouches').setDescription('Staff: Download a backup file of all vouches on this server'),
-  new SlashCommandBuilder().setName('importvouches').setDescription('Staff: Restore vouches from a backup file into this server')
-    .addAttachmentOption(o => o.setName('file').setDescription('The vouches backup .json file').setRequired(true))
+  new SlashCommandBuilder().setName('importvouches').setDescription('Staff: Restore vouches from a backup file, or from the website')
+    // Not required any more: source:website needs no file at all, and that is
+    // the path that matters if the old server is gone with its backup.
+    .addStringOption(o => o.setName('source').setDescription('Where to import from (default: the attached file)').setRequired(false)
+      .addChoices({ name: 'file — an /exportvouches backup', value: 'file' },
+                  { name: 'website — every approved vouch in the store database', value: 'website' }))
+    .addAttachmentOption(o => o.setName('file').setDescription('The vouches backup .json file (source: file)').setRequired(false))
     .addBooleanOption(o => o.setName('repost').setDescription('Repost each vouch as an embed in the vouches channel? (default: true)').setRequired(false)),
   new SlashCommandBuilder().setName('commands').setDescription('Show all available bot commands'),
   new SlashCommandBuilder().setName('addstock').setDescription('Staff: Add accounts to stock')
@@ -1979,7 +2013,7 @@ client.on('interactionCreate', async interaction => {
             { name: '📣 Updates & Status', value: '`/postupdate` — Post a product update\n`/statusupdate` — Post a status update\n`/announce` — Send a custom announcement', inline: false },
             { name: '🌐 Server Setup', value: '`/setwebsite` — Pin website URL\n`/setupreseller` — Post reseller panel\n`/setresellerlinks` — Update reseller button links\n`/postimage` — Post an image', inline: false },
             { name: '🎫 Support Tickets', value: '`/panel` — Post the support panel\n`/clearlogs` — Clear ticket log channel\n`/reply` — Reply to a user\'s ticket', inline: false },
-            { name: '📝 Vouches', value: '`/setupvouch` — Post the Leave a Vouch panel\n`/exportvouches` — Download a backup of all vouches\n`/importvouches` — Restore vouches from a backup file', inline: false },
+            { name: '📝 Vouches', value: '`/setupvouch` — Post the Leave a Vouch panel\n`/exportvouches` — Download a backup of all vouches\n`/importvouches` — Restore vouches from a backup file, or `source: website`', inline: false },
             { name: '🎮 Steam Stock', value: '`/gensteam [type]` — Generate a Steam account\n`/stock` — Check available stock\n`/addstock` — Staff: add accounts to stock', inline: false },
             { name: '💳 Shop Payment Backend', value: '`/config set|view` — Staff: configure payment backend\n`/order lookup|forceconfirm` — Staff: look up/confirm an order\n`/shopstock add|check` — Staff: manage shop product stock', inline: false },
             { name: '📲 SMS Gen', value: '`/gennumber` — Generate a phone number (private dropdowns)\n`/post-smsgen` — Staff: Post the SMS Gen panel\n`/set-smspool-api` — Admin: Set SMSPool.net key\n`/set-5sim-api` — Admin: Set 5sim.net key', inline: false },
@@ -2474,19 +2508,55 @@ client.on('interactionCreate', async interaction => {
         await interaction.deferReply({ ephemeral: true });
         const attachment = interaction.options.getAttachment('file');
         const repost = interaction.options.getBoolean('repost') ?? true;
-
-        if (!attachment || !attachment.name?.toLowerCase().endsWith('.json')) {
-          return interaction.editReply({ content: '❌ Please attach the `.json` backup file from `/exportvouches`.' });
-        }
+        // Attaching a file and not naming a source is the obvious thing to do,
+        // so it still means "file" — the option only has to be set to ask for
+        // the website.
+        const source = (interaction.options.getString('source') || (attachment ? 'file' : null) || 'file').toLowerCase();
 
         let backup;
-        try {
-          const res = await fetch(attachment.url);
-          const text = await res.text();
-          backup = JSON.parse(text);
-        } catch (e) {
-          console.error('Import vouches parse error:', e);
-          return interaction.editReply({ content: '❌ Could not read that file — is it a valid vouches backup .json?' });
+        if (source === 'website') {
+          // The store database is the copy that survives losing this server:
+          // every Discord vouch is pushed there as it happens, and every
+          // website vouch is written there first. Restoring a fresh server is
+          // therefore this one command, with nothing to have kept safe.
+          if (!API_SECRET) {
+            return interaction.editReply({ content: '❌ `API_SECRET` is not set on the bot — it cannot read the website\'s vouches.' });
+          }
+          try {
+            const res = await axios.get(`${BACKEND_URL}/api/reviews/admin/all`, {
+              params: { secret: API_SECRET }, timeout: 15000,
+            });
+            const reviews = (res.data && res.data.reviews) || [];
+            backup = {
+              exportedFrom: 'website',
+              // Unapproved rows are the moderation queue, not vouches. Posting
+              // them into #vouches would publish exactly what an admin has not
+              // yet agreed to publish.
+              entries: reviews.filter(r => r.approved).map(r => ({
+                userId: r.discord_id || null,
+                username: r.display_name || 'Unknown',
+                rating: r.rating,
+                feedback: r.body || '',
+                imageUrl: null,
+                timestamp: r.created_at || new Date().toISOString(),
+              })),
+            };
+          } catch (e) {
+            const why = e.response?.data?.error || e.message;
+            return interaction.editReply({ content: `❌ Could not read the website's vouches: ${why}` });
+          }
+        } else {
+          if (!attachment || !attachment.name?.toLowerCase().endsWith('.json')) {
+            return interaction.editReply({ content: '❌ Attach the `.json` backup from `/exportvouches`, or run this with `source: website`.' });
+          }
+          try {
+            const res = await fetch(attachment.url);
+            const text = await res.text();
+            backup = JSON.parse(text);
+          } catch (e) {
+            console.error('Import vouches parse error:', e);
+            return interaction.editReply({ content: '❌ Could not read that file — is it a valid vouches backup .json?' });
+          }
         }
 
         const incoming = Array.isArray(backup.entries) ? backup.entries : null;
@@ -2502,8 +2572,16 @@ client.on('interactionCreate', async interaction => {
           (ivSettings.vouchesChannelId && interaction.guild.channels.cache.get(ivSettings.vouchesChannelId)) ||
           (gData.channelId && interaction.guild.channels.cache.get(gData.channelId));
 
-        let imported = 0;
+        // Running the import twice is a normal thing to do — the first attempt
+        // half-finished, or the website gained vouches since. Without this,
+        // every re-run duplicates the whole history into #vouches.
+        const seen = new Set(gData.entries.map(e => `${e.userId || e.username}|${e.feedback}|${e.timestamp}`));
+
+        let imported = 0, skipped = 0;
         for (const old of incoming) {
+          const key = `${old.userId || old.username}|${old.feedback || ''}|${old.timestamp}`;
+          if (seen.has(key)) { skipped++; continue; }
+          seen.add(key);
           const newId = ++gData.count;
           const entry = {
             id: newId,
@@ -2540,7 +2618,9 @@ client.on('interactionCreate', async interaction => {
         saveVouches();
 
         await interaction.editReply({
-          content: `✅ Imported **${imported}** vouch${imported === 1 ? '' : 'es'} from backup${repost ? ` and reposted them in <#${vouchCh?.id || ivSettings.vouchesChannelId}>` : ' (silently, no repost)'}.`,
+          content: `✅ Imported **${imported}** vouch${imported === 1 ? '' : 'es'} from ${source === 'website' ? 'the website' : 'backup'}` +
+            `${skipped ? ` (**${skipped}** already here, skipped)` : ''}` +
+            `${repost ? ` and reposted them in <#${vouchCh?.id || ivSettings.vouchesChannelId}>` : ' (silently, no repost)'}.`,
         });
         return;
       }
@@ -4085,6 +4165,9 @@ client.on('interactionCreate', async interaction => {
 
         const vouchMsg = vouchCh ? await vouchCh.send({ embeds: [embed] }) : null;
         if (vouchMsg) { try { await vouchMsg.react('💯'); await vouchMsg.react('🔥'); } catch (_) {} }
+
+        // …and onto the storefront, where it becomes the durable copy.
+        syncVouchToWebsite(interaction.guild.id, entry, vouchMsg?.id);
 
         if (imageUrl) {
           await interaction.reply({ content: '✅ Thank you for your vouch!', ephemeral: true });
