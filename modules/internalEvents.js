@@ -430,6 +430,11 @@ function registerInternalRoutes(app, client) {
         .setFooter({ text: 'Thanks for supporting the store' })
         .setTimestamp();
 
+      // A website vouch can carry a screenshot too. The URL is served by the
+      // backend, not Discord's CDN, so it does not expire out from under the
+      // embed the way an attachment link would.
+      if (review.image_url && /^https?:\/\//i.test(review.image_url)) embed.setImage(review.image_url);
+
       const msg = await ch.send({ embeds: [embed] });
       if (msg) { try { await msg.react('💯'); await msg.react('🔥'); } catch (_) {} }
       return res.json({ ok: true, posted: true });

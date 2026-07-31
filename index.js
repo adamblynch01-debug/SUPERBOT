@@ -194,7 +194,17 @@ async function syncVouchToWebsite(guildId, entry, externalId) {
       body: entry.feedback || null,
       discord_id: entry.userId || null,
       external_id: String(externalId || `${guildId}:${entry.id}:${entry.timestamp}`),
-    }, { timeout: 8000 });
+      // The screenshot is the half of a vouch people actually believe, so it
+      // has to travel with it. Sent as a URL and downloaded on the other side:
+      // Discord's attachment links are signed and expire within a day, so the
+      // storefront keeps its own copy of the bytes rather than the link.
+      //
+      // This is also why the call is repeated after a late upload — the image
+      // normally lands a few seconds AFTER the vouch, so the first sync has
+      // nothing to send. The backend matches on external_id and fills in the
+      // picture it was missing.
+      image_url: entry.imageUrl || null,
+    }, { timeout: 20000 });
   } catch (e) {
     console.error('[Vouch] website sync failed:', e.response?.data?.error || e.message);
   }
@@ -2537,7 +2547,11 @@ client.on('interactionCreate', async interaction => {
                 username: r.display_name || 'Unknown',
                 rating: r.rating,
                 feedback: r.body || '',
-                imageUrl: null,
+                // The website serves its own copy of the screenshot, so this
+                // link keeps working after the Discord CDN one it came from
+                // has expired — which is the only reason a rebuilt server gets
+                // its vouch images back at all.
+                imageUrl: r.image || null,
                 timestamp: r.created_at || new Date().toISOString(),
               })),
             };
@@ -4191,6 +4205,9 @@ client.on('interactionCreate', async interaction => {
                   await vouchMsg.edit({ embeds: [embed], files: [file] });
                   entry.imageUrl = vouchMsg.embeds?.[0]?.image?.url || att.url;
                   saveVouches();
+                  // Second sync, same external_id: the vouch already reached
+                  // the website without a picture, and this is the picture.
+                  syncVouchToWebsite(interaction.guild.id, entry, vouchMsg.id);
                 } catch (e) { console.error('Vouch image attach error:', e); }
               }
               try { if (m.deletable) await m.delete(); } catch (_) {}
