@@ -664,6 +664,19 @@ function stockTypeLabel(type) {
   return STOCK_TYPE_LABELS[type] || type;
 }
 
+// Categories that carry no software build, so they never appear on the
+// website's status page — accounts, custom orders and services. /post-status
+// is documented as being "in sync w/ site", and the site now filters them, so
+// this list has to match window.NON_SOFTWARE_CATEGORIES in the storefront or
+// Discord posts a longer list than the page shows.
+const NON_STATUS_CATEGORIES = ['accounts', 'services', 'custom order'];
+function isNonStatusCategory(name) {
+  const n = String(name == null ? '' : name).trim().toLowerCase();
+  if (!n) return false;
+  if (NON_STATUS_CATEGORIES.includes(n)) return true;
+  return n.includes('custom order') || n.includes('donation');
+}
+
 function normalizeStockType(raw) {
   const t = (raw || '')
     .trim()
@@ -3450,7 +3463,7 @@ client.on('interactionCreate', async interaction => {
             const hs = await axios.get(`${BACKEND_URL}/api/state/global/ghostStatusHidden`);
             hidden = (hs.data && hs.data.value) || {};
           } catch (e) { /* no hide-map yet — show all */ }
-          const rows = raw.filter(r => !hidden[String(r.product_id)]);
+          const rows = raw.filter(r => !hidden[String(r.product_id)] && !isNonStatusCategory(r.game_name));
           if (!rows.length) return interaction.editReply({ content: '❌ No product statuses to post.' });
 
           const STAT = {
