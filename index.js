@@ -622,6 +622,7 @@ const GEN_PANEL_TYPES = [
   { type: 'phone-verified',  label: 'Steam Phone Verified',  emoji: '📱' },
   { type: 'activision',      label: 'Activision',            emoji: '🔫' },
   { type: 'email-outlook',   label: 'Email: Outlook',        emoji: '📧' },
+  { type: '5m-bundle',       label: '5M BUNDLE',             emoji: '💰' },
 ];
 
 // `/addstock` with no type slugs to 'standard', but the panel's Steam button
@@ -641,6 +642,13 @@ const STOCK_TYPE_ALIASES = {
   'activision-account': 'activision',
   'acti': 'activision',
   'cod': 'activision',
+  // The button says "5M BUNDLE", so /addstock will be typed every which way.
+  // normalizeStockType() already folds "5M BUNDLE" → "5m-bundle"; these cover
+  // the shorthands staff actually use.
+  '5m': '5m-bundle',
+  '5mbundle': '5m-bundle',
+  'bundle': '5m-bundle',
+  '5m-bundles': '5m-bundle',
 };
 
 // Staff type slugs; buyers see these.
@@ -649,6 +657,7 @@ const STOCK_TYPE_LABELS = {
   'phone-verified': 'Steam Phone Verified',
   'email-outlook': 'Email: Outlook',
   'activision': 'Activision',
+  '5m-bundle': '5M BUNDLE',
 };
 
 function stockTypeLabel(type) {
@@ -1459,12 +1468,12 @@ const ownCommands = [
   new SlashCommandBuilder().setName('commands').setDescription('Show all available bot commands'),
   new SlashCommandBuilder().setName('addstock').setDescription('Staff: Add accounts to stock')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-    .addStringOption(o => o.setName('type').setDescription('steam | phone-verified | activision | email-outlook (blank = steam)').setRequired(false))
+    .addStringOption(o => o.setName('type').setDescription('steam | phone-verified | activision | email-outlook | 5m-bundle (blank = steam)').setRequired(false))
     .addAttachmentOption(o => o.setName('file').setDescription('.txt file, one account per line').setRequired(false))
     .addStringOption(o => o.setName('accounts').setDescription('Paste accounts here (one per line) if not using a file').setRequired(false)),
   new SlashCommandBuilder().setName('stock').setDescription('Check how much stock is available'),
   new SlashCommandBuilder().setName('gensteam').setDescription('Generate an account')
-    .addStringOption(o => o.setName('type').setDescription('steam | phone-verified | activision | email-outlook (blank = steam)').setRequired(false)),
+    .addStringOption(o => o.setName('type').setDescription('steam | phone-verified | activision | email-outlook | 5m-bundle (blank = steam)').setRequired(false)),
   new SlashCommandBuilder().setName('postgensteam').setDescription('Staff: Post the Steam account generator panel')
     .addChannelOption(o => o.setName('channel').setDescription('Channel to post in (defaults to current channel)').setRequired(false)),
   new SlashCommandBuilder().setName('clearstock').setDescription('Staff: Remove stock accounts (fix a bad upload)')
@@ -1571,13 +1580,14 @@ const ownCommands = [
       .addUserOption(o => o.setName('user').setDescription('Discord user linked to the website account').setRequired(true))
       .addNumberOption(o => o.setName('amount').setDescription('Dollar amount — positive to credit, negative to debit').setRequired(true))
       .addStringOption(o => o.setName('reason').setDescription('Reason / note for the ledger').setRequired(false))),
-  new SlashCommandBuilder().setName('webstatus').setDescription('Staff: Set a website product status (undetected/updating/detected)')
+  new SlashCommandBuilder().setName('webstatus').setDescription('Staff: Set a website product status (undetected/testing/updating/detected)')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addStringOption(o => o.setName('game_name').setDescription('Game / category name (exactly as on the site)').setRequired(true))
     .addStringOption(o => o.setName('product_name').setDescription('Product name (exactly as on the site)').setRequired(true))
     .addStringOption(o => o.setName('status').setDescription('New status').setRequired(true)
       .addChoices(
         { name: 'Undetected', value: 'undetected' },
+        { name: 'Testing', value: 'testing' },
         { name: 'Updating', value: 'updating' },
         { name: 'Detected', value: 'detected' },
       ))
@@ -3244,9 +3254,12 @@ client.on('interactionCreate', async interaction => {
           await axios.post(`${BACKEND_URL}/api/status/update`, {
             secret: API_SECRET, game_name, product_name, status, note,
           });
-          const emoji = { undetected: '🟢', updating: '🟡', detected: '🔴' }[status] || '⚪';
+          // 🧪 for testing rather than another coloured circle — the three
+          // circles are already spoken for and a fourth would read as one of
+          // them at a glance.
+          const emoji = { undetected: '🟢', testing: '🧪', updating: '🟡', detected: '🔴' }[status] || '⚪';
           const embed = new EmbedBuilder()
-            .setColor(status === 'undetected' ? 0x00ff00 : status === 'updating' ? 0xffb400 : 0xff0000)
+            .setColor({ undetected: 0x00ff00, testing: 0x00b8ff, updating: 0xffb400, detected: 0xff0000 }[status] || 0x979c9f)
             .setTitle(`${emoji} Website Status Updated`)
             .addFields(
               { name: 'Product', value: `${game_name} — ${product_name}`, inline: false },
@@ -3442,6 +3455,7 @@ client.on('interactionCreate', async interaction => {
 
           const STAT = {
             undetected: { emoji: '🟢', label: 'UNDETECTED' },
+            testing:    { emoji: '🧪', label: 'TESTING' },
             updating:   { emoji: '🔵', label: 'UPDATING' },
             detected:   { emoji: '🔴', label: 'DETECTED' },
           };
@@ -3450,7 +3464,7 @@ client.on('interactionCreate', async interaction => {
             const g = r.game_name || 'Other';
             (byGame[g] = byGame[g] || []).push(r);
           });
-          const counts = { undetected: 0, updating: 0, detected: 0 };
+          const counts = { undetected: 0, testing: 0, updating: 0, detected: 0 };
           rows.forEach(r => { if (counts[r.status] != null) counts[r.status]++; });
 
           const fields = Object.keys(byGame).sort().map(game => ({
@@ -3466,7 +3480,7 @@ client.on('interactionCreate', async interaction => {
           const header = new EmbedBuilder()
             .setColor(0x00ff88)
             .setTitle('📊 PRODUCT STATUS')
-            .setDescription(`🟢 ${counts.undetected} Undetected  •  🔵 ${counts.updating} Updating  •  🔴 ${counts.detected} Detected`)
+            .setDescription(`🟢 ${counts.undetected} Undetected  •  🧪 ${counts.testing} Testing  •  🔵 ${counts.updating} Updating  •  🔴 ${counts.detected} Detected`)
             .setFooter({ text: `${BOT_NAME}${SITE_URL ? ' | ' + SITE_URL : ''}`, iconURL: client.user.displayAvatarURL() })
             .setTimestamp();
 

@@ -18,6 +18,21 @@ const SUPPORT_CHANNEL  = process.env.SUPPORT_CHANNEL || "1502225607348715621";
 const TICKET_LOG_CHANNEL = process.env.TICKET_LOG_CHANNEL || null;
 const STAFF_ROLE_ID    = process.env.STAFF_ROLE_ID || null;
 
+// Rank boosting is handled by its own team in its own channel, so those
+// tickets must not land in the general ticket log or ping general staff.
+const RANK_BOOST_LOG_CHANNEL = process.env.RANK_BOOST_LOG_CHANNEL || '1532134443433721928'; // 𝐑𝐚𝐧𝐤-𝐁𝐨𝐨𝐬𝐭𝐞𝐫-𝐓𝐢𝐜𝐤𝐞𝐭-𝐋𝐨𝐠
+const RANK_BOOST_ROLE_ID     = process.env.RANK_BOOST_ROLE_ID     || '1532108479454515341'; // ⚡ Rank Booster Staff
+
+// Ticket type → where its log goes and who gets pinged. Anything absent here
+// falls back to the general log channel and staff role, so adding a button
+// without a route can never silently stop logging.
+const TICKET_ROUTES = {
+  'Rank Boosting': { channel: RANK_BOOST_LOG_CHANNEL, role: RANK_BOOST_ROLE_ID },
+};
+function routeFor(ticketType) {
+  return TICKET_ROUTES[ticketType] || { channel: TICKET_LOG_CHANNEL, role: STAFF_ROLE_ID };
+}
+
 const GAMES = [
   'Arc Raiders','Rust','Escape from Tarkov','Fortnite',
   'Apex Legends','Valorant','Call of Duty: Warzone',
@@ -77,11 +92,24 @@ function isStaff(member) {
   return member.roles.cache.has(String(STAFF_ROLE_ID));
 }
 
+// The Quick Reply / Close buttons live in the ticket's OWN channel, so whoever
+// that channel belongs to has to be able to press them — a rank booster
+// without the general staff role would otherwise get "No permission" on a
+// ticket sitting in their own log. General staff keep access to everything so
+// a ticket can't get stranded if the specialist team is away.
+function isStaffFor(member, ticketType) {
+  if (!member) return false;
+  const route = routeFor(ticketType);
+  if (route.role && member.roles.cache.has(String(route.role))) return true;
+  return isStaff(member);
+}
+
 async function sendStaffLog(client, user, ticketData) {
-  if (!TICKET_LOG_CHANNEL) { console.error('[Tickets] TICKET_LOG_CHANNEL not set'); return; }
-  let logCh = client.channels.cache.get(String(TICKET_LOG_CHANNEL));
-  if (!logCh) try { logCh = await client.channels.fetch(String(TICKET_LOG_CHANNEL)); } catch (e) { console.error('[Tickets] Failed to fetch log channel:', e.message); }
-  if (!logCh) { console.error('[Tickets] Log channel not found:', TICKET_LOG_CHANNEL); return; }
+  const route = routeFor(ticketData.type);
+  if (!route.channel) { console.error('[Tickets] no log channel for type', ticketData.type); return; }
+  let logCh = client.channels.cache.get(String(route.channel));
+  if (!logCh) try { logCh = await client.channels.fetch(String(route.channel)); } catch (e) { console.error('[Tickets] Failed to fetch log channel:', e.message); }
+  if (!logCh) { console.error('[Tickets] Log channel not found:', route.channel); return; }
   const embed = new EmbedBuilder()
     .setTitle(`🎫 New Ticket — ${ticketData.type}`)
     .setColor(0xFF8C00).setTimestamp()
@@ -96,7 +124,7 @@ async function sendStaffLog(client, user, ticketData) {
     .setFooter({ text: `Opened at ${ticketData.opened_at} • UH Support` });
 
   await logCh.send({
-    content: STAFF_ROLE_ID ? `<@&${STAFF_ROLE_ID}> New ticket from **${user.username}**` : `New ticket from **${user.username}**`,
+    content: route.role ? `<@&${route.role}> New ticket from **${user.username}**` : `New ticket from **${user.username}**`,
     embeds: [embed],
     components: [ticketActionRow(user.id)],
   });
@@ -143,10 +171,13 @@ async function handleInteraction(interaction, client) {
         '**How it works**\n1. Click the appropriate button below\n2. I\'ll DM you to start a conversation\n3. Describe your issue and I\'ll help!\n\n' +
         '© 2026 UH. All rights reserved.'
       );
+    // Exactly 5 buttons — Discord's limit for one action row. A sixth type
+    // needs a second row, not another entry here.
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('support_hwid').setLabel('HWID Reset').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('support_purchase').setLabel('Purchase').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('support_resell').setLabel('Resell').setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId('support_rankboost').setLabel('⚡ Rank Boosting').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('support_general').setLabel('🎮 Support').setStyle(ButtonStyle.Primary),
     );
     await interaction.channel.send({ embeds: [embed], components: [row] });
@@ -168,12 +199,13 @@ async function handleInteraction(interaction, client) {
 
   // ── /reply ──
   if (interaction.isChatInputCommand() && interaction.commandName === 'reply') {
-    if (!isStaff(interaction.member)) {
-      await interaction.reply({ content: '❌ You don\'t have permission.', ephemeral: true }); return true;
-    }
     const uid = interaction.options.getString("user_id");
     const msg = interaction.options.getString('message');
-    if (!activeTickets.has(uid)) {
+    const target = activeTickets.get(uid);
+    if (!isStaffFor(interaction.member, target && target.type)) {
+      await interaction.reply({ content: '❌ You don\'t have permission.', ephemeral: true }); return true;
+    }
+    if (!target) {
       await interaction.reply({ content: '❌ No active ticket for that user.', ephemeral: true }); return true;
     }
     const user = client.users.cache.get(String(uid)) || await client.users.fetch(String(uid)).catch(() => null);
@@ -191,7 +223,13 @@ async function handleInteraction(interaction, client) {
   }
 
   // ── Support panel buttons ──
-  const TICKET_TYPES = { support_hwid: 'HWID Reset', support_purchase: 'Purchase', support_resell: 'Resell', support_general: 'Support' };
+  // The type NAME (not the customId) is what TICKET_ROUTES keys on and what
+  // gets encoded into the game-select and issue-modal customIds, so it must
+  // stay free of underscores — the modal parser splits on the first one.
+  const TICKET_TYPES = {
+    support_hwid: 'HWID Reset', support_purchase: 'Purchase', support_resell: 'Resell',
+    support_rankboost: 'Rank Boosting', support_general: 'Support',
+  };
   if (interaction.isButton() && TICKET_TYPES[interaction.customId]) {
     if (activeTickets.has(interaction.user.id)) {
       await interaction.reply({ content: '⚠️ You already have an open ticket. Type `!close` in your DM to close it first.', ephemeral: true });
@@ -273,10 +311,11 @@ async function handleInteraction(interaction, client) {
 
   // ── Quick reply button from log ──
   if (interaction.isButton() && interaction.customId.startsWith('ticket_reply_')) {
-    if (!isStaff(interaction.member)) {
+    const uid = interaction.customId.replace("ticket_reply_", "");
+    const openTicket = activeTickets.get(uid);
+    if (!isStaffFor(interaction.member, openTicket && openTicket.type)) {
       await interaction.reply({ content: '❌ No permission.', ephemeral: true }); return true;
     }
-    const uid = interaction.customId.replace("ticket_reply_", "");
     const modal = new ModalBuilder().setCustomId(`staff_reply_modal_${uid}`).setTitle('Reply to Ticket');
     modal.addComponents(new ActionRowBuilder().addComponents(
       new TextInputBuilder().setCustomId('reply_text').setLabel('Your reply to the user')
@@ -309,11 +348,12 @@ async function handleInteraction(interaction, client) {
 
   // ── Close ticket button from log ──
   if (interaction.isButton() && interaction.customId.startsWith('ticket_close_')) {
-    if (!isStaff(interaction.member)) {
+    const uid = interaction.customId.replace("ticket_close_", "");
+    const closing = activeTickets.get(uid);
+    if (!isStaffFor(interaction.member, closing && closing.type)) {
       await interaction.reply({ content: '❌ No permission.', ephemeral: true }); return true;
     }
-    const uid = interaction.customId.replace("ticket_close_", "");
-    if (!activeTickets.has(uid)) {
+    if (!closing) {
       await interaction.reply({ content: '❌ Ticket is already closed.', ephemeral: true }); return true;
     }
     activeTickets.delete(uid);
@@ -357,8 +397,13 @@ async function handleDM(message, client) {
     .setColor(0x57F287)
     .addFields({ name: 'Today at', value: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }) })] });
 
-  if (TICKET_LOG_CHANNEL) {
-    const logCh = client.channels.cache.get(String(TICKET_LOG_CHANNEL));
+  // Close notice follows the ticket, not the general log — a rank-boost ticket
+  // opened in the booster channel must not close in a channel that team
+  // cannot see.
+  const closeRoute = routeFor(ticket.type);
+  if (closeRoute.channel) {
+    let logCh = client.channels.cache.get(String(closeRoute.channel));
+    if (!logCh) try { logCh = await client.channels.fetch(String(closeRoute.channel)); } catch (_) { logCh = null; }
     if (logCh) await logCh.send({ embeds: [new EmbedBuilder()
       .setTitle('🔒 Ticket Closed')
       .setDescription(`Ticket for **${message.author.username}** (\`${message.author.id}\`) has been closed by the user.`)
@@ -368,4 +413,11 @@ async function handleDM(message, client) {
   return true;
 }
 
-module.exports = { handleInteraction, handleDM, supportCommands, activeTickets };
+// routeFor / isStaffFor are exported for test_ticket_routing.js — the whole
+// point of the rank-boost route is that it does NOT reach general staff, and
+// that is only worth anything if it's asserted.
+module.exports = {
+  handleInteraction, handleDM, supportCommands, activeTickets,
+  routeFor, isStaffFor,
+  RANK_BOOST_LOG_CHANNEL, RANK_BOOST_ROLE_ID,
+};

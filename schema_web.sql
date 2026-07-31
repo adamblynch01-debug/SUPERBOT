@@ -94,7 +94,7 @@ CREATE TABLE IF NOT EXISTS products (
   media         JSONB NOT NULL DEFAULT '{}',     -- {youtube, vimeo, video, screenshot, screenshot2, gif}
   tab           TEXT,                            -- tabbed games (Services/HWID Spoofer/GTA V): tab name
   dropdown      JSONB,                           -- {label, options:[{name,price}]} for dropdown products
-  status        TEXT NOT NULL DEFAULT 'undetected', -- undetected | updating | detected
+  status        TEXT NOT NULL DEFAULT 'undetected', -- undetected | testing | updating | detected
   hidden        BOOLEAN NOT NULL DEFAULT false,
   sort_order    INTEGER NOT NULL DEFAULT 0,
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -200,7 +200,7 @@ CREATE TABLE IF NOT EXISTS product_status (
   product_id    BIGINT REFERENCES products(id) ON DELETE CASCADE,
   game_name     TEXT NOT NULL,                   -- denormalized for display grouping
   product_name  TEXT NOT NULL,
-  status        TEXT NOT NULL DEFAULT 'undetected', -- undetected | updating | detected
+  status        TEXT NOT NULL DEFAULT 'undetected', -- undetected | testing | updating | detected
   note          TEXT,
   updated_by    TEXT,                            -- discord id or 'website'
   updated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
