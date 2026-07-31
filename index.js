@@ -3468,7 +3468,10 @@ client.on('interactionCreate', async interaction => {
           await targetMember.roles.add(role).catch(() => {});
           const embed = new EmbedBuilder()
             .setColor(0x00ff88).setTitle('✅ Customer Verified')
-            .setDescription(`<@${targetMember.id}> has been granted the **${roleName}** role for order \`${order_id}\`.`)
+            // Echo the canonical invoice number the backend matched, not the
+            // string as typed — it confirms which order was actually claimed
+            // when a customer supplies the old numeric id.
+            .setDescription(`<@${targetMember.id}> has been granted the **${roleName}** role for order \`${v.invoice_no || order_id}\`.`)
             .setTimestamp();
           return interaction.editReply({ embeds: [embed] });
         } catch (err) {

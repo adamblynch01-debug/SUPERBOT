@@ -43,6 +43,17 @@ const FAILURE_MARKERS = new Set([
   'NO_ACCOUNT_LINKED', 'ALREADY_CREDITED', 'CREDIT_FAILED',
 ]);
 
+// A delivered line, named the way the buyer bought it. The backend's
+// delivery.js now attaches tier_label and qty to every entry in
+// delivered_goods; older payloads have neither and fall back to the bare
+// product name, which is all this ever showed.
+function lineLabel(g) {
+  let s = (g && g.product) || 'Item';
+  if (g && g.tier_label) s += ` — ${g.tier_label}`;
+  if (g && Number(g.qty) > 1) s += ` ×${Number(g.qty)}`;
+  return s;
+}
+
 const SEVERITY_COLOR = { error: 0xED4245, warn: 0xFEE75C, info: 0x5865F2 };
 
 // orders.total_cents is CENTS; payment_info.amount is DOLLARS. The bridge did
@@ -286,6 +297,10 @@ function registerInternalRoutes(app, client) {
         .setColor(0x00ff88)
         .setTitle('🛒 New Order')
         .addFields(
+          // The invoice number is what the buyer holds and what /claim-customer
+          // takes; staff need to be able to match a customer's message to a row
+          // here without asking them for an id they were never given.
+          { name: 'Invoice', value: clip(order.invoice_no || `#${order.id ?? 'unknown'}`, LIMIT.value), inline: true },
           { name: 'Order ID', value: clip(order.id ?? 'unknown', LIMIT.value), inline: true },
           { name: 'Payment', value: clip(String(order.payment_method || 'unknown').toUpperCase(), LIMIT.value), inline: true },
           { name: 'Total', value: clip(formatAmount(order, payment_info), LIMIT.value), inline: true },
@@ -311,7 +326,7 @@ function registerInternalRoutes(app, client) {
   // The valuable one: this is how a Discord buyer actually receives what they
   // paid for. Delivered values go to the buyer by DM only — never to a channel.
   app.post('/internal/deliver_goods', requireSecret, async (req, res) => {
-    const { order_id, email, discord_id, goods = [], guild_id, needs_attention = false } = req.body || {};
+    const { order_id, invoice_no = null, email, discord_id, goods = [], guild_id, needs_attention = false } = req.body || {};
     const out = { ok: true, dm: false, posted: false };
 
     try {
@@ -323,7 +338,7 @@ function registerInternalRoutes(app, client) {
           .setColor(0x00ff00)
           .setTitle('✅ Your Order is Ready!')
           .setDescription('Thank you for your purchase. Here are your goods:')
-          .setFooter({ text: `Order ID: ${order_id ?? ''}`.trim() })
+          .setFooter({ text: (invoice_no ? `Invoice: ${invoice_no}` : `Order ID: ${order_id ?? ''}`).trim() })
           .setTimestamp();
 
         let fieldCount = 0;
@@ -335,7 +350,9 @@ function registerInternalRoutes(app, client) {
           // one unclipped field; past 1024 chars Discord rejects the whole
           // message, so a large order delivered the buyer nothing at all.
           const body = clip(items.join('\n'), LIMIT.value - 8);
-          embed.addFields({ name: clip(`📦 ${g.product || 'Item'}`, LIMIT.name), value: '```' + body + '```' });
+          // "Punisher Phone External Bo7" told the buyer nothing about which
+          // term they had just been given, or how many of it.
+          embed.addFields({ name: clip(`📦 ${lineLabel(g)}`, LIMIT.name), value: '```' + body + '```' });
           fieldCount++;
         }
 
@@ -365,7 +382,7 @@ function registerInternalRoutes(app, client) {
           const parts = [];
           if (good) parts.push(`${good} delivered`);
           if (bad.length) parts.push(`⚠️ ${bad.join(', ')}`);
-          return `• ${clip(g.product || 'Item', 100)} — ${parts.join(', ') || 'nothing'}`;
+          return `• ${clip(lineLabel(g), 100)} — ${parts.join(', ') || 'nothing'}`;
         });
 
         const logEmbed = new EmbedBuilder()
@@ -373,6 +390,7 @@ function registerInternalRoutes(app, client) {
           .setTitle(needs_attention ? '⚠️ Order Needs Attention' : '📦 Order Delivered')
           .setDescription(clip(summary.join('\n') || 'No items', LIMIT.desc))
           .addFields(
+            { name: 'Invoice', value: clip(invoice_no || `#${order_id ?? 'unknown'}`, LIMIT.value), inline: true },
             { name: 'Order ID', value: clip(order_id ?? 'unknown', LIMIT.value), inline: true },
             { name: 'Discord', value: discord_id ? `<@${discord_id}>` : 'N/A', inline: true },
             { name: 'Email', value: clip(email || 'N/A', LIMIT.value), inline: true },
