@@ -91,5 +91,45 @@ check('type survives the issue-modal customId', rest.slice(0, sep).replace(/_/g,
 check('game survives the issue-modal customId', rest.slice(sep + 1) === game);
 check('modal customId is within Discord\'s 100-char limit', modalId.length <= 100);
 
+// ── TICKET_STAFF_ROLE_ID is separate from the money gate ──────────────────
+// The guild has two roles named "Ticket Staff"; the env pointed at the wrong
+// one. Repointing STAFF_ROLE_ID would have fixed the ping and also handed
+// /web-balance, /addstock and /clearstock to the whole ticket team, because
+// index.js hasAccess() reads STAFF_ROLE_ID. These assert the split holds.
+console.log('\nticket ping role is independent of the permission gate');
+
+// Everything above ran with TICKET_STAFF_ROLE_ID unset — so it fell back.
+check('unset TICKET_STAFF_ROLE_ID falls back to STAFF_ROLE_ID',
+  routeFor('Support').role === process.env.STAFF_ROLE_ID);
+
+// Re-load the module with the var set, the way production reads env at boot.
+const TICKET_ROLE = '333333333333333333';
+process.env.TICKET_STAFF_ROLE_ID = TICKET_ROLE;
+delete require.cache[require.resolve('./modules/support')];
+const support2 = require('./modules/support');
+
+check('a set TICKET_STAFF_ROLE_ID is what gets pinged',
+  support2.routeFor('Support').role === TICKET_ROLE);
+check('the ping role is NOT the permission gate role',
+  support2.routeFor('Support').role !== process.env.STAFF_ROLE_ID);
+check('every general ticket type pings it',
+  ['HWID Reset', 'Purchase', 'Resell', 'Support', 'Nothing Routed']
+    .every(t => support2.routeFor(t).role === TICKET_ROLE));
+check('rank boosting still pings its own team, not ticket staff',
+  support2.routeFor('Rank Boosting').role === RANK_BOOST_ROLE_ID);
+
+// Ticket staff must be able to press Quick Reply / Close on their own tickets.
+const ticketStaff = member([TICKET_ROLE]);
+check('ticket staff can work a general ticket', support2.isStaffFor(ticketStaff, 'Support') === true);
+check('ticket staff can work an HWID ticket', support2.isStaffFor(ticketStaff, 'HWID Reset') === true);
+// ...but the role grants nothing on the rank-boost team's tickets, and holding
+// it is NOT the same as holding the money-gate role.
+check('ticket staff do not inherit rank boost tickets',
+  support2.isStaffFor(ticketStaff, 'Rank Boosting') === false);
+check('holding the ping role is not holding STAFF_ROLE_ID',
+  ticketStaff.roles.cache.has(process.env.STAFF_ROLE_ID) === false);
+// Restore, so a later require in the same process sees the original world.
+delete process.env.TICKET_STAFF_ROLE_ID;
+
 console.log(`\n  ${passed} passed, ${failed} failed\n`);
 process.exit(failed ? 1 : 0);

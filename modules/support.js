@@ -18,6 +18,16 @@ const SUPPORT_CHANNEL  = process.env.SUPPORT_CHANNEL || "1502225607348715621";
 const TICKET_LOG_CHANNEL = process.env.TICKET_LOG_CHANNEL || null;
 const STAFF_ROLE_ID    = process.env.STAFF_ROLE_ID || null;
 
+// Who gets @-mentioned when a ticket opens. Deliberately SEPARATE from
+// STAFF_ROLE_ID: that one is the permission gate in index.js hasAccess() and
+// covers /web-balance, /addstock, /clearstock and /giveaway — i.e. it can move
+// money. The guild has two roles both called "Ticket Staff" (a plain-ASCII
+// leftover and the real styled one) and the env pointed at the leftover, so the
+// ping went nowhere useful. Repointing STAFF_ROLE_ID would have fixed the ping
+// AND silently handed the money commands to everyone on the ticket team.
+// Falls back to STAFF_ROLE_ID so an unset var keeps the old behaviour exactly.
+const TICKET_STAFF_ROLE_ID = process.env.TICKET_STAFF_ROLE_ID || STAFF_ROLE_ID;
+
 // Rank boosting is handled by its own team in its own channel, so those
 // tickets must not land in the general ticket log or ping general staff.
 const RANK_BOOST_LOG_CHANNEL = process.env.RANK_BOOST_LOG_CHANNEL || '1532134443433721928'; // 𝐑𝐚𝐧𝐤-𝐁𝐨𝐨𝐬𝐭𝐞𝐫-𝐓𝐢𝐜𝐤𝐞𝐭-𝐋𝐨𝐠
@@ -30,7 +40,7 @@ const TICKET_ROUTES = {
   'Rank Boosting': { channel: RANK_BOOST_LOG_CHANNEL, role: RANK_BOOST_ROLE_ID },
 };
 function routeFor(ticketType) {
-  return TICKET_ROUTES[ticketType] || { channel: TICKET_LOG_CHANNEL, role: STAFF_ROLE_ID };
+  return TICKET_ROUTES[ticketType] || { channel: TICKET_LOG_CHANNEL, role: TICKET_STAFF_ROLE_ID };
 }
 
 const GAMES = [
