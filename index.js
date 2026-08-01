@@ -1263,10 +1263,21 @@ const UPDATE_TYPES = {
   time_extension: { label: 'Time Extension',  emoji: '🕐' },
   new_feature:    { label: 'New Feature',     emoji: '✨' },
 };
+// `site` is the website status this word means. The two vocabularies are not
+// the same and never were: the site tracks undetected / testing / updating /
+// detected, while the announcements here talk about a product being "updated".
+// Those are the same fact from two angles — an update finishing means the
+// product is back up and undetected — so "updated" maps onto 'undetected'
+// rather than getting a status of its own.
+//
+// detected/undetected were not sayable here at all, which left the two most
+// important states on a store like this one impossible to announce or sync.
 const STATUS_TYPES = {
-  updating: { emoji: '🔵', label: 'Updating', color: 0x9B59B6 },
-  testing:  { emoji: '🟡', label: 'Testing',  color: 0xF1C40F },
-  updated:  { emoji: '🟢', label: 'Updated',  color: 0x57F287 },
+  updating:   { emoji: '🔵', label: 'Updating',   color: 0x9B59B6, site: 'updating'   },
+  testing:    { emoji: '🟡', label: 'Testing',    color: 0xF1C40F, site: 'testing'    },
+  updated:    { emoji: '🟢', label: 'Updated',    color: 0x57F287, site: 'undetected' },
+  undetected: { emoji: '🟢', label: 'Undetected', color: 0x57F287, site: 'undetected' },
+  detected:   { emoji: '🔴', label: 'Detected',   color: 0xED4245, site: 'detected'   },
 };
 
 function getProductColor(name) {
@@ -1366,6 +1377,256 @@ async function sendEmbedBatches(channel, header, embeds) {
   for (let i = 0; i < all.length; i += 10) {
     await channel.send({ embeds: all.slice(i, i + 10) });
   }
+}
+
+// ─── Live status panel ───────────────────────────────────────────────────────
+// /post-status used to render the statuses once and leave. The message was
+// then wrong from the first change onward, and the only way to correct it was
+// to post the whole thing again — which is what the admin asked not to have to
+// do. The panel now edits itself instead.
+//
+// Discord caps a message at 10 embeds, so a panel is usually several messages.
+// All of them are tracked, because a status can move between games and change
+// which message it lands in.
+const STATUS_PANEL_REFRESH_MS = Number(process.env.STATUS_REFRESH_MS) || 5 * 60 * 1000;
+const STATUS_EMOJI = {
+  undetected: { emoji: '🟢', label: 'UNDETECTED' },
+  testing:    { emoji: '🧪', label: 'TESTING' },
+  updating:   { emoji: '🔵', label: 'UPDATING' },
+  detected:   { emoji: '🔴', label: 'DETECTED' },
+};
+
+// The last content we rendered, so a refresh that would change nothing costs
+// no API calls. Reset on boot, which means the first tick after a restart
+// always writes once — correct after downtime, and cheap.
+let statusPanelSignature = null;
+
+// Both /post-status and the refresher build from here, so what the timer
+// writes can never drift from what the command posted.
+async function buildStatusPanel() {
+  const res = await axios.get(`${BACKEND_URL}/api/status`);
+  const raw = Array.isArray(res.data) ? res.data : (res.data.statuses || []);
+  // Respect the site's admin hide-map so Discord stays in sync with the page
+  let hidden = {};
+  try {
+    const hs = await axios.get(`${BACKEND_URL}/api/state/global/ghostStatusHidden`);
+    hidden = (hs.data && hs.data.value) || {};
+  } catch (e) { /* no hide-map yet — show all */ }
+  const rows = raw.filter(r => !hidden[String(r.product_id)] && !isNonStatusCategory(r.game_name));
+  if (!rows.length) return null;
+
+  const byGame = {};
+  rows.forEach(r => {
+    const g = r.game_name || 'Other';
+    (byGame[g] = byGame[g] || []).push(r);
+  });
+  const counts = { undetected: 0, testing: 0, updating: 0, detected: 0 };
+  rows.forEach(r => { if (counts[r.status] != null) counts[r.status]++; });
+
+  const fields = Object.keys(byGame).sort().map(game => ({
+    name: game,
+    value: byGame[game].map(r => {
+      const s = STATUS_EMOJI[r.status] || { emoji: '⚪', label: (r.status || '?').toUpperCase() };
+      const note = r.note ? ` — _${r.note}_` : '';
+      return `${s.emoji} **${r.product_name}** · ${s.label}${note}`;
+    }).join('\n'),
+    inline: false,
+  }));
+
+  const header = new EmbedBuilder()
+    .setColor(0x00ff88)
+    .setTitle('📊 PRODUCT STATUS')
+    .setDescription(`🟢 ${counts.undetected} Undetected  •  🧪 ${counts.testing} Testing  •  🔵 ${counts.updating} Updating  •  🔴 ${counts.detected} Detected`)
+    .setFooter({ text: `${BOT_NAME}${SITE_URL ? ' | ' + SITE_URL : ''} • updates automatically`, iconURL: client.user.displayAvatarURL() })
+    .setTimestamp();
+
+  const all = [header, ...packEmbedFields(fields, 0x00ff88)];
+  const messages = [];
+  for (let i = 0; i < all.length; i += 10) messages.push(all.slice(i, i + 10));
+
+  // Deliberately NOT built from the rendered embeds: those carry a timestamp
+  // that changes every build, which would make every tick look like a change
+  // and edit the panel forever.
+  const signature = JSON.stringify(rows.map(r => [r.product_id, r.status, r.note || '']));
+  return { messages, signature, count: rows.length };
+}
+
+async function loadStatusPanelRef() {
+  try {
+    const r = await axios.get(`${BACKEND_URL}/api/status/panel`, { params: { secret: API_SECRET, kind: 'status' }, timeout: 10000 });
+    return (r.data && r.data.panel) || null;
+  } catch (err) {
+    console.warn('[Status] could not load the panel reference:', err.message);
+    return null;
+  }
+}
+
+async function saveStatusPanelRef(channelId, messageIds) {
+  try {
+    await axios.post(`${BACKEND_URL}/api/status/panel`, {
+      secret: API_SECRET, kind: 'status',
+      channel_id: channelId || null, message_ids: messageIds || [],
+    }, { timeout: 10000 });
+  } catch (err) {
+    console.warn('[Status] could not save the panel reference:', err.message);
+  }
+}
+
+// `force` skips the unchanged-check — used right after something writes a
+// status, where the whole point is to show the change immediately.
+async function refreshStatusPanel({ force = false } = {}) {
+  if (!API_SECRET) return;
+  const ref = await loadStatusPanelRef();
+  if (!ref || !ref.channel_id || !(ref.message_ids || []).length) return;
+
+  let built;
+  try { built = await buildStatusPanel(); } catch (err) {
+    console.warn('[Status] panel refresh skipped:', err.message);
+    return;
+  }
+  // No rows is not the same as "clear the panel" — it is almost always the
+  // backend being briefly unreachable, and blanking a public channel over a
+  // hiccup is worse than showing a slightly stale list.
+  if (!built) return;
+  if (!force && built.signature === statusPanelSignature) return;
+
+  let channel;
+  try {
+    channel = await client.channels.fetch(ref.channel_id);
+  } catch (err) {
+    // Channel deleted or no longer visible — forget the panel rather than
+    // failing on a timer forever.
+    console.warn('[Status] panel channel is gone, forgetting it:', err.message);
+    await saveStatusPanelRef(null, []);
+    return;
+  }
+  if (!channel || !channel.isTextBased?.()) return;
+
+  const ids = [...ref.message_ids];
+  const wanted = built.messages;
+
+  for (let i = 0; i < Math.min(ids.length, wanted.length); i++) {
+    try {
+      const msg = await channel.messages.fetch(ids[i]);
+      await msg.edit({ embeds: wanted[i] });
+    } catch (err) {
+      // 10008 Unknown Message — somebody deleted part of the panel. Drop the
+      // whole reference: a half-edited panel is worse than none, and the admin
+      // can re-run /post-status.
+      if (err.code === 10008) {
+        console.warn('[Status] part of the panel was deleted — forgetting it');
+        await saveStatusPanelRef(null, []);
+        statusPanelSignature = null;
+        return;
+      }
+      throw err;
+    }
+  }
+
+  // The catalog grew past what the existing messages hold.
+  for (let i = ids.length; i < wanted.length; i++) {
+    const sent = await channel.send({ embeds: wanted[i] });
+    ids.push(sent.id);
+  }
+  // …or shrank. Leaving the surplus would strand a stale copy of statuses
+  // that are now rendered above it.
+  for (let i = wanted.length; i < ids.length; i++) {
+    try { const m = await channel.messages.fetch(ids[i]); await m.delete(); } catch (_) {}
+  }
+  const finalIds = ids.slice(0, wanted.length);
+
+  statusPanelSignature = built.signature;
+  if (finalIds.length !== ref.message_ids.length || finalIds.some((id, i) => id !== ref.message_ids[i])) {
+    await saveStatusPanelRef(ref.channel_id, finalIds);
+  }
+}
+
+// ─── Announced status → actual status ────────────────────────────────────────
+// The update forms take a product name as free text, so it rarely matches the
+// catalog exactly ("C0D B07 - H8ED EXTERNAL" for "H8ED Private External").
+//
+// The one thing this must never do is guess. A wrong match sets the WRONG
+// product's status on the public website, which is worse than not syncing at
+// all — nobody would be looking for it. So it matches only when the answer is
+// unambiguous, and when it is not, it hands back the near misses for the
+// admin to choose from rather than picking one.
+function normProductName(s) {
+  return String(s || '').toUpperCase().replace(/[^A-Z0-9]+/g, ' ').trim();
+}
+
+async function resolveStatusProduct(typed) {
+  const res = await axios.get(`${BACKEND_URL}/api/status`, { timeout: 10000 });
+  const raw = Array.isArray(res.data) ? res.data : (res.data.statuses || []);
+  const rows = raw.filter(r => !isNonStatusCategory(r.game_name));
+  const t = normProductName(typed);
+  if (!t) return { match: null, candidates: [] };
+
+  const exact = rows.filter(r =>
+    normProductName(r.product_name) === t ||
+    normProductName(`${r.game_name} ${r.product_name}`) === t);
+  if (exact.length === 1) return { match: exact[0], candidates: [] };
+  if (exact.length > 1) return { match: null, candidates: exact };
+
+  // One name contained in the other — catches both the typed prefix
+  // ("H8ED PRIVATE EXTERNAL" for "COD - H8ED Private External") and the typed
+  // extra ("C0D B07 - H8ED PRIVATE EXTERNAL").
+  const contains = rows.filter(r => {
+    const p = normProductName(r.product_name);
+    return p && (t.includes(p) || p.includes(t));
+  });
+  if (contains.length === 1) return { match: contains[0], candidates: [] };
+  if (contains.length > 1) return { match: null, candidates: contains };
+
+  // Nothing lined up. Offer the closest by shared words so the reply can say
+  // what to retype — but do NOT treat these as a match.
+  const words = t.split(' ').filter(w => w.length > 2);
+  const scored = rows
+    .map(r => ({ r, score: words.filter(w => normProductName(r.product_name).split(' ').includes(w)).length }))
+    .filter(x => x.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 4);
+  return { match: null, candidates: scored.map(x => x.r) };
+}
+
+// Notes from the form are deliberately NOT written to the status row. They are
+// announcement copy — paragraphs, pings, "@everyone" — and the status panel
+// renders its note inline next to the product name, where that would be a wall
+// of text against every other product.
+async function syncStatusToSite(typedProduct, statusKey) {
+  if (!API_SECRET) return { ok: false, reason: 'the bot has no API_SECRET, so it cannot write to the site' };
+  const site = (STATUS_TYPES[statusKey] || {}).site;
+  if (!site) return { ok: false, reason: `“${statusKey}” has no matching website status` };
+
+  let found;
+  try { found = await resolveStatusProduct(typedProduct); }
+  catch (err) { return { ok: false, reason: `the website was unreachable (${err.message})` }; }
+
+  if (!found.match) {
+    const near = found.candidates.length
+      ? ` Did you mean: ${found.candidates.map(c => `**${c.product_name}**`).join(', ')}?`
+      : '';
+    return { ok: false, reason: `nothing on the website matched “${typedProduct}”.${near}` };
+  }
+
+  try {
+    await axios.post(`${BACKEND_URL}/api/status/update`, {
+      secret: API_SECRET, product_id: found.match.product_id, status: site,
+    }, { timeout: 10000 });
+  } catch (err) {
+    return { ok: false, reason: err.response?.data?.error || err.message };
+  }
+  // Show it on the panel now rather than at the next tick — the announcement
+  // and the panel sitting next to it disagreeing is the thing being fixed.
+  refreshStatusPanel({ force: true }).catch(() => {});
+  return { ok: true, product: found.match, site };
+}
+
+// One line appended to the command's own reply. A silent failure here would be
+// the worst outcome: the admin would believe the site had been updated.
+function describeSync(sync) {
+  if (!sync) return '';
+  if (sync.ok) return `\n🌐 Website status set to **${sync.site.toUpperCase()}** for \`${sync.product.product_name}\` — the status panel has been updated too.`;
+  return `\n⚠️ **The website was NOT updated** — ${sync.reason}\nThe announcement above still posted. Fix it with \`/statusupdate\` or from the admin panel.`;
 }
 
 // Only true for the bot owner's own Discord account — used for commands
@@ -1809,6 +2070,14 @@ client.once('ready', async () => {
   // was offline, then check every minute going forward.
   await sweepExpiredKeys();
   setInterval(sweepExpiredKeys, 60_000);
+
+  // Keep the posted status panel current. The first pass is forced because
+  // anything could have changed while the bot was down, and after a restart
+  // there is no remembered signature to compare against.
+  refreshStatusPanel({ force: true }).catch(err => console.warn('[Status] first refresh failed:', err.message));
+  setInterval(() => {
+    refreshStatusPanel().catch(err => console.warn('[Status] refresh failed:', err.message));
+  }, STATUS_PANEL_REFRESH_MS);
 
   await client.user.setActivity('for scams 🛡️', { type: 3 }); // Watching
 });
@@ -3162,7 +3431,7 @@ client.on('interactionCreate', async interaction => {
         const modal = new ModalBuilder().setCustomId('setstatus_modal').setTitle('Status Update');
         modal.addComponents(
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('ss_product').setLabel('PRODUCT NAME').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(100)),
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('ss_status').setLabel('STATUS (e.g. updated -> updating)').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(40)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('ss_status').setLabel('STATUS (updating > updated / detected)').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(40)),
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('ss_notes').setLabel('NOTES (optional, separate with |)').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(1000)),
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('ss_ping').setLabel('PING ROLE (name or ID, optional)').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(100)),
         );
@@ -3601,50 +3870,37 @@ client.on('interactionCreate', async interaction => {
         await interaction.deferReply({ ephemeral: true });
         const targetCh = interaction.options.getChannel('channel') || interaction.channel;
         try {
-          const res = await axios.get(`${BACKEND_URL}/api/status`);
-          const raw = Array.isArray(res.data) ? res.data : (res.data.statuses || []);
-          // Respect the site's admin hide-map so Discord stays in sync with the page
-          let hidden = {};
-          try {
-            const hs = await axios.get(`${BACKEND_URL}/api/state/global/ghostStatusHidden`);
-            hidden = (hs.data && hs.data.value) || {};
-          } catch (e) { /* no hide-map yet — show all */ }
-          const rows = raw.filter(r => !hidden[String(r.product_id)] && !isNonStatusCategory(r.game_name));
-          if (!rows.length) return interaction.editReply({ content: '❌ No product statuses to post.' });
+          const built = await buildStatusPanel();
+          if (!built) return interaction.editReply({ content: '❌ No product statuses to post.' });
 
-          const STAT = {
-            undetected: { emoji: '🟢', label: 'UNDETECTED' },
-            testing:    { emoji: '🧪', label: 'TESTING' },
-            updating:   { emoji: '🔵', label: 'UPDATING' },
-            detected:   { emoji: '🔴', label: 'DETECTED' },
-          };
-          const byGame = {};
-          rows.forEach(r => {
-            const g = r.game_name || 'Other';
-            (byGame[g] = byGame[g] || []).push(r);
+          // Take the previous panel down first. Two panels would both keep
+          // refreshing themselves, and only one of them is the one anybody is
+          // actually looking at — the other becomes a second source of truth
+          // that stays convincingly up to date.
+          const prev = await loadStatusPanelRef();
+          if (prev && prev.channel_id) {
+            try {
+              const ch = await client.channels.fetch(prev.channel_id);
+              for (const id of prev.message_ids || []) {
+                try { const m = await ch.messages.fetch(id); await m.delete(); } catch (_) {}
+              }
+            } catch (_) { /* channel gone — nothing to clean up */ }
+          }
+
+          const ids = [];
+          for (const embeds of built.messages) {
+            const sent = await targetCh.send({ embeds });
+            ids.push(sent.id);
+          }
+          await saveStatusPanelRef(targetCh.id, ids);
+          statusPanelSignature = built.signature;
+
+          const mins = Math.max(1, Math.round(STATUS_PANEL_REFRESH_MS / 60000));
+          return interaction.editReply({
+            content: `✅ Posted ${built.count} product statuses to ${targetCh}.\n`
+              + `It **keeps itself up to date** from now on — re-checked every ${mins} min and edited in place, `
+              + `and updated straight away whenever \`/postupdate\` changes a status. You should not need to run this again.`,
           });
-          const counts = { undetected: 0, testing: 0, updating: 0, detected: 0 };
-          rows.forEach(r => { if (counts[r.status] != null) counts[r.status]++; });
-
-          const fields = Object.keys(byGame).sort().map(game => ({
-            name: game,
-            value: byGame[game].map(r => {
-              const s = STAT[r.status] || { emoji: '⚪', label: (r.status || '?').toUpperCase() };
-              const note = r.note ? ` — _${r.note}_` : '';
-              return `${s.emoji} **${r.product_name}** · ${s.label}${note}`;
-            }).join('\n'),
-            inline: false,
-          }));
-
-          const header = new EmbedBuilder()
-            .setColor(0x00ff88)
-            .setTitle('📊 PRODUCT STATUS')
-            .setDescription(`🟢 ${counts.undetected} Undetected  •  🧪 ${counts.testing} Testing  •  🔵 ${counts.updating} Updating  •  🔴 ${counts.detected} Detected`)
-            .setFooter({ text: `${BOT_NAME}${SITE_URL ? ' | ' + SITE_URL : ''}`, iconURL: client.user.displayAvatarURL() })
-            .setTimestamp();
-
-          await sendEmbedBatches(targetCh, header, packEmbedFields(fields, 0x00ff88));
-          return interaction.editReply({ content: `✅ Posted ${rows.length} product statuses to ${targetCh}.` });
         } catch (err) {
           const msg = err.response?.data?.error || err.message;
           return interaction.editReply({ content: `❌ Could not post statuses: ${msg}` });
@@ -3747,7 +4003,7 @@ client.on('interactionCreate', async interaction => {
         const modal = new ModalBuilder().setCustomId('update_modal').setTitle(`${typeInfo.emoji} ${typeInfo.label} — Product Update`);
         modal.addComponents(
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('product_name').setLabel('PRODUCT NAME').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(100)),
-          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('status_transition').setLabel(isTimeExt ? 'TIME ADDED (e.g. 12 hours, 3 days)' : 'STATUS (e.g. updating → updated)').setStyle(TextInputStyle.Short).setRequired(isTimeExt).setMaxLength(40)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('status_transition').setLabel(isTimeExt ? 'TIME ADDED (e.g. 12 hours, 3 days)' : 'STATUS (updating > updated / detected)').setStyle(TextInputStyle.Short).setRequired(isTimeExt).setMaxLength(40)),
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('notes').setLabel('NOTES (separate bullet points with |)').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(1000)),
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('custom_title').setLabel('CUSTOM TITLE (optional)').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(100)),
           new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('image_url').setLabel('IMAGE URL (optional)').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(500)),
@@ -4085,10 +4341,30 @@ client.on('interactionCreate', async interaction => {
         const downloadUrl = productData ? (productData.url || '') : '';
         const buttonRow = downloadUrl ? new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel('⬇️  DOWNLOAD').setURL(downloadUrl).setStyle(ButtonStyle.Link)) : null;
         const payload = { embeds: [embed], ...(buttonRow ? { components: [buttonRow] } : {}) };
+
+        // Deferred because the sync below is two more network calls, and a
+        // modal reply has about three seconds before Discord declares the
+        // interaction dead and the admin sees "This interaction failed"
+        // despite everything having worked.
+        await interaction.deferReply({ flags: 64 });
+
+        // The embed announces that the status changed. This is what makes it
+        // true. Until now /postupdate told the server a product was updating
+        // while the website's status page — and the /post-status panel next to
+        // it — went on saying whatever they said before, and the only way to
+        // reconcile them was to remember to go and do it by hand.
+        let siteSync = null;
+        if (newStatus) {
+          const key = Object.keys(STATUS_TYPES).find(k => STATUS_TYPES[k] === newStatus);
+          siteSync = await syncStatusToSite(product, key);
+        }
+
         try {
           await interaction.channel.send(payload);
-          await interaction.reply({ content: `✅ Update posted to <#${interaction.channel.id}>`, flags: 64 }); autoDelete(interaction, 5000);
-        } catch (err) { await interaction.reply({ content: `❌ Failed: ${err.message}`, flags: 64 }); autoDelete(interaction, 8000); }
+          await interaction.editReply({ content: `✅ Update posted to <#${interaction.channel.id}>${describeSync(siteSync)}` });
+          // A warning needs long enough to actually be read.
+          autoDelete(interaction, siteSync && !siteSync.ok ? 30000 : 5000);
+        } catch (err) { await interaction.editReply({ content: `❌ Failed: ${err.message}${describeSync(siteSync)}` }); autoDelete(interaction, 12000); }
         return;
       }
 
@@ -4140,10 +4416,21 @@ client.on('interactionCreate', async interaction => {
         const statusCh = findChannelByName(interaction.guild, 'statusupdates') || interaction.channel;
         let pingText = '@everyone';
         if (pingStr) { const clean = pingStr.replace('@','').trim().toLowerCase(); if (clean==='everyone') pingText='@everyone'; else if (clean==='here') pingText='@here'; else { const rm=pingStr.match(/\d+/); if(rm) pingText=`<@&${rm[0]}>`; else { const r=interaction.guild.roles.cache.find(r=>r.name.toLowerCase()===clean); if(r) pingText=`<@&${r.id}>`; } } }
+        // Same sync as /postupdate. This command is the one actually named
+        // "status update", so it announcing a change the website never hears
+        // about is the more surprising of the two.
+        await interaction.deferReply({ flags: 64 });
+        let siteSync = null;
+        if (newStatus) {
+          const key = Object.keys(STATUS_TYPES).find(k => STATUS_TYPES[k] === newStatus);
+          siteSync = await syncStatusToSite(product, key);
+        }
+
         try {
           await statusCh.send({ content: pingText, embeds: [embed] });
-          await interaction.reply({ content: `✅ Status update posted to <#${statusCh.id}>`, flags: 64 }); autoDelete(interaction, 5000);
-        } catch (err) { await interaction.reply({ content: `❌ Failed: ${err.message}`, flags: 64 }); autoDelete(interaction, 8000); }
+          await interaction.editReply({ content: `✅ Status update posted to <#${statusCh.id}>${describeSync(siteSync)}` });
+          autoDelete(interaction, siteSync && !siteSync.ok ? 30000 : 5000);
+        } catch (err) { await interaction.editReply({ content: `❌ Failed: ${err.message}${describeSync(siteSync)}` }); autoDelete(interaction, 12000); }
         return;
       }
 
