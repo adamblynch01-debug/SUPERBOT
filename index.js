@@ -3568,6 +3568,18 @@ client.on('interactionCreate', async interaction => {
               name: 'Admin panel access',
               value: 'They log in to the site as normal, then unlock the panel with the panel password (set in Railway).',
             });
+          } else if ((u.role || role) === 'staff') {
+            // Staff have no second password to be handed. The role IS the
+            // access, so this says what appears and what it does — otherwise
+            // the natural next question is "what do I send them?", and the
+            // honest answer (nothing) reads like the command half-worked.
+            embed.addFields({
+              name: 'Staff panel access',
+              value:
+                'No password to send — the role is the access. They log in to the site as normal and a **🛡 shield** appears in the dock; ' +
+                'it opens the admin panel limited to **Tickets**, **Status Manager** and **Downloads Manager**.\n' +
+                'They can edit and hide, but **not delete** anything. Set them back to `member` here to revoke it — it takes effect on their next click.',
+            });
           }
           return interaction.editReply({ embeds: [embed] });
         } catch (err) {
