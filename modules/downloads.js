@@ -66,6 +66,22 @@ const LEGACY_PRODUCTS = [
   'HWID SPOOFER - VERSE PERMANENT', 'HWID SPOOFER - RANKED TPM TEMPORARY',
 ];
 
+// Categories whose products are not files.
+//
+// A service — ACCOUNT RECOVERY, RANK BOOSTING, COINS, BLUEPRINTS — is carried
+// out by a person, so listing one in a download panel offers the customer a
+// button that can never do anything: it sat there reading "Coming soon"
+// forever, because there is nothing that would ever arrive. Excluded by
+// CATEGORY rather than by name, so a service added to the store later is left
+// out without another code change.
+//
+// DOWNLOADS_EXCLUDE_CATEGORIES overrides the list (comma-separated); set it to
+// a single space to exclude nothing.
+const NON_DOWNLOADABLE = new Set(
+  String(process.env.DOWNLOADS_EXCLUDE_CATEGORIES == null ? 'Services' : process.env.DOWNLOADS_EXCLUDE_CATEGORIES)
+    .split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+);
+
 // A select-menu option value is capped at 100 characters and must be stable
 // across restarts — the panel message stays in #downloads between deploys, so
 // an id that changed shape would make every existing dropdown dead. Slugging
@@ -194,9 +210,20 @@ async function fetchFromBackend() {
     //
     // `category` is the game title on this API — there is no game_name field,
     // whatever the DB column is called.
+    //
+    // Anything in a non-downloadable category is left out entirely — see
+    // NON_DOWNLOADABLE. Their names are collected so an entry arriving from the
+    // link table cannot put them back.
+    const excluded = new Set();
     for (const row of catalog) {
       const name = row && (row.product_name || row.name);
-      if (name) put(name, { vault: false, game: (row.category || row.game_name || '').trim() });
+      if (!name) continue;
+      const game = String(row.category || row.game_name || '').trim();
+      if (NON_DOWNLOADABLE.has(game.toLowerCase())) {
+        excluded.add(String(name).trim().toUpperCase());
+        continue;
+      }
+      put(name, { vault: false, game });
     }
     // The floor applies ONLY when the catalog could not be read. Once it can,
     // the legacy names are duplicates of catalog products under a different
@@ -208,6 +235,7 @@ async function fetchFromBackend() {
     // is where the "9 products do not fit" warning came from.
     if (!catalog.length) for (const name of LEGACY_PRODUCTS) put(name);
     for (const d of (links.data && links.data.downloads) || []) {
+      if (excluded.has(String(d.name || '').trim().toUpperCase())) continue;
       put(d.name, {
         url: d.link || '',
         version: d.version || null,
