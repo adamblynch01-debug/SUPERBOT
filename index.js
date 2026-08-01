@@ -3614,24 +3614,128 @@ client.on('interactionCreate', async interaction => {
               params: { secret: API_SECRET }, timeout: 10000,
             });
             const o = res.data;
-            const statusEmoji = { waiting: '⏳', paid: '💰', delivered: '✅', expired: '❌' }[o.status] || '❓';
+            const statusEmoji = { waiting: '⏳', paid: '💰', underpaid: '⚠️', delivered: '✅', expired: '❌', cancelled: '🚫' }[o.status] || '❓';
+
             // Every field below is nullable on a real row — an order that never
             // reached a payment method has payment_method null, and
             // `.toUpperCase()` on it threw INSIDE this try, which the catch then
             // reported as "Order not found". A present order must not be able to
             // render as a missing one.
-            const when = t => (t ? new Date(t).toLocaleString() : '—');
+            //
+            // Timestamps go out as Discord markers rather than
+            // `toLocaleString()`: that renders in the CONTAINER's timezone (UTC
+            // on Railway), so staff read a time that is not theirs and not the
+            // customer's. `<t:…:f>` is rendered by each viewer's own client.
+            const when = t => {
+              const d = t ? new Date(t) : null;
+              return d && !isNaN(d.getTime()) ? `<t:${Math.floor(d.getTime() / 1000)}:f>` : '—';
+            };
+            const money = n => (n == null || n === '' ? '—' : `$${Number(n).toFixed(2)}`);
+            const dash = v => (v == null || v === '' ? '—' : String(v));
+            // An embed field caps at 1024 characters and Discord rejects the
+            // whole message if one goes over — so a 40-item order must lose
+            // lines, and it must SAY it lost them. Silent truncation in a staff
+            // lookup reads as "that is the whole order", which is exactly the
+            // wrong thing to believe while answering a customer.
+            const block = (lines, cap = 1024) => {
+              const kept = [];
+              let len = 0;
+              for (const line of lines) {
+                if (len + line.length + 1 > cap - 40) break;
+                kept.push(line); len += line.length + 1;
+              }
+              if (kept.length < lines.length) kept.push(`_… ${lines.length - kept.length} more not shown_`);
+              return kept.join('\n') || '—';
+            };
+
             const embed = new EmbedBuilder()
-              .setColor(o.status === 'delivered' ? 0x00ff00 : o.status === 'waiting' ? 0xffff00 : 0xff0000)
+              .setColor(o.status === 'delivered' ? 0x00ff00 : o.status === 'waiting' ? 0xffff00 : o.status === 'paid' ? 0x00b0f4 : 0xff0000)
               .setTitle(`${statusEmoji} Order ${o.invoice_no || `#${o.order_id || order_id}`}`)
               .addFields(
                 { name: 'Status',    value: String(o.status || 'unknown').toUpperCase(), inline: true },
                 { name: 'Payment',   value: String(o.payment_method || '—').toUpperCase(), inline: true },
-                { name: 'Total',     value: o.total != null ? `$${o.total}` : '—', inline: true },
                 { name: 'Delivered', value: o.delivered ? '✅ Yes' : '❌ No', inline: true },
-                { name: 'Created',   value: when(o.created_at), inline: true },
-                { name: 'Expires',   value: when(o.expires_at), inline: true },
-              ).setTimestamp();
+              );
+
+            // The customer block only arrives when the backend recognised this
+            // request as privileged. Rendering the headings unconditionally
+            // would print a row of em-dashes that looks like an order with no
+            // buyer, rather than a reply that was not entitled to say.
+            if (o.email || o.discord_id || o.web_user_id) {
+              embed.addFields({
+                name: '👤 Customer',
+                value: block([
+                  `**Email:** ${dash(o.email)}`,
+                  `**Discord:** ${o.discord_id ? `<@${o.discord_id}> \`${o.discord_id}\`` : '—'}`,
+                  `**Web account:** ${o.web_user_id ? `#${o.web_user_id}` : '—'}`,
+                ]),
+              });
+            }
+
+            const moneyLines = [`**Subtotal:** ${money(o.subtotal)}`];
+            if (o.coupon_code) moneyLines.push(`**Coupon:** \`${o.coupon_code}\` −${money(o.coupon_discount)}`);
+            if (o.fee) moneyLines.push(`**Fee:** ${money(o.fee)}`);
+            moneyLines.push(`**Total:** ${money(o.total)}`);
+            if (o.amount_received != null) {
+              // What was actually received against what was owed — the number
+              // that decides whether an order is short, and by how much.
+              const native = o.amount_received_native ? ` (${o.amount_received_native} ${o.amount_received_unit || ''})`.trimEnd() : '';
+              const delta = o.total != null ? Number(o.amount_received) - Number(o.total) : null;
+              const note = delta == null || Math.abs(delta) < 0.005 ? ''
+                : delta < 0 ? ` — ⚠️ short ${money(Math.abs(delta))}` : ` — over by ${money(delta)}`;
+              moneyLines.push(`**Received:** ${money(o.amount_received)}${native}${note}`);
+            }
+            if (o.paid_from_balance) moneyLines.push('**Paid from store balance:** ✅');
+            embed.addFields({ name: '💵 Money', value: block(moneyLines) });
+
+            embed.addFields({
+              name: '🕒 Timeline',
+              value: block([
+                `**Created:** ${when(o.created_at)}`,
+                `**Paid:** ${when(o.paid_at)}`,
+                `**Delivered:** ${when(o.delivered_at)}`,
+                `**Expires:** ${when(o.expires_at)}`,
+              ]),
+            });
+
+            const items = Array.isArray(o.items) ? o.items : [];
+            if (items.length) {
+              embed.addFields({
+                name: `🛒 Items (${items.length})`,
+                value: block(items.map(it => {
+                  const name = it.name || it.product_name || 'Unknown product';
+                  // `name` on the snapshot usually already carries the tier —
+                  // "Punisher Phone External Bo7 (Day)" — so only append the
+                  // tier when it is not already in there.
+                  const tier = it.tier_label && !String(name).toLowerCase().includes(String(it.tier_label).toLowerCase())
+                    ? ` [${it.tier_label}]` : '';
+                  return `• **${it.qty || 1}×** ${name}${tier} — ${money(it.price)}`;
+                })),
+              });
+            }
+
+            const goods = Array.isArray(o.delivered_goods) ? o.delivered_goods : [];
+            if (goods.length) {
+              const lines = [];
+              for (const g of goods) {
+                const tier = g.tier_label ? ` [${g.tier_label}]` : '';
+                lines.push(`• **${g.qty || 1}×** ${g.product || 'Unknown product'}${tier}`);
+                for (const k of (Array.isArray(g.items) ? g.items : [])) lines.push(`\`${k}\``);
+              }
+              embed.addFields({ name: '📦 Delivered', value: block(lines) });
+            }
+
+            // Everything needed to find this payment in PayPal, Cash App or on
+            // chain, which is the whole reason staff run this command when an
+            // order is stuck.
+            const payLines = [];
+            if (o.crypto_address)   payLines.push(`**Address:** \`${o.crypto_address}\``);
+            if (o.payment_note)     payLines.push(`**Note / memo:** \`${o.payment_note}\``);
+            if (o.provider_txn_id)  payLines.push(`**Txn id:** \`${o.provider_txn_id}\``);
+            if (o.external_ref)     payLines.push(`**External ref:** \`${o.external_ref}\``);
+            if (payLines.length) embed.addFields({ name: '🔗 Payment detail', value: block(payLines) });
+
+            embed.setTimestamp();
             if (o.invoice_no && o.order_id) embed.setFooter({ text: `Internal id #${o.order_id}` });
             return interaction.editReply({ embeds: [embed] });
           } catch (err) {
