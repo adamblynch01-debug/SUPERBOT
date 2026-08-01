@@ -4259,8 +4259,19 @@ client.on('interactionCreate', async interaction => {
             secret: API_SECRET, order_id, email,
           });
           const v = res.data;
-          if (!v.email_match) {
-            return interaction.editReply({ content: '❌ That email does not match the invoice on record.' });
+
+          // The Discord account named ON the order is stronger proof than any
+          // address the claimer types, so it stands on its own. Without it a
+          // customer whose order carries a second address of theirs — the
+          // common case, and the one that produced "that email does not match
+          // the invoice on record" for the buyer's own invoice — had no way
+          // through at all.
+          const ownsByDiscord = !!v.discord_id && String(v.discord_id) === interaction.user.id;
+          if (!v.email_match && !ownsByDiscord) {
+            const hint = v.email_hint ? ` The address on this order looks like \`${v.email_hint}\`.` : '';
+            return interaction.editReply({
+              content: `❌ That email does not match invoice \`${v.invoice_no || order_id}\`.${hint}\nUse the address from your order confirmation — if you no longer have it, open a support ticket and staff can grant the role.`,
+            });
           }
           if (!v.paid) {
             return interaction.editReply({ content: `❌ Invoice \`${order_id}\` is **${v.status}** — only paid/delivered orders qualify.` });
@@ -4276,9 +4287,10 @@ client.on('interactionCreate', async interaction => {
             .setColor(0x00ff88)
             .setTitle('✅ Claim Successful')
             .addFields(
-              { name: 'Invoice ID', value: `\`${order_id}\``, inline: true },
+              { name: 'Invoice ID', value: `\`${v.invoice_no || order_id}\``, inline: true },
               { name: 'Email', value: email, inline: true },
               { name: 'User', value: `<@${interaction.user.id}>`, inline: true },
+              { name: 'Verified by', value: v.email_match ? 'Email on the order' : 'Discord account on the order', inline: true },
               { name: 'Role Added', value: `<@&${role.id}>`, inline: false },
             )
             .setFooter({ text: BOT_NAME, iconURL: client.user.displayAvatarURL() })
