@@ -3605,23 +3605,38 @@ client.on('interactionCreate', async interaction => {
 
         if (sub === 'lookup') {
           try {
-            const res = await axios.get(`${BACKEND_URL}/api/orders/${order_id}`);
+            // GET /api/orders/:id is gated on the public ref, the owning
+            // session, staff, or the bot's secret. This request carried NONE of
+            // those, so it got the same 404 as a stranger enumerating ids — the
+            // command could not have worked for anyone since that route was
+            // hardened, whatever id was typed.
+            const res = await axios.get(`${BACKEND_URL}/api/orders/${encodeURIComponent(order_id)}`, {
+              params: { secret: API_SECRET }, timeout: 10000,
+            });
             const o = res.data;
             const statusEmoji = { waiting: '⏳', paid: '💰', delivered: '✅', expired: '❌' }[o.status] || '❓';
+            // Every field below is nullable on a real row — an order that never
+            // reached a payment method has payment_method null, and
+            // `.toUpperCase()` on it threw INSIDE this try, which the catch then
+            // reported as "Order not found". A present order must not be able to
+            // render as a missing one.
+            const when = t => (t ? new Date(t).toLocaleString() : '—');
             const embed = new EmbedBuilder()
               .setColor(o.status === 'delivered' ? 0x00ff00 : o.status === 'waiting' ? 0xffff00 : 0xff0000)
-              .setTitle(`${statusEmoji} Order #${order_id}`)
+              .setTitle(`${statusEmoji} Order ${o.invoice_no || `#${o.order_id || order_id}`}`)
               .addFields(
-                { name: 'Status',    value: o.status.toUpperCase(),         inline: true },
-                { name: 'Payment',   value: o.payment_method.toUpperCase(), inline: true },
-                { name: 'Total',     value: `$${o.total}`,                  inline: true },
+                { name: 'Status',    value: String(o.status || 'unknown').toUpperCase(), inline: true },
+                { name: 'Payment',   value: String(o.payment_method || '—').toUpperCase(), inline: true },
+                { name: 'Total',     value: o.total != null ? `$${o.total}` : '—', inline: true },
                 { name: 'Delivered', value: o.delivered ? '✅ Yes' : '❌ No', inline: true },
-                { name: 'Created',   value: new Date(o.created_at).toLocaleString(), inline: true },
-                { name: 'Expires',   value: new Date(o.expires_at).toLocaleString(), inline: true },
+                { name: 'Created',   value: when(o.created_at), inline: true },
+                { name: 'Expires',   value: when(o.expires_at), inline: true },
               ).setTimestamp();
+            if (o.invoice_no && o.order_id) embed.setFooter({ text: `Internal id #${o.order_id}` });
             return interaction.editReply({ embeds: [embed] });
           } catch (err) {
-            return interaction.editReply({ content: `❌ Order not found or error: ${err.message}` });
+            const msg = (err.response && err.response.data && err.response.data.error) || err.message;
+            return interaction.editReply({ content: `❌ Order \`${order_id}\` not found or error: ${msg}` });
           }
         }
 
