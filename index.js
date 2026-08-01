@@ -1314,6 +1314,62 @@ function hasAccess(interaction) {
   return false;
 }
 
+// The role a verified buyer gets, BY ID.
+//
+// This used to be `roles.cache.find(r => r.name === 'Customer')` with a
+// `roles.create()` fallback, and it failed in both ways a name lookup can. The
+// role that actually marks a paying customer in this server is named
+// "🤝 Real One"; nothing was named 'Customer', so every claim fell through to
+// the fallback and the bot MANUFACTURED a role called 'Customer' at the bottom
+// of the hierarchy — a role that grants no channel access, carries no
+// permissions, and is not what any of the server's overwrites are written
+// against. The claim then reported success.
+//
+// So: resolve by id, and never create. A role the bot invents is by
+// construction not the role the server was built around, and handing someone a
+// decoy is worse than telling them the feature is misconfigured.
+const CUSTOMER_ROLE_ID_FALLBACK = '1242149583228768306'; // 🤝 Real One
+function resolveCustomerRole(guild) {
+  const id = process.env.CUSTOMER_ROLE_ID || CUSTOMER_ROLE_ID_FALLBACK;
+  const byId = guild.roles.cache.get(String(id));
+  if (byId) return byId;
+  // Only if the configured id is absent from THIS guild — a name is a last
+  // resort, and it warns rather than pretending it is equivalent.
+  const name = process.env.CUSTOMER_ROLE_NAME;
+  if (name) {
+    console.warn(`[Customer] Role id ${id} not found in ${guild.id}; falling back to the name "${name}". Set CUSTOMER_ROLE_ID.`);
+    return guild.roles.cache.find(r => r.name === name) || null;
+  }
+  console.warn(`[Customer] Role id ${id} not found in guild ${guild.id} — set CUSTOMER_ROLE_ID.`);
+  return null;
+}
+
+// Returns null on success, or a human-readable reason on failure.
+//
+// Adding a role fails for reasons the person claiming needs to hear, and the
+// loudest one is hierarchy: Discord requires the bot's own highest role to sit
+// strictly ABOVE the role it hands out, and Administrator does not exempt it.
+// In this server the bot's role sits at the bottom while the customer role is
+// near the top, so the add throws — and the old code swallowed it with
+// `.catch(() => {})` and posted "✅ Role Added" regardless. A claim that
+// granted nothing was indistinguishable from one that worked.
+async function grantCustomerRole(member, role) {
+  const me = member.guild.members.me || await member.guild.members.fetchMe().catch(() => null);
+  if (!me) return 'I could not read my own permissions in this server.';
+  if (!me.permissions.has(PermissionFlagsBits.ManageRoles)) return 'I do not have the **Manage Roles** permission.';
+  if (role.managed) return `**${role.name}** is managed by an integration, so Discord will not let anyone assign it.`;
+  if (me.roles.highest.comparePositionTo(role) <= 0) {
+    return `my highest role (**${me.roles.highest.name}**) is below **${role.name}** in the role list, so Discord refuses the assignment. An admin needs to drag my role above it in Server Settings → Roles.`;
+  }
+  if (member.roles.cache.has(role.id)) return null; // already held — nothing to do
+  try {
+    await member.roles.add(role, 'Verified paid order');
+    return null;
+  } catch (err) {
+    return err.message || 'Discord refused the role assignment.';
+  }
+}
+
 // Stricter gate for the commands that can move money or repoint where money
 // goes. /config writes BTC_XPUB, LTC_XPUB, PAYPAL_EMAIL, CASHAPP_CASHTAG and
 // the Gmail credentials through the backend using the shared API_SECRET — that
@@ -3759,25 +3815,33 @@ client.on('interactionCreate', async interaction => {
             secret: API_SECRET, order_id, email,
           });
           const v = res.data;
-          if (!v.email_match) {
-            return interaction.editReply({ content: '❌ That email does not match the order on record.' });
+          // Same widening as the claim panel: the Discord account named on the
+          // order proves ownership on its own, because a buyer may hold more
+          // than one address and only one of them was captured at checkout.
+          // Checked against the TARGET, not the caller — otherwise staff
+          // granting on someone's behalf would verify themselves.
+          const ownsByDiscord = !!v.discord_id && String(v.discord_id) === targetMember.id;
+          if (!v.email_match && !ownsByDiscord) {
+            const hint = v.email_hint ? ` The address on this order looks like \`${v.email_hint}\`.` : '';
+            return interaction.editReply({ content: `❌ That email does not match the order on record.${hint}` });
           }
           if (!v.paid) {
             return interaction.editReply({ content: `❌ Order \`${order_id}\` is **${v.status}** — only paid/delivered orders qualify.` });
           }
 
-          const roleName = process.env.CUSTOMER_ROLE_NAME || 'Customer';
-          let role = interaction.guild.roles.cache.find(r => r.name === roleName);
-          if (!role) role = await interaction.guild.roles.create({ name: roleName, color: 0x00ff88, reason: 'Customer role for verified purchases' }).catch(() => null);
-          if (!role) return interaction.editReply({ content: '❌ Could not find or create the Customer role.' });
+          const role = resolveCustomerRole(interaction.guild);
+          if (!role) return interaction.editReply({ content: '❌ The customer role is not configured on this bot — set `CUSTOMER_ROLE_ID` to the role id.' });
 
-          await targetMember.roles.add(role).catch(() => {});
+          const failure = await grantCustomerRole(targetMember, role);
+          if (failure) {
+            return interaction.editReply({ content: `⚠️ Order \`${v.invoice_no || order_id}\` is verified, but I could not add the role: ${failure}` });
+          }
           const embed = new EmbedBuilder()
             .setColor(0x00ff88).setTitle('✅ Customer Verified')
             // Echo the canonical invoice number the backend matched, not the
             // string as typed — it confirms which order was actually claimed
             // when a customer supplies the old numeric id.
-            .setDescription(`<@${targetMember.id}> has been granted the **${roleName}** role for order \`${v.invoice_no || order_id}\`.`)
+            .setDescription(`<@${targetMember.id}> has been granted the <@&${role.id}> role for order \`${v.invoice_no || order_id}\`.`)
             .setTimestamp();
           return interaction.editReply({ embeds: [embed] });
         } catch (err) {
@@ -4277,12 +4341,13 @@ client.on('interactionCreate', async interaction => {
             return interaction.editReply({ content: `❌ Invoice \`${order_id}\` is **${v.status}** — only paid/delivered orders qualify.` });
           }
 
-          const roleName = process.env.CUSTOMER_ROLE_NAME || 'Customer';
-          let role = interaction.guild.roles.cache.find(r => r.name === roleName);
-          if (!role) role = await interaction.guild.roles.create({ name: roleName, color: 0x00ff88, reason: 'Customer role for verified purchases' }).catch(() => null);
-          if (!role) return interaction.editReply({ content: '❌ Could not find or create the Customer role.' });
+          const role = resolveCustomerRole(interaction.guild);
+          if (!role) return interaction.editReply({ content: '❌ The customer role is not configured on this bot — set `CUSTOMER_ROLE_ID` to the role id. Open a ticket and staff can grant it manually.' });
 
-          await interaction.member.roles.add(role).catch(() => {});
+          const failure = await grantCustomerRole(interaction.member, role);
+          if (failure) {
+            return interaction.editReply({ content: `⚠️ Invoice \`${v.invoice_no || order_id}\` is verified, but I could not add the role: ${failure}\nOpen a support ticket and staff can grant it manually.` });
+          }
           const embed = new EmbedBuilder()
             .setColor(0x00ff88)
             .setTitle('✅ Claim Successful')
