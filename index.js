@@ -2330,8 +2330,14 @@ client.on('interactionCreate', async interaction => {
       const focused = interaction.options.getFocused().toLowerCase();
       // Discord invalidates an autocomplete interaction after 3s; respond()
       // then rejects with 10062. Unawaited, that killed the process.
+      // Match on the displayed label, so typing a GAME narrows to that game's
+      // products — the product name alone is often not something an admin can
+      // search by ("Ancient", "PREDATOR", "FULL").
       return await interaction.respond(
-        getAllProducts().filter(p => p.name.toLowerCase().includes(focused)).slice(0, 25).map(p => ({ name: p.name, value: p.id }))
+        getAllProducts()
+          .filter(p => (p.label || p.name).toLowerCase().includes(focused))
+          .slice(0, 25)
+          .map(p => ({ name: (p.label || p.name).slice(0, 100), value: p.id }))
       );
     }
 
@@ -2548,11 +2554,17 @@ client.on('interactionCreate', async interaction => {
           return interaction.reply({ content: '❌ No downloads are configured yet.', flags: 64 });
         }
         const makeMenu = (id, placeholder, chunk) => new StringSelectMenuBuilder().setCustomId(id).setPlaceholder(placeholder)
-          .addOptions(chunk.map(p => ({ label: p.name.length > 100 ? p.name.slice(0,97)+'...' : p.name, value: p.id, description: p.url ? 'Download available' : 'Coming soon' })));
+          .addOptions(chunk.map(p => {
+            // "GAME - PRODUCT". The option VALUE stays the slug of the product
+            // name, so an existing panel keeps working and the link table keeps
+            // resolving; only what the customer reads changes.
+            const text = p.label || p.name;
+            return { label: text.length > 100 ? text.slice(0, 97) + '...' : text, value: p.id, description: p.url ? 'Download available' : 'Coming soon' };
+          }));
         await interaction.reply({
           content: '### Product Downloads\nSelect your product below:',
           components: chunks.map((chunk, i) => new ActionRowBuilder().addComponents(
-            makeMenu(`dl_page_${i + 1}`, `${chunk[0].name.charAt(0)}–${chunk[chunk.length - 1].name.charAt(0)}  (Page ${i + 1} of ${chunks.length})`, chunk)
+            makeMenu(`dl_page_${i + 1}`, `${(chunk[0].label || chunk[0].name).charAt(0)}–${(chunk[chunk.length - 1].label || chunk[chunk.length - 1].name).charAt(0)}  (Page ${i + 1} of ${chunks.length})`, chunk)
           )),
           flags: 64,
         });
@@ -2577,7 +2589,13 @@ client.on('interactionCreate', async interaction => {
         }
 
         const makeMenu = (id, placeholder, chunk) => new StringSelectMenuBuilder().setCustomId(id).setPlaceholder(placeholder)
-          .addOptions(chunk.map(p => ({ label: p.name.length > 100 ? p.name.slice(0,97)+'...' : p.name, value: p.id, description: p.url ? 'Download available' : 'Coming soon' })));
+          .addOptions(chunk.map(p => {
+            // "GAME - PRODUCT". The option VALUE stays the slug of the product
+            // name, so an existing panel keeps working and the link table keeps
+            // resolving; only what the customer reads changes.
+            const text = p.label || p.name;
+            return { label: text.length > 100 ? text.slice(0, 97) + '...' : text, value: p.id, description: p.url ? 'Download available' : 'Coming soon' };
+          }));
         const embed = new EmbedBuilder().setTitle('📦  PRODUCT DOWNLOADS').setColor(0x5865F2)
           .setDescription('> Select your product from the dropdown below and click **DOWNLOAD** to get your file.')
           .setFooter({ text: `${BOT_NAME} | ${SITE_URL}`, iconURL: client.user.displayAvatarURL() }).setTimestamp();
@@ -2589,7 +2607,7 @@ client.on('interactionCreate', async interaction => {
         await dlCh.send({
           embeds: [embed],
           components: chunks.map((chunk, i) => new ActionRowBuilder().addComponents(
-            makeMenu(`dl_page_${i + 1}`, `${chunk[0].name.charAt(0)}–${chunk[chunk.length - 1].name.charAt(0)}  (Page ${i + 1} of ${chunks.length})`, chunk)
+            makeMenu(`dl_page_${i + 1}`, `${(chunk[0].label || chunk[0].name).charAt(0)}–${(chunk[chunk.length - 1].label || chunk[chunk.length - 1].name).charAt(0)}  (Page ${i + 1} of ${chunks.length})`, chunk)
           )),
         });
         await interaction.editReply({ content: `✅ Download panel posted in <#${dlCh.id}> — ${chunks.reduce((n, c) => n + c.length, 0)} products across ${chunks.length} page(s).` });
@@ -2618,8 +2636,11 @@ client.on('interactionCreate', async interaction => {
         }
         await interaction.editReply({
           content: url
-            ? `✅ Download link updated for **${product.name}**\n🔗 ${url}\n_Live on the website's Downloads Manager too._`
-            : `✅ Download link cleared for **${product.name}** — it now shows as coming soon on both the site and here.`,
+            // Echo the label AND the key it was saved under: the label is how
+            // the admin found it, the name is what the website will look it up
+            // by, and they are not the same string.
+            ? `✅ Download link updated for **${product.label || product.name}**\n🔗 ${url}\n_Saved as \`${product.name}\` — live on the website's Downloads Manager too._`
+            : `✅ Download link cleared for **${product.label || product.name}** — it now shows as coming soon on both the site and here.`,
         });
         return;
       }
@@ -4092,7 +4113,7 @@ client.on('interactionCreate', async interaction => {
             flags: 64,
           });
         }
-        const embed = new EmbedBuilder().setTitle(`📦  ${product.name}`).setColor(0x57F287)
+        const embed = new EmbedBuilder().setTitle(`📦  ${product.label || product.name}`).setColor(0x57F287)
           .setFooter({ text: `${BOT_NAME} | ${SITE_URL}`, iconURL: client.user.displayAvatarURL() }).setTimestamp();
         if (product.url) {
           embed.setDescription('Your download is ready! Click the button below.');

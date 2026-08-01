@@ -76,7 +76,49 @@ function slugify(name) {
   return (s || 'product').slice(0, 90);
 }
 
-// id → { id, name, url, version, updated, instructions, vault }
+// What the dropdown SHOWS, which is not what the table is keyed by.
+//
+// The panel listed the product name alone, and a product name on its own is
+// often unidentifiable: the catalog has an "Ancient" (Arc Raiders), an
+// "ARCANE" (Arc Raiders), a "PREDATOR" (Marvel Rivals) and an "ACCOUNT
+// RECOVERY" (Services), and nothing in the dropdown said which game any of
+// them was for.
+//
+// The game cannot simply be folded into `name`, though: the backend link table
+// is keyed by the catalog product NAME, and the website resolves an
+// entitlement by matching that same name against the order's items snapshot
+// (backend routes/downloads.js). Rename the key and the one link that is
+// already saved — "H8ED Private External" — stops resolving. So the game rides
+// along as a separate display field.
+function displayLabel(name, game) {
+  const n = String(name || '').trim();
+  const g = String(game || '').trim();
+  // No game to prefix with: the legacy floor already reads "GAME - PRODUCT",
+  // and prefixing it again would give "Arc Raiders - ARC RAIDERS - ANCIENT".
+  if (!g) return n;
+
+  // Half the catalog already says the game inside the product name, at one end
+  // or the other — "APEX LEGENDS: FULL", "VALORANT COLORBOT", "ARCANE: ACTIVE
+  // MATTER". Prefixing those verbatim reads as a stutter, so the repeat comes
+  // off first and every row ends up in the same shape.
+  //
+  // Only a WHOLE-title match is stripped: "ARENA BREAKOUT: FULL" under the game
+  // "Arena Breakout Infinite" keeps its name, because "Arena Breakout" is a
+  // different product line and chopping a partial title would rewrite meaning
+  // rather than remove a repeat.
+  const esc = g.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const SEP = '[\\s:\u2013\u2014-]+';
+  let bare = n
+    .replace(new RegExp(`^${esc}${SEP}`, 'i'), '')
+    .replace(new RegExp(`${SEP}${esc}$`, 'i'), '')
+    .trim();
+  // A name that was nothing but the game title leaves the game standing alone
+  // rather than "Rust - Rust".
+  if (!bare) return g;
+  return `${g} - ${bare}`;
+}
+
+// id → { id, name, label, game, url, version, updated, instructions, vault }
 let byId = new Map();
 let byName = new Map();
 let lastRefresh = 0;
@@ -88,6 +130,10 @@ function put(name, extra = {}) {
   const id = slugify(clean);
   const existing = byId.get(id) || { id, name: clean, url: '', vault: false };
   const merged = { ...existing, ...extra, id, name: extra.name || existing.name || clean };
+  // The link table carries no game — it is keyed by product name only — so an
+  // entry arriving from there must not blank the game the catalog supplied.
+  merged.game = extra.game || existing.game || '';
+  merged.label = displayLabel(merged.name, merged.game);
   byId.set(id, merged);
   byName.set(merged.name.toUpperCase(), merged);
 }
@@ -145,11 +191,22 @@ async function fetchFromBackend() {
   try {
     // /api/products is a FLAT LIST OF TIERS, so the same product appears once
     // per price. put() is idempotent on the name, which collapses them.
+    //
+    // `category` is the game title on this API — there is no game_name field,
+    // whatever the DB column is called.
     for (const row of catalog) {
       const name = row && (row.product_name || row.name);
-      if (name) put(name, { vault: false });
+      if (name) put(name, { vault: false, game: (row.category || row.game_name || '').trim() });
     }
-    for (const name of LEGACY_PRODUCTS) put(name);
+    // The floor applies ONLY when the catalog could not be read. Once it can,
+    // the legacy names are duplicates of catalog products under a different
+    // spelling — "ARC RAIDERS - ANCIENT" beside the catalog's "Ancient" — and
+    // they are duplicates that cannot work: a link saved against a legacy name
+    // is not a key the website's entitlement check will ever match, so it
+    // would show a download in Discord that the site refuses to serve. 60 of
+    // them beside 74 real products also overflowed the 125-slot panel, which
+    // is where the "9 products do not fit" warning came from.
+    if (!catalog.length) for (const name of LEGACY_PRODUCTS) put(name);
     for (const d of (links.data && links.data.downloads) || []) {
       put(d.name, {
         url: d.link || '',
@@ -190,9 +247,14 @@ function refresh(force = false) {
 for (const name of LEGACY_PRODUCTS) put(name);
 loadCache();
 
+// Sorted by what the dropdown shows, so the alphabetical order the customer
+// reads is the order they were promised — sorting by `name` while displaying
+// `label` would look shuffled.
 function getAllProducts() {
   refresh();
-  return [...byId.values()].sort((a, b) => a.name.localeCompare(b.name));
+  return [...byId.values()].sort((a, b) =>
+    (a.label || a.name).localeCompare(b.label || b.name, 'en', { sensitivity: 'base' })
+  );
 }
 
 function getProduct(id) {
