@@ -35,6 +35,13 @@ const REFRESH_MS  = Number(process.env.DOWNLOADS_REFRESH_MS) || 5 * 60 * 1000;
 // before the catalog became the source, and dropping them would blank the
 // dropdown for anyone whose backend is unreachable at boot. Anything the
 // catalog also names wins on casing and spelling.
+//
+// The three HWID entries said "WOOFER" — the same typo the store carried until
+// the catalog was corrected. Renaming them changes their slug, which is
+// normally the one thing not to do here (see slugify below): a link is stored
+// against the name, so a changed id orphans it. It was safe in this case only
+// because the link table had no rows at all, so there was nothing to orphan.
+// Check that before touching any other name in this list.
 const LEGACY_PRODUCTS = [
   'ARC RAIDERS - ANCIENT', 'ARC RAIDERS - ARCANE', "ARC RAIDERS - HEAVEN'S BLINDSPOT",
   'ARC RAIDERS - FULL', 'APEX LEGENDS - ANCIENT', 'APEX LEGENDS - ARCANE',
@@ -54,8 +61,8 @@ const LEGACY_PRODUCTS = [
   'MARVEL RIVALS - PREDATOR', 'MARVEL RIVALS - ARCANE', 'OFF THE GRID - ARCANE',
   'PUBG - FULL', 'RUST - MEK EXTERNAL', 'RUST - DIVISION EXTERNAL', 'RUST - COFFEE RUST',
   'SCUM - ARCANE', 'SEA OF THIEVES - ARCANE', 'SQUAD - ARCANE', 'VALORANT - COLORBOT',
-  'VALORANT - VIP', 'WAR THUNDER - ARCANE', 'HWID WOOFER - EXODUS TEMP',
-  'HWID WOOFER - VERSE PERM', 'HWID WOOFER - RANKED TPM TEMP',
+  'VALORANT - VIP', 'WAR THUNDER - ARCANE', 'HWID SPOOFER - EXODUS TEMP',
+  'HWID SPOOFER - VERSE PERM', 'HWID SPOOFER - RANKED TPM TEMP',
 ];
 
 // A select-menu option value is capped at 100 characters and must be stable
