@@ -41,7 +41,8 @@ const db     = require('./db');
 const antiscam   = require('./modules/antiscam');
 const support    = require('./modules/support');
 const { startAuthServer, handle2FAInteraction } = require('./modules/auth2fa');
-const { getAllProducts, getProduct, setProductUrl, getProductChunks, getProductByName } = require('./modules/downloads');
+const { getAllProducts, getProduct, setProductUrl, getProductChunks, getProductByName, refresh: dlRefresh } = require('./modules/downloads');
+const { handleWebTicketButton, handleWebTicketModal } = require('./modules/webTickets');
 const { commands: smsCommands, handleSMSInteraction, setSMSAccessGate } = require('./modules/sms-gen');
 
 // ─── ENV Config ───────────────────────────────────────────────────────────────
@@ -2214,15 +2215,20 @@ client.on('interactionCreate', async interaction => {
       // ── /downloads ────────────────────────────────────────────────────────
       if (cmd === 'downloads') {
         const chunks = getProductChunks();
+        // `chunks[2] || []` built an EMPTY select menu whenever there were
+        // fewer than 51 products, and Discord rejects a menu with no options —
+        // the whole reply fails, not just that row. Build only the rows that
+        // have something in them.
+        if (!chunks.length) {
+          return interaction.reply({ content: '❌ No downloads are configured yet.', flags: 64 });
+        }
         const makeMenu = (id, placeholder, chunk) => new StringSelectMenuBuilder().setCustomId(id).setPlaceholder(placeholder)
           .addOptions(chunk.map(p => ({ label: p.name.length > 100 ? p.name.slice(0,97)+'...' : p.name, value: p.id, description: p.url ? 'Download available' : 'Coming soon' })));
         await interaction.reply({
           content: '### Product Downloads\nSelect your product below:',
-          components: [
-            new ActionRowBuilder().addComponents(makeMenu('dl_page_1', 'Products A-F  (Page 1 of 3)', chunks[0] || [])),
-            new ActionRowBuilder().addComponents(makeMenu('dl_page_2', 'Products G-R  (Page 2 of 3)', chunks[1] || [])),
-            new ActionRowBuilder().addComponents(makeMenu('dl_page_3', 'Products S-Z + HWID  (Page 3 of 3)', chunks[2] || [])),
-          ],
+          components: chunks.map((chunk, i) => new ActionRowBuilder().addComponents(
+            makeMenu(`dl_page_${i + 1}`, `${chunk[0].name.charAt(0)}–${chunk[chunk.length - 1].name.charAt(0)}  (Page ${i + 1} of ${chunks.length})`, chunk)
+          )),
           flags: 64,
         });
         autoDelete(interaction, 120000);
@@ -2232,33 +2238,64 @@ client.on('interactionCreate', async interaction => {
       // ── /setupdownloads ───────────────────────────────────────────────────
       if (cmd === 'setupdownloads') {
         if (!hasAccess(interaction)) return interaction.reply({ content: '❌ No permission.', flags: 64 });
+        await interaction.deferReply({ flags: 64 });
         const dlCh = findChannelByName(interaction.guild, 'downloads') || interaction.channel;
+
+        // Force a refresh before posting. The panel message stays in the
+        // channel indefinitely, so whatever it is built from here is what
+        // customers see until someone runs this again — posting a stale list
+        // is not something they can work around.
+        await dlRefresh(true);
         const chunks = getProductChunks();
+        if (!chunks.length) {
+          return interaction.editReply({ content: '❌ No products to list — the backend returned an empty catalog and there is no cached table.' });
+        }
+
         const makeMenu = (id, placeholder, chunk) => new StringSelectMenuBuilder().setCustomId(id).setPlaceholder(placeholder)
           .addOptions(chunk.map(p => ({ label: p.name.length > 100 ? p.name.slice(0,97)+'...' : p.name, value: p.id, description: p.url ? 'Download available' : 'Coming soon' })));
         const embed = new EmbedBuilder().setTitle('📦  PRODUCT DOWNLOADS').setColor(0x5865F2)
           .setDescription('> Select your product from the dropdown below and click **DOWNLOAD** to get your file.')
           .setFooter({ text: `${BOT_NAME} | ${SITE_URL}`, iconURL: client.user.displayAvatarURL() }).setTimestamp();
-        await dlCh.send({ embeds: [embed], components: [
-          new ActionRowBuilder().addComponents(makeMenu('dl_page_1', 'Products A-F  (Page 1 of 3)', chunks[0] || [])),
-          new ActionRowBuilder().addComponents(makeMenu('dl_page_2', 'Products G-R  (Page 2 of 3)', chunks[1] || [])),
-          new ActionRowBuilder().addComponents(makeMenu('dl_page_3', 'Products S-Z + HWID  (Page 3 of 3)', chunks[2] || [])),
-        ]});
-        await interaction.reply({ content: `✅ Download panel posted in <#${dlCh.id}>`, flags: 64 }); autoDelete(interaction, 5000);
+
+        // One row per page, built from however many pages there actually are.
+        // This was three hardcoded rows labelled "Page n of 3", so a fourth
+        // page of products was dropped without a word and the labels lied as
+        // soon as the catalog stopped being 62 items.
+        await dlCh.send({
+          embeds: [embed],
+          components: chunks.map((chunk, i) => new ActionRowBuilder().addComponents(
+            makeMenu(`dl_page_${i + 1}`, `${chunk[0].name.charAt(0)}–${chunk[chunk.length - 1].name.charAt(0)}  (Page ${i + 1} of ${chunks.length})`, chunk)
+          )),
+        });
+        await interaction.editReply({ content: `✅ Download panel posted in <#${dlCh.id}> — ${chunks.reduce((n, c) => n + c.length, 0)} products across ${chunks.length} page(s).` });
         return;
       }
 
       // ── /setdownload ──────────────────────────────────────────────────────
       if (cmd === 'setdownload') {
         if (!hasAccess(interaction)) return interaction.reply({ content: '❌ No permission.', flags: 64 });
+        await interaction.deferReply({ flags: 64 });
         const productId = interaction.options.getString('product');
         let url = interaction.options.getString('url').trim();
         if (url && !url.startsWith('http')) url = 'https://' + url;
         const product = getProduct(productId);
-        if (!product) return interaction.reply({ content: '❌ Product not found.', flags: 64 });
-        setProductUrl(productId, url);
-        await interaction.reply({ content: `✅ Download link updated for **${product.name}**\n🔗 ${url}`, flags: 64 });
-        autoDelete(interaction, 8000);
+        if (!product) return interaction.editReply({ content: '❌ Product not found.' });
+
+        // The write goes to the backend now, so it can fail — and if it does,
+        // saying "updated" would be a lie that only surfaces when a customer
+        // clicks a dead button. The old version wrote a local file that
+        // Railway deleted on the next deploy and always reported success.
+        try {
+          await setProductUrl(productId, url);
+        } catch (err) {
+          const msg = (err.response && err.response.data && err.response.data.error) || err.message;
+          return interaction.editReply({ content: `❌ Could not save the link: ${msg}\nNothing was changed — the website and the bot are still in sync.` });
+        }
+        await interaction.editReply({
+          content: url
+            ? `✅ Download link updated for **${product.name}**\n🔗 ${url}\n_Live on the website's Downloads Manager too._`
+            : `✅ Download link cleared for **${product.name}** — it now shows as coming soon on both the site and here.`,
+        });
         return;
       }
 
@@ -3709,9 +3746,20 @@ client.on('interactionCreate', async interaction => {
       }
 
       // Download page select
-      if (['dl_page_1','dl_page_2','dl_page_3'].includes(interaction.customId)) {
+      // The panel can now be up to 5 pages, and a panel posted before that
+      // change is still sitting in #downloads with the old three.
+      if (/^dl_page_[1-5]$/.test(interaction.customId)) {
         const product = getProduct(interaction.values[0]);
-        if (!product) return interaction.reply({ content: '❌ Product not found.', flags: 64 });
+        if (!product) {
+          // Product ids are slugs of the product NAME now, not the old
+          // hand-written ids, so an option in a panel message posted before
+          // this change no longer resolves. Say what to do about it instead of
+          // a bare "not found" that reads like the product was deleted.
+          return interaction.reply({
+            content: '❌ This download panel is out of date — ask an admin to run `/setupdownloads` again.',
+            flags: 64,
+          });
+        }
         const embed = new EmbedBuilder().setTitle(`📦  ${product.name}`).setColor(0x57F287)
           .setFooter({ text: `${BOT_NAME} | ${SITE_URL}`, iconURL: client.user.displayAvatarURL() }).setTimestamp();
         if (product.url) {
@@ -3730,6 +3778,13 @@ client.on('interactionCreate', async interaction => {
     // ── Buttons ───────────────────────────────────────────────────────────────
     if (interaction.isButton()) {
       const { customId, guild, member } = interaction;
+
+      // Website-ticket buttons first: they are posted into the ticket log
+      // channel by modules/webTickets.js and are answered before
+      // getGuildSettings, which hits the DB on every button press and is not
+      // needed for them.
+      if (await handleWebTicketButton(interaction)) return;
+
       const btnSettings = await getGuildSettings(guild.id);
 
       // Steam stock panel — one of the fixed type buttons (Steam / Steam Phone
@@ -3917,6 +3972,9 @@ client.on('interactionCreate', async interaction => {
 
     // ── Modal submits ─────────────────────────────────────────────────────────
     if (interaction.isModalSubmit()) {
+      // Reply-to-website-ticket modal (modules/webTickets.js)
+      if (await handleWebTicketModal(interaction)) return;
+
       // Redeem panel modal
       if (interaction.customId === 'redeem_modal') {
         const keyInput = interaction.fields.getTextInputValue('redeem_key_input');

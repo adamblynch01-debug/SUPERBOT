@@ -1,106 +1,243 @@
 // ─── Product Download Store ───────────────────────────────────────────────────
-const fs   = require('fs');
-const path = require('path');
+'use strict';
+//
+// This used to be a hardcoded list of 62 products plus a download_urls.json
+// file written next to the code. Two things were wrong with that.
+//
+//   1. The website had its OWN link table (app_state 'ghostDownloads', written
+//      by the admin panel's Downloads Manager). A link updated on the site
+//      never reached /downloads here, and /setdownload never reached the site —
+//      same product, two answers, no way to tell which was current.
+//   2. download_urls.json lives on the container filesystem. Railway replaces
+//      that on every deploy, so unless DATA_DIR points at a mounted volume,
+//      every link ever set with /setdownload was silently lost at the next
+//      push. Nobody would notice until a customer asked why the button was
+//      dead.
+//
+// The backend's table is the single source of truth now. The product list is
+// the live catalog (so a product added to the store appears in the Discord
+// dropdown with no code change), and the JSON file is demoted to a local cache
+// so a backend outage degrades the panel to "last known links" instead of
+// breaking it.
+
+const fs    = require('fs');
+const path  = require('path');
+const axios = require('axios');
 
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..');
 if (DATA_DIR !== path.join(__dirname, '..') && !fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-const SAVE_FILE = path.join(DATA_DIR, 'download_urls.json');
+const CACHE_FILE = path.join(DATA_DIR, 'download_urls.json');
 
-const products = [
-  { id: 'arc_raiders_ancient',           name: 'ARC RAIDERS - ANCIENT',                    url: '' },
-  { id: 'arc_raiders_arcane',            name: 'ARC RAIDERS - ARCANE',                     url: '' },
-  { id: 'arc_raiders_heavens_blindspot', name: "ARC RAIDERS - HEAVEN'S BLINDSPOT",          url: '' },
-  { id: 'arc_raiders_full',              name: 'ARC RAIDERS - FULL',                        url: '' },
-  { id: 'apex_ancient',                  name: 'APEX LEGENDS - ANCIENT',                    url: '' },
-  { id: 'apex_arcane',                   name: 'APEX LEGENDS - ARCANE',                     url: '' },
-  { id: 'apex_full',                     name: 'APEX LEGENDS - FULL',                       url: '' },
-  { id: 'apex_exodus',                   name: 'APEX LEGENDS - EXODUS',                     url: '' },
-  { id: 'ark_arcane',                    name: 'ARK ASCENDED - ARCANE',                     url: '' },
-  { id: 'active_matter_arcane',          name: 'ACTIVE MATTER - ARCANE',                    url: '' },
-  { id: 'arena_breakout_full',           name: 'ARENA BREAKOUT INFINITE - FULL',            url: '' },
-  { id: 'battlefield_ancient',           name: 'BATTLEFIELD - ANCIENT',                     url: '' },
-  { id: 'battlefield_arcane',            name: 'BATTLEFIELD - ARCANE',                      url: '' },
-  { id: 'cod_blitz',                     name: 'CALL OF DUTY - BLITZ EXTERNAL',             url: '' },
-  { id: 'cod_zenith_v3',                 name: 'CALL OF DUTY - ZENITH V3 (BO7)',            url: '' },
-  { id: 'cod_zenith_bo6',                name: 'CALL OF DUTY - ZENITH BO6 INTERNAL',        url: '' },
-  { id: 'cod_ghost_mw3',                 name: 'CALL OF DUTY - GHOST INTERNAL MW3',         url: '' },
-  { id: 'cod_ghost_mw19',                name: 'CALL OF DUTY - GHOST INTERNAL MW19',        url: '' },
-  { id: 'cod_h8ed',                      name: 'CALL OF DUTY - H8ED.EXE',                   url: '' },
-  { id: 'cs2_predator',                  name: 'CS2 / CSGO - PREDATOR',                     url: '' },
-  { id: 'dark_darker_arcane',            name: 'DARK & DARKER - ARCANE',                    url: '' },
-  { id: 'dayz_external',                 name: 'DAYZ - EXTERNAL',                           url: '' },
-  { id: 'dayz_chevron',                  name: 'DAYZ - CHEVRON',                            url: '' },
-  { id: 'dbd_arcane',                    name: 'DEAD BY DAYLIGHT - ARCANE',                 url: '' },
-  { id: 'deadside_arcane',               name: 'DEADSIDE - ARCANE',                         url: '' },
-  { id: 'delta_force_full',              name: 'DELTA FORCE - FULL',                        url: '' },
-  { id: 'delta_force_exodus',            name: 'DELTA FORCE - EXODUS EXTERNAL',             url: '' },
-  { id: 'dune_arcane',                   name: 'DUNE AWAKENING - ARCANE',                   url: '' },
-  { id: 'tarkov_ancient_chams',          name: 'ESCAPE FROM TARKOV - ANCIENT CHAMS',        url: '' },
-  { id: 'tarkov_coffee',                 name: 'ESCAPE FROM TARKOV - COFFEE CHEAT',         url: '' },
-  { id: 'tarkov_coffee_chams',           name: 'ESCAPE FROM TARKOV - COFFEE CHAMS',         url: '' },
-  { id: 'farlight_arcane',               name: 'FARLIGHT 84 - ARCANE',                      url: '' },
-  { id: 'fortnite_ancient',              name: 'FORTNITE - ANCIENT EXTERNAL',               url: '' },
-  { id: 'fortnite_full',                 name: 'FORTNITE - FULL',                           url: '' },
-  { id: 'fortnite_exodus',               name: 'FORTNITE - EXODUS EXTERNAL',                url: '' },
-  { id: 'fortnite_venom',                name: 'FORTNITE - VENOM EXTERNAL',                 url: '' },
-  { id: 'fortnite_ultimate',             name: 'FORTNITE - ULTIMATE EXTERNAL',              url: '' },
-  { id: 'fortnite_arcane',               name: 'FORTNITE - ARCANE',                         url: '' },
-  { id: 'grayzone_arcane',               name: 'GRAY ZONE WARFARE - ARCANE',                url: '' },
-  { id: 'gta_arcane_gtav',               name: 'GTA - ARCANE V (GTAV)',                     url: '' },
-  { id: 'gta_arcane_fivem',              name: 'GTA - ARCANE V (FIVEM)',                    url: '' },
-  { id: 'hll_arcane',                    name: 'HELL LET LOOSE - ARCANE',                   url: '' },
-  { id: 'hunt_arcane',                   name: 'HUNT SHOWDOWN - ARCANE',                    url: '' },
-  { id: 'marvel_predator',               name: 'MARVEL RIVALS - PREDATOR',                  url: '' },
-  { id: 'marvel_arcane',                 name: 'MARVEL RIVALS - ARCANE',                    url: '' },
-  { id: 'otg_arcane',                    name: 'OFF THE GRID - ARCANE',                     url: '' },
-  { id: 'pubg_full',                     name: 'PUBG - FULL',                               url: '' },
-  { id: 'rust_mek',                      name: 'RUST - MEK EXTERNAL',                       url: '' },
-  { id: 'rust_division',                 name: 'RUST - DIVISION EXTERNAL',                  url: '' },
-  { id: 'rust_coffee',                   name: 'RUST - COFFEE RUST',                        url: '' },
-  { id: 'scum_arcane',                   name: 'SCUM - ARCANE',                             url: '' },
-  { id: 'sot_arcane',                    name: 'SEA OF THIEVES - ARCANE',                   url: '' },
-  { id: 'squad_arcane',                  name: 'SQUAD - ARCANE',                            url: '' },
-  { id: 'valorant_colorbot',             name: 'VALORANT - COLORBOT',                       url: '' },
-  { id: 'valorant_vip',                  name: 'VALORANT - VIP',                            url: '' },
-  { id: 'war_thunder_arcane',            name: 'WAR THUNDER - ARCANE',                      url: '' },
-  { id: 'hwid_exodus_temp',              name: 'HWID WOOFER - EXODUS TEMP',                 url: '' },
-  { id: 'hwid_verse_perm',               name: 'HWID WOOFER - VERSE PERM',                  url: '' },
-  { id: 'ranked_tpm_woofer',             name: 'HWID WOOFER - RANKED TPM TEMP',             url: '' },
+const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:3000';
+const REFRESH_MS  = Number(process.env.DOWNLOADS_REFRESH_MS) || 5 * 60 * 1000;
+
+// Kept as a floor, not as the list. These are the products the panel offered
+// before the catalog became the source, and dropping them would blank the
+// dropdown for anyone whose backend is unreachable at boot. Anything the
+// catalog also names wins on casing and spelling.
+const LEGACY_PRODUCTS = [
+  'ARC RAIDERS - ANCIENT', 'ARC RAIDERS - ARCANE', "ARC RAIDERS - HEAVEN'S BLINDSPOT",
+  'ARC RAIDERS - FULL', 'APEX LEGENDS - ANCIENT', 'APEX LEGENDS - ARCANE',
+  'APEX LEGENDS - FULL', 'APEX LEGENDS - EXODUS', 'ARK ASCENDED - ARCANE',
+  'ACTIVE MATTER - ARCANE', 'ARENA BREAKOUT INFINITE - FULL', 'BATTLEFIELD - ANCIENT',
+  'BATTLEFIELD - ARCANE', 'CALL OF DUTY - BLITZ EXTERNAL', 'CALL OF DUTY - ZENITH V3 (BO7)',
+  'CALL OF DUTY - ZENITH BO6 INTERNAL', 'CALL OF DUTY - GHOST INTERNAL MW3',
+  'CALL OF DUTY - GHOST INTERNAL MW19', 'CALL OF DUTY - H8ED.EXE', 'CS2 / CSGO - PREDATOR',
+  'DARK & DARKER - ARCANE', 'DAYZ - EXTERNAL', 'DAYZ - CHEVRON', 'DEAD BY DAYLIGHT - ARCANE',
+  'DEADSIDE - ARCANE', 'DELTA FORCE - FULL', 'DELTA FORCE - EXODUS EXTERNAL',
+  'DUNE AWAKENING - ARCANE', 'ESCAPE FROM TARKOV - ANCIENT CHAMS',
+  'ESCAPE FROM TARKOV - COFFEE CHEAT', 'ESCAPE FROM TARKOV - COFFEE CHAMS',
+  'FARLIGHT 84 - ARCANE', 'FORTNITE - ANCIENT EXTERNAL', 'FORTNITE - FULL',
+  'FORTNITE - EXODUS EXTERNAL', 'FORTNITE - VENOM EXTERNAL', 'FORTNITE - ULTIMATE EXTERNAL',
+  'FORTNITE - ARCANE', 'GRAY ZONE WARFARE - ARCANE', 'GTA - ARCANE V (GTAV)',
+  'GTA - ARCANE V (FIVEM)', 'HELL LET LOOSE - ARCANE', 'HUNT SHOWDOWN - ARCANE',
+  'MARVEL RIVALS - PREDATOR', 'MARVEL RIVALS - ARCANE', 'OFF THE GRID - ARCANE',
+  'PUBG - FULL', 'RUST - MEK EXTERNAL', 'RUST - DIVISION EXTERNAL', 'RUST - COFFEE RUST',
+  'SCUM - ARCANE', 'SEA OF THIEVES - ARCANE', 'SQUAD - ARCANE', 'VALORANT - COLORBOT',
+  'VALORANT - VIP', 'WAR THUNDER - ARCANE', 'HWID WOOFER - EXODUS TEMP',
+  'HWID WOOFER - VERSE PERM', 'HWID WOOFER - RANKED TPM TEMP',
 ];
 
-let urlOverrides = {};
-try {
-  if (fs.existsSync(SAVE_FILE)) {
-    urlOverrides = JSON.parse(fs.readFileSync(SAVE_FILE, 'utf8'));
-    console.log(`✅ Loaded ${Object.keys(urlOverrides).length} saved download URLs`);
-  }
-} catch (err) {
-  console.error('Failed to load download_urls.json:', err.message);
+// A select-menu option value is capped at 100 characters and must be stable
+// across restarts — the panel message stays in #downloads between deploys, so
+// an id that changed shape would make every existing dropdown dead. Slugging
+// the name gives both, and the name is the key in the backend table too, so
+// one row per name means one id per row.
+function slugify(name) {
+  const s = String(name || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+  return (s || 'product').slice(0, 90);
 }
 
-function saveUrls() {
-  try { fs.writeFileSync(SAVE_FILE, JSON.stringify(urlOverrides, null, 2), 'utf8'); } catch (e) {}
+// id → { id, name, url, version, updated, instructions, vault }
+let byId = new Map();
+let byName = new Map();
+let lastRefresh = 0;
+let refreshing = null;
+
+function put(name, extra = {}) {
+  const clean = String(name || '').trim();
+  if (!clean) return;
+  const id = slugify(clean);
+  const existing = byId.get(id) || { id, name: clean, url: '', vault: false };
+  const merged = { ...existing, ...extra, id, name: extra.name || existing.name || clean };
+  byId.set(id, merged);
+  byName.set(merged.name.toUpperCase(), merged);
+}
+
+// The cache is the LAST KNOWN table, not an override of it — the backend wins
+// on every successful refresh. Writing it back on each refresh is what lets a
+// cold start with a dead backend still show real links.
+function loadCache() {
+  try {
+    if (!fs.existsSync(CACHE_FILE)) return;
+    const raw = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
+    // Tolerate the OLD file shape (id → url string) so an upgrade does not
+    // throw away links that were set before this change.
+    for (const [k, v] of Object.entries(raw || {})) {
+      if (typeof v === 'string') put(k.replace(/_/g, ' ').toUpperCase(), { url: v });
+      else if (v && typeof v === 'object') put(v.name || k, v);
+    }
+    console.log(`✅ Loaded ${byId.size} cached download entries`);
+  } catch (err) {
+    console.error('Failed to load download cache:', err.message);
+  }
+}
+
+function saveCache() {
+  try {
+    const out = {};
+    for (const p of byId.values()) out[p.id] = p;
+    fs.writeFileSync(CACHE_FILE, JSON.stringify(out, null, 2), 'utf8');
+  } catch (_) { /* the cache is an optimisation; losing it costs one refresh */ }
+}
+
+async function fetchFromBackend() {
+  const secret = process.env.API_SECRET;
+  if (!secret) throw new Error('API_SECRET is not set on the bot');
+
+  // The link table first — it is the authoritative answer for URLs.
+  const links = await axios.get(`${BACKEND_URL}/api/downloads/bot/all`, {
+    params: { secret }, timeout: 10000,
+  });
+
+  // …then the catalog, so a product that exists in the store but has no link
+  // yet still appears in the dropdown as "Coming soon" rather than being
+  // invisible until someone remembers to add it here.
+  let catalog = [];
+  try {
+    const res = await axios.get(`${BACKEND_URL}/api/products`, { timeout: 10000 });
+    catalog = Array.isArray(res.data) ? res.data : (res.data && res.data.products) || [];
+  } catch (err) {
+    console.warn('[Downloads] catalog unavailable, using the link table only:', err.message);
+  }
+
+  const prevById = byId, prevByName = byName;
+  byId = new Map(); byName = new Map();
+
+  try {
+    // /api/products is a FLAT LIST OF TIERS, so the same product appears once
+    // per price. put() is idempotent on the name, which collapses them.
+    for (const row of catalog) {
+      const name = row && (row.product_name || row.name);
+      if (name) put(name, { vault: false });
+    }
+    for (const name of LEGACY_PRODUCTS) put(name);
+    for (const d of (links.data && links.data.downloads) || []) {
+      put(d.name, {
+        url: d.link || '',
+        version: d.version || null,
+        updated: d.updated || null,
+        instructions: d.instructions || null,
+        vault: !!d.vault,
+      });
+    }
+    lastRefresh = Date.now();
+    saveCache();
+  } catch (err) {
+    // Never leave the maps half-built — a partially applied refresh reads as
+    // "half the products vanished".
+    byId = prevById; byName = prevByName;
+    throw err;
+  }
+}
+
+// Callers are interaction handlers on a 3-second Discord deadline, so this is
+// never awaited on the hot path: it refreshes in the background and the
+// dropdown shows the previous table until it lands. Concurrent calls share one
+// in-flight request.
+function refresh(force = false) {
+  if (!force && Date.now() - lastRefresh < REFRESH_MS) return refreshing || Promise.resolve();
+  if (refreshing) return refreshing;
+  refreshing = fetchFromBackend()
+    .catch(err => { console.error('[Downloads] refresh failed:', err.message); })
+    .finally(() => { refreshing = null; });
+  return refreshing;
+}
+
+// Seed the floor BEFORE the cache, and before the first refresh has had a
+// chance to land. Without this a cold start with no cache file and an
+// unreachable backend leaves the panel with zero options — and an empty
+// dropdown is not a valid Discord component, so /setupdownloads would throw
+// rather than degrade.
+for (const name of LEGACY_PRODUCTS) put(name);
+loadCache();
+
+function getAllProducts() {
+  refresh();
+  return [...byId.values()].sort((a, b) => a.name.localeCompare(b.name));
 }
 
 function getProduct(id) {
-  const p = products.find(p => p.id === id);
-  return p ? { ...p, url: urlOverrides[id] ?? p.url } : null;
+  refresh();
+  return byId.get(String(id)) || null;
 }
-function getAllProducts() {
-  return products.map(p => ({ ...p, url: urlOverrides[p.id] ?? p.url }));
-}
-function setProductUrl(id, url) {
-  urlOverrides[id] = url;
-  saveUrls();
-}
+
 function getProductByName(name) {
-  return products.find(p => p.name === name.toUpperCase().trim());
+  refresh();
+  return byName.get(String(name || '').toUpperCase().trim()) || null;
 }
+
+// Writes THROUGH to the backend, so the site and the bot cannot disagree and
+// the link survives the next deploy. Throws on failure — the caller must say
+// so rather than reporting a save that did not happen, which is how the old
+// file-only write looked successful right up until the container was replaced.
+async function setProductUrl(id, url) {
+  const product = byId.get(String(id));
+  const name = product ? product.name : String(id);
+  if (!process.env.API_SECRET) throw new Error('API_SECRET is not set on the bot — cannot save the link');
+
+  const res = await axios.post(`${BACKEND_URL}/api/downloads/bot/set`, {
+    secret: process.env.API_SECRET, name, link: url, vault: !!(product && product.vault),
+  }, { timeout: 10000 });
+
+  const entry = (res.data && res.data.entry) || {};
+  put(name, {
+    url: entry.link != null ? entry.link : url,
+    version: entry.version || (product && product.version) || null,
+    updated: entry.updated || null,
+    instructions: entry.instructions || (product && product.instructions) || null,
+  });
+  saveCache();
+  return byId.get(slugify(name));
+}
+
+// Discord allows 5 action rows per message and 25 options per select, so the
+// panel can carry 125 products. The old code hardcoded exactly 3 pages, which
+// silently dropped everything past the 75th the moment the catalog grew.
+const MAX_PAGES = 5;
+
 function getProductChunks() {
   const all = getAllProducts();
   const chunks = [];
-  for (let i = 0; i < all.length; i += 25) chunks.push(all.slice(i, i + 25));
+  for (let i = 0; i < all.length && chunks.length < MAX_PAGES; i += 25) chunks.push(all.slice(i, i + 25));
+  const dropped = all.length - chunks.reduce((n, c) => n + c.length, 0);
+  if (dropped > 0) {
+    console.warn(`[Downloads] ${dropped} products do not fit the ${MAX_PAGES}-page panel and are not listed`);
+  }
   return chunks;
 }
 
-module.exports = { getAllProducts, getProduct, setProductUrl, getProductByName, getProductChunks };
+module.exports = {
+  getAllProducts, getProduct, setProductUrl, getProductByName, getProductChunks,
+  refresh, slugify,
+};

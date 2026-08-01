@@ -21,6 +21,7 @@
 const crypto = require('crypto');
 const { EmbedBuilder } = require('discord.js');
 const { query } = require('../db');
+const { registerWebTicketRoutes } = require('./webTickets');
 
 // Discord's hard caps. Exceeding any one rejects the WHOLE message, so
 // everything user-supplied is clipped on the way in. Clipping is always marked
@@ -501,6 +502,12 @@ function registerInternalRoutes(app, client) {
     }
   });
 
+  // Website tickets live in their own module but must be registered HERE, and
+  // specifically BEFORE the catch-all below. Express matches in registration
+  // order, so '/internal/:event' would otherwise swallow '/internal/new_ticket'
+  // and answer handled:false — which is exactly the bug the module fixes.
+  registerWebTicketRoutes(app, client, requireSecret);
+
   // Anything else the backend learns to send. Answering 200 keeps an unknown
   // event from looking like an outage, but it is logged loudly rather than
   // dropped quietly — a silent accept is what let ops_alert 404 unnoticed.
@@ -512,4 +519,8 @@ function registerInternalRoutes(app, client) {
   console.log('📨 Internal event routes registered (new_order, deliver_goods, web_review, ops_alert)');
 }
 
-module.exports = { registerInternalRoutes };
+// requireSecret is exported so modules/webTickets.js can guard its own
+// /internal/* routes with the SAME check rather than a second copy of it. Two
+// copies is how one of them ends up without the "unset API_SECRET means refuse"
+// rule that the original paymentBridge was missing.
+module.exports = { registerInternalRoutes, requireSecret };
