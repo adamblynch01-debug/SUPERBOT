@@ -66,8 +66,8 @@ async function handle2FAInteraction(interaction) {
 // ─── Start the HTTP server ──────────────────────────────────────────────────
 // `issueKey` is passed in from index.js — it owns keysData/generateKeyString/
 // saveKeys, this module just exposes an authenticated HTTP door to it.
-function startAuthServer(discordClient, { issueKey, invalidateGuildSettings } = {}) {
-  registerPanelRoutes(app, discordClient, { invalidateGuildSettings });
+function startAuthServer(discordClient, { issueKey, invalidateGuildSettings, panelHooks } = {}) {
+  registerPanelRoutes(app, discordClient, { invalidateGuildSettings, ...(panelHooks || {}) });
   registerInternalRoutes(app, discordClient);
 
   // POST /api/auth/initiate-2fa

@@ -425,13 +425,10 @@ function parseUsefulLinksBulk(raw) {
 }
 
 // ─── TOS / Rules / Guide — staff-editable content, one per guild per key ───
-const CONTENT_TYPES = {
-  tos:             { label: 'Terms of Service', defaultTitle: '📜 Terms of Service' },
-  rules:           { label: 'Rules',            defaultTitle: '📋 Server Rules' },
-  guide:           { label: 'Guide',            defaultTitle: '📖 Guide' },
-  'payment-method': { label: 'Payment Methods',  defaultTitle: '💳 Payment Methods' },
-};
-
+// CONTENT_TYPES and the renderer live in modules/contentRender.js because the
+// web panel renders the same documents. Two copies would diverge on the first
+// change, and the panel's preview would then promise a layout Discord does not
+// produce.
 async function getGuildContent(guildId, key) {
   const { rows } = await db.query('SELECT * FROM guild_content WHERE guild_id = $1 AND content_key = $2', [guildId, key]);
   return rows[0] || null;
@@ -447,92 +444,9 @@ async function setGuildContent(guildId, key, title, body, updatedBy) {
   );
 }
 
-// ─── Content rendering ────────────────────────────────────────────────────────
-// The Terms of Service saved fine — 3051 characters of it, on 2026-08-02. What
-// it did NOT do was display. The body was pasted in as ASCII art wrapped in a
-// ```text fence, and a fenced block inside an embed is the one piece of Discord
-// markup that does not wrap: every 61-character ╔═══╗ rule and every
-// `━━━━━━━━━━ SECTION` header ran off the right edge, so on a phone the terms
-// were a column of truncated lines and on desktop a horizontal scrollbar.
-//
-// So the fix is at the RENDER step, not the storage step. The body in the
-// database is left exactly as the operator typed it — it is their document, and
-// re-writing it in place would mean the next /set-tos silently disagreed with
-// what they last pasted. Instead the art is translated to native Discord
-// markdown on the way out, where the client is free to reflow it.
-//
-// Anything that is not recognisably boxed art passes through untouched.
-const BOX_CHARS = /[╔╗╚╝═║┃━┏┓┗┛│─┌┐└┘├┤┬┴┼▀▄█]/;
-
-function renderContentBody(raw) {
-  let body = String(raw || '');
-
-  // 1. Unwrap a fence around the WHOLE document. A fence around part of it is
-  //    intentional (a payment address, a command) and is left alone.
-  const fenced = body.match(/^\s*```[a-zA-Z]*\n([\s\S]*?)\n?```\s*$/);
-  if (fenced) body = fenced[1];
-
-  // Nothing box-drawn in here — it is already markdown, leave it be.
-  if (!BOX_CHARS.test(body)) return body.trim();
-
-  const out = [];
-  for (const line of body.split(/\r?\n/)) {
-    const t = line.trim();
-
-    // A rule made only of box characters carries no words; the embed's own
-    // title and field borders already do that job.
-    if (t && !t.replace(new RegExp(BOX_CHARS.source, 'g'), '').trim()) { out.push(''); continue; }
-
-    // `━━━━━━━━━ REFUND & PAYMENT POLICY` — a section header wearing a rule.
-    const header = t.match(/^[━─═]{3,}\s*(.+?)\s*[━─═]*$/);
-    if (header && header[1] && !BOX_CHARS.test(header[1])) {
-      out.push('', `**${header[1].toUpperCase()}**`);
-      continue;
-    }
-
-    // `┃  One purchase per account` / `┃ ✦ All payments are non-refundable`
-    const bar = t.match(/^[┃│┏┗▌]\s*(?:[✦•▪▸►]\s*)?(.*)$/);
-    if (bar) { if (bar[1].trim()) out.push(`• ${bar[1].trim()}`); continue; }
-
-    // A boxed banner line with real words in it — the store name, the invite.
-    if (BOX_CHARS.test(t)) {
-      const words = t.replace(new RegExp(BOX_CHARS.source, 'g'), ' ').trim();
-      if (words) out.push(`**${words}**`);
-      continue;
-    }
-
-    // Already-bulleted lines keep their bullet but lose the leading indent,
-    // which Discord would otherwise render as a nested list.
-    const bullet = t.match(/^[•▪▸►·-]\s*(.*)$/);
-    if (bullet) { out.push(`• ${bullet[1]}`); continue; }
-
-    out.push(t);
-  }
-
-  // Blank runs are how the art breathed; two blank lines in markdown is just a
-  // gap, three or more is a hole.
-  return out.join('\n').replace(/\n{3,}/g, '\n\n').trim();
-}
-
-// Discord: 4096 per description, 6000 across all embeds in one message, 10
-// embeds per message. Split on paragraph boundaries so a page never breaks
-// mid-sentence, and never mid-word.
-function paginate(text, limit = 3900) {
-  const pages = [];
-  let cur = '';
-  for (const para of String(text).split(/\n\n+/)) {
-    const block = para.length > limit
-      // A single paragraph longer than a page still has to go somewhere.
-      ? para.match(new RegExp(`[\\s\\S]{1,${limit}}(?:\\n|$)|[\\s\\S]{1,${limit}}`, 'g')) || [para]
-      : [para];
-    for (const b of block) {
-      if (cur && cur.length + b.length + 2 > limit) { pages.push(cur); cur = ''; }
-      cur = cur ? `${cur}\n\n${b}` : b;
-    }
-  }
-  if (cur) pages.push(cur);
-  return pages.length ? pages : [''];
-}
+const {
+  CONTENT_TYPES, renderContentBody, paginate, chunkEmbedsIntoMessages,
+} = require('./modules/contentRender');
 
 // Returns an ARRAY now — a long document is several embeds, not one truncated
 // one. Callers spread it; `buildContentEmbed` is kept as the single-embed
@@ -661,6 +575,14 @@ function parseKeyDuration(raw) {
   return n * unitMs[m[2]];
 }
 
+// Module scope, not inside the /genkey handler where this used to live: the web
+// panel mints keys too, and a second copy of this map is how the same 30d key
+// ends up labelled "1 Month" in Discord and "30d" in the browser.
+const DURATION_LABELS = {
+  lifetime: 'Lifetime', '365d': '1 Year', '90d': '3 Months', '30d': '1 Month',
+  '14d': '2 Weeks', '3d': '3 Days', '1d': '1 Day', '5m': '5 Minutes',
+};
+
 // Removes the role for any key whose time is up. Runs on a timer, and once
 // immediately at startup in case expirations piled up while the bot was down.
 // The whole body is wrapped defensively — if the database is briefly
@@ -729,6 +651,82 @@ async function issueKeyAndNotify({ discordUserId, guildId, roleId, durationMs })
   }
 
   return { ok: true, key, dmSent };
+}
+
+// ─── Key operations for the web panel ────────────────────────────────────────
+// Passed into modules/panel.js rather than reimplemented there. The panel and
+// /genkey write the same rows, log to the same gen channel, and read the same
+// duration labels — because they call this, not a second copy of it.
+//
+// Unlike issueKeyAndNotify these do NOT DM anyone: the panel hands the strings
+// straight back to the staff member who pressed the button, and there is no
+// buyer to notify yet.
+async function mintKeysForPanel({ guildId, roleId, duration, count, createdBy }) {
+  const guild = client.guilds.cache.get(guildId);
+  if (!guild) return { ok: false, error: 'The bot is not in that server.' };
+
+  const role = guild.roles.cache.get(String(roleId));
+  if (!role) return { ok: false, error: 'That role no longer exists.' };
+  // The panel filters these out of the picker, but the picker is a snapshot —
+  // a role can be moved above the bot between loading the page and pressing
+  // Generate, and a key for an unassignable role fails silently at /redeem.
+  const me = guild.members.me;
+  if (me && role.position >= me.roles.highest.position) {
+    return { ok: false, error: `${role.name} sits above the bot's own role, so the bot cannot grant it.` };
+  }
+  if (role.managed) return { ok: false, error: `${role.name} is managed by an integration and cannot be granted.` };
+
+  const durationMs = parseKeyDuration(duration);
+  if (durationMs === null) return { ok: false, error: `"${duration}" is not a duration this bot understands.` };
+
+  const n = Math.max(1, Math.min(25, parseInt(count, 10) || 1));
+  const keys = [];
+  for (let i = 0; i < n; i++) {
+    const key = await generateKeyString();
+    await createKeyRow({ key, guildId, roleId: role.id, roleName: role.name, durationMs, createdBy });
+    keys.push(key);
+  }
+
+  const durationLabel = DURATION_LABELS[duration] || String(duration);
+  // Same log line /genkey writes, for the same reason — keys grant a paid role.
+  // The strings stay out of it; anyone who can read that channel could redeem one.
+  logGeneration(client, {
+    kind: 'key',
+    user: { id: String(createdBy).replace(/^panel:/, ''), tag: `${createdBy} (web panel)` },
+    what: `${n} × ${role.name}`,
+    detail: `Duration: ${durationLabel}`,
+    source: 'web panel',
+  }).catch(() => {});
+
+  return { ok: true, keys, roleName: role.name, durationLabel };
+}
+
+async function revokeKeyForPanel({ guildId, key }) {
+  const entry = await getKeyEntry(key);
+  if (!entry) return { ok: false, error: 'No such key.' };
+  if (entry.status === 'revoked') return { ok: false, error: 'That key was already revoked.' };
+
+  await markKeyStatus(key, 'revoked');
+
+  // An unredeemed key has no holder — nothing to take back, and saying "role
+  // removed" would be a claim about a member who does not exist.
+  if (entry.status !== 'active' || !entry.redeemedBy) {
+    return { ok: true, roleRemoved: false, note: 'It had not been redeemed, so nobody lost a role.' };
+  }
+
+  const guild = client.guilds.cache.get(guildId);
+  if (!guild) return { ok: true, roleRemoved: false, note: 'The key is dead, but the bot is no longer in that server to remove the role.' };
+
+  try {
+    const member = await guild.members.fetch(entry.redeemedBy);
+    await member.roles.remove(entry.roleId);
+    return { ok: true, roleRemoved: true };
+  } catch (e) {
+    // The key is already revoked at this point, and that is the part that
+    // matters — it cannot be redeemed again. Report the role honestly.
+    console.warn(`[keys] revoked ${key} but could not remove role ${entry.roleId} from ${entry.redeemedBy}:`, e.message);
+    return { ok: true, roleRemoved: false, note: `The key is dead, but the role could not be removed (${e.message}) — do it by hand.` };
+  }
 }
 
 // Shared redeem logic — used by /redeem and by the postredeem panel's modal.
@@ -2336,7 +2334,21 @@ client.once('ready', async () => {
   }
 
   // Start 2FA auth server
-  startAuthServer(client, { issueKey: issueKeyAndNotify, invalidateGuildSettings });
+  // The panel's hooks are the bot's own functions, handed over rather than
+  // reimplemented inside modules/panel.js. A second definition of "how a key is
+  // minted" or "how a stock type is spelled" is how the panel and Discord end
+  // up disagreeing about the same table.
+  startAuthServer(client, {
+    issueKey: issueKeyAndNotify,
+    invalidateGuildSettings,
+    panelHooks: {
+      buildContentEmbeds,
+      chunkEmbeds: chunkEmbedsIntoMessages,
+      normalizeStockType,
+      mintKeys: mintKeysForPanel,
+      revokeKey: revokeKeyForPanel,
+    },
+  });
 
   // Redeemable-key expiry — catch up on anything that expired while the bot
   // was offline, then check every minute going forward.
@@ -3510,10 +3522,6 @@ client.on('interactionCreate', async interaction => {
           return interaction.reply({ content: '❌ Invalid duration.', flags: 64 });
         }
 
-        const DURATION_LABELS = {
-          lifetime: 'Lifetime', '365d': '1 Year', '90d': '3 Months', '30d': '1 Month',
-          '14d': '2 Weeks', '3d': '3 Days', '1d': '1 Day', '5m': '5 Minutes',
-        };
         const durationLabel = DURATION_LABELS[durationStr] || durationStr;
 
         const generated = [];
@@ -3738,14 +3746,7 @@ client.on('interactionCreate', async interaction => {
         // 6000 characters across all embeds in one message is a hard Discord
         // limit, and exceeding it rejects the WHOLE message — the terms would
         // post as nothing at all. Send in runs that fit instead.
-        const messages = [];
-        let run = [], runLen = 0;
-        for (const e of embeds) {
-          const len = (e.data.description || '').length + (e.data.title || '').length + 100;
-          if (run.length && (runLen + len > 5500 || run.length >= 10)) { messages.push(run); run = []; runLen = 0; }
-          run.push(e); runLen += len;
-        }
-        if (run.length) messages.push(run);
+        const messages = chunkEmbedsIntoMessages(embeds);
         for (const m of messages) await channel.send({ embeds: m });
 
         await interaction.reply({
