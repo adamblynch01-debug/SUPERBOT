@@ -1190,7 +1190,11 @@ async function announceInvite(member, inviterId, fake, isRejoin) {
     const settings = await getGuildSettings(member.guild.id);
     const ch = (settings.invitesChannelId && member.guild.channels.cache.get(settings.invitesChannelId))
       || findChannelByName(member.guild, settings.invitesChannelName);
-    if (!ch) return;
+    // Returns the channel it posted to (null if it could not resolve one), so
+    // /testinvite can report WHERE the announcement landed instead of just
+    // "sent". A tracker posting into the wrong channel does not error — that is
+    // exactly how it went unnoticed — so the destination has to be shown.
+    if (!ch) return null;
 
     const created = `<t:${Math.floor(member.user.createdTimestamp / 1000)}:R>`;
     let line;
@@ -1215,8 +1219,10 @@ async function announceInvite(member, inviterId, fake, isRejoin) {
       .setTimestamp();
 
     await ch.send({ embeds: [embed] });
+    return ch;
   } catch (e) {
     console.error('[Invites] could not announce join:', e.message);
+    return null;
   }
 }
 
@@ -1800,6 +1806,8 @@ const ownCommands = [
   new SlashCommandBuilder().setName('setup-verify').setDescription('Sets up the verification channel').setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
   new SlashCommandBuilder().setName('setup-invites').setDescription('Sets up the invite reward channel').setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+  new SlashCommandBuilder().setName('testinvite').setDescription('Admin: fire a test join announcement through the real invite tracker')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
   new SlashCommandBuilder().setName('show-voucher-stats').setDescription('📊 Invite leaderboard — everybody\'s invite tracker stats')
     .addUserOption(o => o.setName('user').setDescription('Show one member\'s stats instead of the leaderboard').setRequired(false))
     .addBooleanOption(o => o.setName('public').setDescription('Post it in the channel for everyone (staff only)').setRequired(false)),
@@ -2520,6 +2528,35 @@ client.on('interactionCreate', async interaction => {
         await invCh.send({ embeds: [embed], components: [row] });
         await interaction.editReply('✅ Invite system set up!'); autoDelete(interaction, 5000);
         return;
+      }
+
+      // ── /testinvite ────────────────────────────────────────────────────────
+      // The only honest way to test a join announcement without asking someone
+      // to join: call the SAME function guildMemberAdd calls, with the caller
+      // standing in for the new member. Re-implementing the embed here would
+      // test this command instead of the tracker.
+      //
+      // It exists because the tracker had been posting into the wrong channel
+      // for its whole life and nothing errored — two channels with near-
+      // identical names, both real, both writable. So the reply names the
+      // channel it actually reached, which is the fact under test.
+      if (cmd === 'testinvite') {
+        await interaction.deferReply({ ephemeral: true });
+        const settings = await getGuildSettings(interaction.guild.id);
+        const ch = await announceInvite(interaction.member, interaction.user.id, false, false);
+        if (!ch) {
+          return interaction.editReply(
+            '❌ No invites channel could be resolved, so the announcement was dropped.\n' +
+            `• \`INVITES_CHANNEL_ID\` → \`${settings.invitesChannelId || '(unset)'}\`\n` +
+            `• name fallback → \`#${settings.invitesChannelName}\`\n` +
+            'Either the id points at a channel the bot cannot see, or it lacks **View Channel** / **Send Messages** there.'
+          );
+        }
+        return interaction.editReply(
+          `✅ Test join announcement posted to <#${ch.id}> — **#${ch.name}** (\`${ch.id}\`).\n` +
+          'That is the exact channel a real join will use. If it is the wrong one, ' +
+          'set `INVITES_CHANNEL_ID` or `guild_settings.invites_channel_id` to the right id.'
+        );
       }
 
       // ── /postupdate ────────────────────────────────────────────────────────
