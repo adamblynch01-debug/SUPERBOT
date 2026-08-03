@@ -68,7 +68,12 @@ const VERIFIED_ROLE_ENV  = process.env.VERIFIED_ROLE_NAME  || 'Verified';
 const VERIFY_CHANNEL_ENV = process.env.VERIFY_CHANNEL_NAME || 'get-verify';
 const WELCOME_CHANNEL_ENV= process.env.WELCOME_CHANNEL_NAME|| 'welcome';
 const WELCOME_CHANNEL_ID = process.env.WELCOME_CHANNEL_ID || '1400773021274341396';
-const INVITES_CHANNEL_ID = process.env.INVITES_CHANNEL_ID || '1482585544998256781';
+// #invites — every join announcement, the reward panel and the leave notice
+// resolve through here. The old literal (1482585544998256781) was a channel the
+// tracker had been posting into by accident; the operator's actual invites
+// channel is below. Env var still wins, and guild_settings.invites_channel_id
+// wins over both.
+const INVITES_CHANNEL_ID = process.env.INVITES_CHANNEL_ID || '1400878017667923968';
 const INVITES_CHANNEL_ENV= process.env.INVITES_CHANNEL_NAME|| 'invites';
 const INVITES_NEEDED_ENV = parseInt(process.env.INVITES_NEEDED || '10');
 
