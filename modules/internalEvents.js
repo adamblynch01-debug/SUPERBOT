@@ -16,7 +16,7 @@
 // verbatim; what is added is the missing route plus the hardening noted at each
 // site below.
 //
-// Events: new_order, deliver_goods, web_review, ops_alert.
+// Events: new_order, deliver_goods, web_review, ops_alert, restock.
 
 const crypto = require('crypto');
 const { EmbedBuilder } = require('discord.js');
@@ -502,6 +502,134 @@ function registerInternalRoutes(app, client) {
     }
   });
 
+  // ─── restock ───────────────────────────────────────────────────────────────
+  // "Product Restocked!" announcements for #restocks.
+  //
+  // The backend batches these (utils/restockNotify.js) so one sync-all press
+  // arrives as one request carrying many products, rather than one request per
+  // tier. This route therefore has to render BOTH shapes: a handful of
+  // products gets the full per-product embed a customer can act on, and a
+  // catalogue-wide fill collapses into a single summary — 60 embeds in a row
+  // is not an announcement, it is a wall.
+  //
+  // Unlike the order channel this one is safe to hardcode a fallback for: a
+  // restock embed carries product names and prices, which are already public
+  // on the storefront. There is no customer data to misdeliver.
+  const RESTOCK_FALLBACK_CHANNEL = '1533187731381817534';
+  const MAX_INDIVIDUAL_EMBEDS = 4;
+
+  const restockChannel = async () => firstSendable(client, [
+    process.env.RESTOCK_CHANNEL_ID,
+    RESTOCK_FALLBACK_CHANNEL,
+  ]);
+
+  // "3 DAY'S ···· $14.99" — the dotted leader from the reference notification,
+  // padded so the prices line up in Discord's proportional font as well as they
+  // can. Bounded so a product with 30 tiers cannot blow the 1024-char field.
+  function variantLines(variants) {
+    const rows = (variants || []).slice(0, 12);
+    const width = rows.reduce((m, v) => Math.max(m, String(v.label || '').length), 0);
+    const out = rows.map(v => {
+      const label = String(v.label || '—');
+      const dots = '·'.repeat(Math.max(4, width - label.length + 6));
+      return `\`${label}\` ${dots} **${v.price || 'TBD'}**`;
+    });
+    if ((variants || []).length > rows.length) {
+      out.push(`_… and ${variants.length - rows.length} more variant(s)_`);
+    }
+    return out.join('\n') || '—';
+  }
+
+  function productEmbed(p, storeUrl) {
+    const title = p.game_name && p.game_name !== p.product_name
+      ? `${p.game_name} — ${p.product_name}`
+      : p.product_name;
+
+    const embed = new EmbedBuilder()
+      .setColor(0x5865F2)
+      .setTitle(clip(title, LIMIT.name))
+      .setDescription(clip(
+        '🔵 **Product Restocked!**\n' +
+        'The following product has just been restocked and is now available.\n\n' +
+        `🛒 **[Buy Now »](${storeUrl})**`,
+        LIMIT.desc
+      ))
+      .addFields({ name: 'Variants & Pricing', value: clip(variantLines(p.variants), LIMIT.value) })
+      .setFooter({ text: 'UHSERVICES.XYZ Restock Notifications' })
+      .setTimestamp();
+
+    if (storeUrl) embed.setURL(storeUrl);
+
+    // Which tiers actually moved, and what is on the shelf now. The reference
+    // embed does not carry this, but "restocked" with no number is the exact
+    // ambiguity that had the operator asking why a product still read LOW.
+    const moved = (p.restocked || [])
+      .slice(0, 12)
+      .map(r => `\`${r.label}\` +${r.added} → **${r.available} in stock**`)
+      .join('\n');
+    if (moved) embed.addFields({ name: 'Restocked', value: clip(moved, LIMIT.value) });
+
+    if (p.image_url) embed.setImage(p.image_url);
+    return embed;
+  }
+
+  app.post('/internal/restock', requireSecret, async (req, res) => {
+    const { products = [], store_url, total_added } = req.body || {};
+    try {
+      if (!Array.isArray(products) || !products.length) {
+        return res.json({ ok: true, posted: false, reason: 'no products' });
+      }
+
+      const ch = await restockChannel();
+      if (!ch) {
+        console.error('[Internal] restock DROPPED: no restock channel reachable. Set RESTOCK_CHANNEL_ID.');
+        return res.json({ ok: true, posted: false, reason: 'no channel configured' });
+      }
+
+      const storeUrl = String(store_url || 'https://uhservices.xyz').replace(/\/+$/, '');
+
+      if (products.length <= MAX_INDIVIDUAL_EMBEDS) {
+        for (const p of products) {
+          await ch.send({ embeds: [productEmbed(p, storeUrl)] });
+        }
+        return res.json({ ok: true, posted: true, embeds: products.length });
+      }
+
+      // Summary. Every product is NAMED — a count alone ("47 products
+      // restocked") tells a customer nothing about whether the one they want
+      // is back. The list is capped at the field limit and says so when it is.
+      const shown = products.slice(0, 40);
+      const lines = shown.map(p => {
+        const name = p.game_name && p.game_name !== p.product_name
+          ? `${p.game_name} — ${p.product_name}` : p.product_name;
+        return `• **${name}** (+${p.total_added})`;
+      });
+      if (products.length > shown.length) {
+        lines.push(`_… and ${products.length - shown.length} more product(s)_`);
+      }
+
+      const embed = new EmbedBuilder()
+        .setColor(0x5865F2)
+        .setTitle('🔵 Products Restocked!')
+        .setURL(storeUrl)
+        .setDescription(clip(
+          `**${products.length}** product(s) have just been restocked` +
+          (Number(total_added) > 0 ? ` with **${Number(total_added)}** new key(s)` : '') +
+          '.\n\n' + `🛒 **[Buy Now »](${storeUrl})**`,
+          LIMIT.desc
+        ))
+        .addFields({ name: 'Restocked', value: clip(lines.join('\n'), LIMIT.value) })
+        .setFooter({ text: 'UHSERVICES.XYZ Restock Notifications' })
+        .setTimestamp();
+
+      await ch.send({ embeds: [embed] });
+      return res.json({ ok: true, posted: true, embeds: 1, summarized: products.length });
+    } catch (err) {
+      console.error('[Internal] restock failed:', err.message);
+      return res.status(500).json({ error: 'failed to post restock' });
+    }
+  });
+
   // Website tickets live in their own module but must be registered HERE, and
   // specifically BEFORE the catch-all below. Express matches in registration
   // order, so '/internal/:event' would otherwise swallow '/internal/new_ticket'
@@ -516,7 +644,7 @@ function registerInternalRoutes(app, client) {
     return res.json({ ok: true, handled: false });
   });
 
-  console.log('📨 Internal event routes registered (new_order, deliver_goods, web_review, ops_alert)');
+  console.log('📨 Internal event routes registered (new_order, deliver_goods, web_review, ops_alert, restock)');
 }
 
 // requireSecret is exported so modules/webTickets.js can guard its own
