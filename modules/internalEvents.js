@@ -516,9 +516,26 @@ function registerInternalRoutes(app, client) {
   // restock embed carries product names and prices, which are already public
   // on the storefront. There is no customer data to misdeliver.
   const RESTOCK_FALLBACK_CHANNEL = '1533187731381817534';
+  // The vault sells from its own catalogue in its own part of the server, so a
+  // vault restock announced in the storefront channel points customers at a
+  // page that does not carry the product. This channel lives under the
+  // 🔑 GEN-VAULT category and is named IDENTICALLY to the storefront one —
+  // resolving either by name would pick whichever Discord returned first, so
+  // both are pinned by id.
+  const VAULT_RESTOCK_FALLBACK_CHANNEL = '1533912211834146916';
   const MAX_INDIVIDUAL_EMBEDS = 4;
 
   const restockChannel = async () => firstSendable(client, [
+    process.env.RESTOCK_CHANNEL_ID,
+    RESTOCK_FALLBACK_CHANNEL,
+  ]);
+
+  // Falls back to the storefront channel rather than dropping the message: a
+  // vault restock in the wrong channel is a nuisance, a vault restock nobody
+  // sees is a product that silently never came back.
+  const vaultRestockChannel = async () => firstSendable(client, [
+    process.env.VAULT_RESTOCK_CHANNEL_ID,
+    VAULT_RESTOCK_FALLBACK_CHANNEL,
     process.env.RESTOCK_CHANNEL_ID,
     RESTOCK_FALLBACK_CHANNEL,
   ]);
@@ -573,57 +590,89 @@ function registerInternalRoutes(app, client) {
     return embed;
   }
 
+  // One catalogue's worth of restocks into one channel. Returns what it did so
+  // the response can account for both groups separately — "posted: true" that
+  // hides a silently-dropped half is the kind of answer this route exists to
+  // stop giving.
+  async function postRestockGroup(ch, list, storeUrl) {
+    if (list.length <= MAX_INDIVIDUAL_EMBEDS) {
+      for (const p of list) await ch.send({ embeds: [productEmbed(p, storeUrl)] });
+      return { embeds: list.length, summarized: 0 };
+    }
+
+    // Summary. Every product is NAMED — a count alone ("47 products
+    // restocked") tells a customer nothing about whether the one they want
+    // is back. The list is capped at the field limit and says so when it is.
+    const shown = list.slice(0, 40);
+    const lines = shown.map(p => {
+      const name = p.game_name && p.game_name !== p.product_name
+        ? `${p.game_name} — ${p.product_name}` : p.product_name;
+      return `• **${name}** (+${p.total_added})`;
+    });
+    if (list.length > shown.length) {
+      lines.push(`_… and ${list.length - shown.length} more product(s)_`);
+    }
+    const added = list.reduce((s, p) => s + (Number(p.total_added) || 0), 0);
+
+    const embed = new EmbedBuilder()
+      .setColor(0x5865F2)
+      .setTitle('🔵 Products Restocked!')
+      .setURL(storeUrl)
+      .setDescription(clip(
+        `**${list.length}** product(s) have just been restocked` +
+        (added > 0 ? ` with **${added}** new key(s)` : '') +
+        '.\n\n' + `🛒 **[Buy Now »](${storeUrl})**`,
+        LIMIT.desc
+      ))
+      .addFields({ name: 'Restocked', value: clip(lines.join('\n'), LIMIT.value) })
+      .setFooter({ text: 'UHSERVICES.XYZ Restock Notifications' })
+      .setTimestamp();
+
+    await ch.send({ embeds: [embed] });
+    return { embeds: 1, summarized: list.length };
+  }
+
   app.post('/internal/restock', requireSecret, async (req, res) => {
-    const { products = [], store_url, total_added } = req.body || {};
+    const { products = [] } = req.body || {};
     try {
       if (!Array.isArray(products) || !products.length) {
         return res.json({ ok: true, posted: false, reason: 'no products' });
       }
 
-      const ch = await restockChannel();
-      if (!ch) {
-        console.error('[Internal] restock DROPPED: no restock channel reachable. Set RESTOCK_CHANNEL_ID.');
-        return res.json({ ok: true, posted: false, reason: 'no channel configured' });
-      }
+      // Split on the CATALOGUE, not the channel: a batch can carry both, since
+      // "sync all stock" walks every tier the guild owns regardless of which
+      // storefront sells it.
+      const store = products.filter(p => !p.vault);
+      const vault = products.filter(p => p.vault);
 
-      const storeUrl = String(store_url || 'https://uhservices.xyz').replace(/\/+$/, '');
+      const storeUrl = String(req.body.store_url || 'https://uhservices.xyz').replace(/\/+$/, '');
+      const vaultUrl = String(req.body.vault_url || storeUrl).replace(/\/+$/, '');
 
-      if (products.length <= MAX_INDIVIDUAL_EMBEDS) {
-        for (const p of products) {
-          await ch.send({ embeds: [productEmbed(p, storeUrl)] });
+      const out = { ok: true, posted: false, store: null, vault: null };
+
+      if (store.length) {
+        const ch = await restockChannel();
+        if (!ch) {
+          console.error('[Internal] restock DROPPED for storefront: no channel reachable. Set RESTOCK_CHANNEL_ID.');
+          out.store = { posted: false, reason: 'no channel configured', products: store.length };
+        } else {
+          out.store = { posted: true, channel: ch.id, products: store.length, ...(await postRestockGroup(ch, store, storeUrl)) };
+          out.posted = true;
         }
-        return res.json({ ok: true, posted: true, embeds: products.length });
       }
 
-      // Summary. Every product is NAMED — a count alone ("47 products
-      // restocked") tells a customer nothing about whether the one they want
-      // is back. The list is capped at the field limit and says so when it is.
-      const shown = products.slice(0, 40);
-      const lines = shown.map(p => {
-        const name = p.game_name && p.game_name !== p.product_name
-          ? `${p.game_name} — ${p.product_name}` : p.product_name;
-        return `• **${name}** (+${p.total_added})`;
-      });
-      if (products.length > shown.length) {
-        lines.push(`_… and ${products.length - shown.length} more product(s)_`);
+      if (vault.length) {
+        const ch = await vaultRestockChannel();
+        if (!ch) {
+          console.error('[Internal] restock DROPPED for vault: no channel reachable. Set VAULT_RESTOCK_CHANNEL_ID.');
+          out.vault = { posted: false, reason: 'no channel configured', products: vault.length };
+        } else {
+          out.vault = { posted: true, channel: ch.id, products: vault.length, ...(await postRestockGroup(ch, vault, vaultUrl)) };
+          out.posted = true;
+        }
       }
 
-      const embed = new EmbedBuilder()
-        .setColor(0x5865F2)
-        .setTitle('🔵 Products Restocked!')
-        .setURL(storeUrl)
-        .setDescription(clip(
-          `**${products.length}** product(s) have just been restocked` +
-          (Number(total_added) > 0 ? ` with **${Number(total_added)}** new key(s)` : '') +
-          '.\n\n' + `🛒 **[Buy Now »](${storeUrl})**`,
-          LIMIT.desc
-        ))
-        .addFields({ name: 'Restocked', value: clip(lines.join('\n'), LIMIT.value) })
-        .setFooter({ text: 'UHSERVICES.XYZ Restock Notifications' })
-        .setTimestamp();
-
-      await ch.send({ embeds: [embed] });
-      return res.json({ ok: true, posted: true, embeds: 1, summarized: products.length });
+      return res.json(out);
     } catch (err) {
       console.error('[Internal] restock failed:', err.message);
       return res.status(500).json({ error: 'failed to post restock' });
