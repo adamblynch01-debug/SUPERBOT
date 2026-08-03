@@ -20,6 +20,7 @@ const {
 const fs   = require('fs');
 const path = require('path');
 const db   = require('../db');
+const { logGeneration } = require('./genLog');
 
 // ─── Order persistence ────────────────────────────────────────────────────────
 // Buying a number spends REAL provider credit. Orders used to live only in the
@@ -1311,6 +1312,17 @@ async function purchaseNumber(interaction, client, provider, apiKey, session, co
   // balance by this point, so the row must exist even if the process dies on
   // the very next line.
   await persistOrder(orderData);
+
+  // Gen log. The number is included here where an account's credentials are
+  // not: it is already posted publicly in the order channel above, and it is
+  // the only handle staff have if the provider order has to be chased.
+  logGeneration(client, {
+    kind: 'sms',
+    user: interaction.user,
+    what: `${serviceName} — ${country}`,
+    detail: `\`${number}\`  ·  ${provider}  ·  order \`${orderId}\``,
+    source: '/gennumber',
+  }).catch(() => {});
 
   await startPolling(client, orderId, orderData);
 }

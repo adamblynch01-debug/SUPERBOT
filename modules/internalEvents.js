@@ -260,6 +260,26 @@ function registerInternalRoutes(app, client) {
   // The status used to be the hardcoded string '⏳ Pending Payment', so a
   // balance order that was already paid AND delivered before the embed was
   // even built still announced itself as awaiting payment.
+  // Where the order came from. The vouch embed has said `Source: 🌐 Website`
+  // since the web-review bridge was built, and an order embed said nothing —
+  // so a storefront checkout and a key handed over by hand in a ticket arrived
+  // in #order-log looking identical. They are not: one was paid for through
+  // the site and one is a staff action that nobody else witnessed.
+  const SOURCE_LABELS = {
+    website: '🌐 Website',
+    discord: '💬 Discord',
+    manual:  '🖐️ Manual (staff)',
+  };
+  const sourceLabel = (s) => SOURCE_LABELS[String(s || 'website').toLowerCase()] || `❔ ${s}`;
+
+  // The dedicated channel the operator created for hand-delivered orders. Kept
+  // separate from #order-log on purpose: this is the short list a human is
+  // accountable for, and it would be unreadable buried in the checkout feed.
+  const manualChannel = async () => firstSendable(client, [
+    process.env.MANUAL_DELIVERY_CHANNEL_ID,
+    '1533927608360636629',
+  ]);
+
   const STATUS_LABELS = {
     waiting:          '⏳ Pending Payment',
     paid:             '💰 Paid',
@@ -307,6 +327,7 @@ function registerInternalRoutes(app, client) {
           { name: 'Total', value: clip(formatAmount(order, payment_info), LIMIT.value), inline: true },
           { name: 'Email', value: clip(order.email || order.discord_id || 'unknown', LIMIT.value), inline: true },
           { name: 'Status', value: STATUS_LABELS[String(order.status || 'waiting')] || `❔ ${order.status}`, inline: true },
+          { name: 'Source', value: sourceLabel(order.source), inline: true },
         )
         .setTimestamp();
 
@@ -327,7 +348,8 @@ function registerInternalRoutes(app, client) {
   // The valuable one: this is how a Discord buyer actually receives what they
   // paid for. Delivered values go to the buyer by DM only — never to a channel.
   app.post('/internal/deliver_goods', requireSecret, async (req, res) => {
-    const { order_id, invoice_no = null, email, discord_id, goods = [], guild_id, needs_attention = false } = req.body || {};
+    const { order_id, invoice_no = null, email, discord_id, goods = [], guild_id,
+            needs_attention = false, source = 'website' } = req.body || {};
     const out = { ok: true, dm: false, posted: false };
 
     try {
@@ -396,11 +418,25 @@ function registerInternalRoutes(app, client) {
             { name: 'Discord', value: discord_id ? `<@${discord_id}>` : 'N/A', inline: true },
             { name: 'Email', value: clip(email || 'N/A', LIMIT.value), inline: true },
             { name: 'Buyer DM', value: out.dm ? 'sent' : (out.dm_error || (discord_id ? 'not sent' : 'no discord id')), inline: true },
+            { name: 'Source', value: sourceLabel(source), inline: true },
           )
           .setTimestamp();
 
         await ch.send({ embeds: [logEmbed] });
         out.posted = true;
+
+        // A hand-delivered order goes to BOTH channels. #order-log is the
+        // complete feed and must stay complete; the manual channel is the
+        // subset a human is answerable for, and duplicating the embed there is
+        // cheaper than asking staff to filter the firehose.
+        if (String(source).toLowerCase() === 'manual') {
+          const mch = await manualChannel();
+          if (mch && mch.id !== ch.id) {
+            await mch.send({ embeds: [logEmbed] }).catch(e =>
+              console.error('[Internal] manual delivery channel post failed:', e.message));
+            out.manual_posted = true;
+          }
+        }
       } else {
         // The customer still got their keys (the DM above is what matters to
         // them), but staff have no record of it. Say so loudly rather than

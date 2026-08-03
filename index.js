@@ -44,6 +44,10 @@ const { startAuthServer, handle2FAInteraction } = require('./modules/auth2fa');
 const { getAllProducts, getProduct, setProductUrl, getProductChunks, getProductByName, refresh: dlRefresh } = require('./modules/downloads');
 const { handleWebTicketButton, handleWebTicketModal } = require('./modules/webTickets');
 const { commands: smsCommands, handleSMSInteraction, setSMSAccessGate } = require('./modules/sms-gen');
+const { logGeneration } = require('./modules/genLog');
+const {
+  commands: manualCommands, handleManualInteraction, setManualAccessGate,
+} = require('./modules/manualDelivery');
 
 // ─── ENV Config ───────────────────────────────────────────────────────────────
 const TOKEN          = process.env.DISCORD_TOKEN;
@@ -309,6 +313,11 @@ async function clearStockCooldown(guildId, userId, type) {
 // definition of who counts as staff, which is how a gate ends up open on one
 // command and shut on another. Installed at load, not in ready(): sms-gen
 // refuses every request until this runs, so it must not be able to run late.
+// Manual delivery borrows hasAccess() for the same reason — it is the staff
+// gate the rest of the bot already uses, and every entry point of that flow
+// (command, select menu, modal) is checked against it.
+setManualAccessGate({ hasAccess: (i) => hasAccess(i) });
+
 setSMSAccessGate({
   canAccess:     canAccessStock,
   hasUnlimited:  hasUnlimitedGen,
@@ -438,15 +447,123 @@ async function setGuildContent(guildId, key, title, body, updatedBy) {
   );
 }
 
-async function buildContentEmbed(guildId, key) {
+// ─── Content rendering ────────────────────────────────────────────────────────
+// The Terms of Service saved fine — 3051 characters of it, on 2026-08-02. What
+// it did NOT do was display. The body was pasted in as ASCII art wrapped in a
+// ```text fence, and a fenced block inside an embed is the one piece of Discord
+// markup that does not wrap: every 61-character ╔═══╗ rule and every
+// `━━━━━━━━━━ SECTION` header ran off the right edge, so on a phone the terms
+// were a column of truncated lines and on desktop a horizontal scrollbar.
+//
+// So the fix is at the RENDER step, not the storage step. The body in the
+// database is left exactly as the operator typed it — it is their document, and
+// re-writing it in place would mean the next /set-tos silently disagreed with
+// what they last pasted. Instead the art is translated to native Discord
+// markdown on the way out, where the client is free to reflow it.
+//
+// Anything that is not recognisably boxed art passes through untouched.
+const BOX_CHARS = /[╔╗╚╝═║┃━┏┓┗┛│─┌┐└┘├┤┬┴┼▀▄█]/;
+
+function renderContentBody(raw) {
+  let body = String(raw || '');
+
+  // 1. Unwrap a fence around the WHOLE document. A fence around part of it is
+  //    intentional (a payment address, a command) and is left alone.
+  const fenced = body.match(/^\s*```[a-zA-Z]*\n([\s\S]*?)\n?```\s*$/);
+  if (fenced) body = fenced[1];
+
+  // Nothing box-drawn in here — it is already markdown, leave it be.
+  if (!BOX_CHARS.test(body)) return body.trim();
+
+  const out = [];
+  for (const line of body.split(/\r?\n/)) {
+    const t = line.trim();
+
+    // A rule made only of box characters carries no words; the embed's own
+    // title and field borders already do that job.
+    if (t && !t.replace(new RegExp(BOX_CHARS.source, 'g'), '').trim()) { out.push(''); continue; }
+
+    // `━━━━━━━━━ REFUND & PAYMENT POLICY` — a section header wearing a rule.
+    const header = t.match(/^[━─═]{3,}\s*(.+?)\s*[━─═]*$/);
+    if (header && header[1] && !BOX_CHARS.test(header[1])) {
+      out.push('', `**${header[1].toUpperCase()}**`);
+      continue;
+    }
+
+    // `┃  One purchase per account` / `┃ ✦ All payments are non-refundable`
+    const bar = t.match(/^[┃│┏┗▌]\s*(?:[✦•▪▸►]\s*)?(.*)$/);
+    if (bar) { if (bar[1].trim()) out.push(`• ${bar[1].trim()}`); continue; }
+
+    // A boxed banner line with real words in it — the store name, the invite.
+    if (BOX_CHARS.test(t)) {
+      const words = t.replace(new RegExp(BOX_CHARS.source, 'g'), ' ').trim();
+      if (words) out.push(`**${words}**`);
+      continue;
+    }
+
+    // Already-bulleted lines keep their bullet but lose the leading indent,
+    // which Discord would otherwise render as a nested list.
+    const bullet = t.match(/^[•▪▸►·-]\s*(.*)$/);
+    if (bullet) { out.push(`• ${bullet[1]}`); continue; }
+
+    out.push(t);
+  }
+
+  // Blank runs are how the art breathed; two blank lines in markdown is just a
+  // gap, three or more is a hole.
+  return out.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+// Discord: 4096 per description, 6000 across all embeds in one message, 10
+// embeds per message. Split on paragraph boundaries so a page never breaks
+// mid-sentence, and never mid-word.
+function paginate(text, limit = 3900) {
+  const pages = [];
+  let cur = '';
+  for (const para of String(text).split(/\n\n+/)) {
+    const block = para.length > limit
+      // A single paragraph longer than a page still has to go somewhere.
+      ? para.match(new RegExp(`[\\s\\S]{1,${limit}}(?:\\n|$)|[\\s\\S]{1,${limit}}`, 'g')) || [para]
+      : [para];
+    for (const b of block) {
+      if (cur && cur.length + b.length + 2 > limit) { pages.push(cur); cur = ''; }
+      cur = cur ? `${cur}\n\n${b}` : b;
+    }
+  }
+  if (cur) pages.push(cur);
+  return pages.length ? pages : [''];
+}
+
+// Returns an ARRAY now — a long document is several embeds, not one truncated
+// one. Callers spread it; `buildContentEmbed` is kept as the single-embed
+// convenience for the places that only ever preview.
+async function buildContentEmbeds(guildId, key) {
   const row = await getGuildContent(guildId, key);
   if (!row) return null;
-  return new EmbedBuilder()
-    .setColor(0x5865F2)
-    .setTitle(row.title)
-    .setDescription(row.body)
-    .setFooter({ text: BOT_NAME, iconURL: client.user.displayAvatarURL() })
-    .setTimestamp(new Date(row.updated_at));
+
+  const pages = paginate(renderContentBody(row.body));
+  return pages.map((page, i) => {
+    const e = new EmbedBuilder()
+      .setColor(0x5865F2)
+      .setDescription(page || '_(empty)_');
+    // Only the first page carries the title, and only the last the footer —
+    // repeating both on every page reads as four separate documents.
+    if (i === 0) e.setTitle(row.title);
+    if (i === pages.length - 1) {
+      e.setFooter({
+        text: pages.length > 1 ? `${BOT_NAME} · page ${i + 1}/${pages.length}` : BOT_NAME,
+        iconURL: client.user.displayAvatarURL(),
+      }).setTimestamp(new Date(row.updated_at));
+    } else {
+      e.setFooter({ text: `page ${i + 1}/${pages.length}` });
+    }
+    return e;
+  });
+}
+
+async function buildContentEmbed(guildId, key) {
+  const embeds = await buildContentEmbeds(guildId, key);
+  return embeds ? embeds[0] : null;
 }
 
 async function buildUsefulLinksEmbed(guildId) {
@@ -978,6 +1095,19 @@ async function claimStockAccount(interaction, type) {
     await interaction.user.send({ embeds: [embed] });
     delivered = true;
   } catch (_) { /* DMs closed — fall back below */ }
+
+  // Audit trail. Deliberately AFTER the delivery attempt so it can record
+  // whether the member actually received it, and deliberately not awaited into
+  // the reply path — logGeneration swallows its own failures, but a slow
+  // channel fetch should not push the interaction past its 3s window.
+  logGeneration(client, {
+    kind: 'account',
+    user: interaction.user,
+    what: stockTypeLabel(type),
+    remaining,
+    delivered,
+    source: interaction.isButton?.() ? 'panel button' : '/gensteam',
+  }).catch(() => {});
 
   if (delivered) {
     return interaction.reply({ content: '✅ Sent your account via DM! Check your messages.', flags: 64 });
@@ -2019,7 +2149,58 @@ const ownCommands = [
 ].map(c => c.toJSON());
 
 // Merge with support module commands
-const allCommands = [...ownCommands, ...support.supportCommands, ...smsCommands.map(c => c.toJSON())];
+const allCommands = [
+  ...ownCommands, ...support.supportCommands,
+  ...smsCommands.map(c => c.toJSON()),
+  ...manualCommands.map(c => c.toJSON()),
+];
+
+// ─── Command lockdown ─────────────────────────────────────────────────────────
+// Every staff command was gated at RUNTIME by hasAccess() and by nothing else,
+// so 44 of the 66 registered commands were listed in the slash picker of every
+// member in the server. `/config`, `/web-promote`, `/clearstock`,
+// `/web-balance`, `/leaveguild` — all of them typeable by anyone, all of them
+// answering "❌ No permission." A refusal is not concealment: it still tells a
+// stranger the command exists, what it takes, and that there is something worth
+// finding a way into.
+//
+// The gate is `default_member_permissions: "0"`, not a permission bit. A bit
+// like ManageGuild would have LOCKED OUT THIS SERVER'S OWN STAFF: STAFF_ROLE_ID
+// is `1242149320095170570` ("Ticket Staff"), and that role holds none of the
+// management permissions — hasAccess() lets it through on role id alone. "0"
+// hides the command from everyone except members with Administrator, and leaves
+// the owner free to hand any role back a specific command in
+// Server Settings → Integrations → UH Services. That is the only mechanism
+// Discord offers here: per-command permission overwrites can only be written by
+// a user bearer token with `applications.commands.permissions.update`, never by
+// a bot token, so the bot cannot grant them for you.
+//
+// PUBLIC is an allow-list on purpose. A command added later and forgotten about
+// arrives LOCKED, which is the failure that costs nothing.
+const PUBLIC_COMMANDS = new Set([
+  'commands',            // the help list itself
+  'downloads',           // buyers fetch their own files
+  'redeem',              // buyer redeems a key they were given
+  'claim-customer',      // buyer claims the customer role with invoice + email
+  'stock',               // read-only stock count
+  'gensteam',            // the generator members are here for
+  'gennumber',           // ditto, SMS
+  'show-voucher-stats',  // invite leaderboard; the `public:` flag is staff-gated inside
+]);
+
+let _lockedCount = 0;
+for (const c of allCommands) {
+  if (PUBLIC_COMMANDS.has(c.name)) {
+    // Explicitly clear rather than leave undefined: a command that is meant to
+    // be public should say so in the payload, so a later default cannot quietly
+    // hide it.
+    c.default_member_permissions = null;
+    continue;
+  }
+  c.default_member_permissions = '0';
+  _lockedCount++;
+}
+console.log(`[Lockdown] ${_lockedCount}/${allCommands.length} commands hidden from non-admins; public: ${[...PUBLIC_COMMANDS].join(', ')}`);
 
 // ─── Ready ────────────────────────────────────────────────────────────────────
 client.once('ready', async () => {
@@ -2131,6 +2312,28 @@ client.once('ready', async () => {
     await rest.put(Routes.applicationCommands(CLIENT_ID), { body: allCommands });
     console.log('✅ Global slash commands registered');
   } catch (err) { console.error('Failed to register commands:', err); }
+
+  // ─── Administrator audit ────────────────────────────────────────────────────
+  // The lockdown above hides staff commands from everyone except Administrator,
+  // and hasAccess() lets Administrator through unconditionally. Both are only as
+  // tight as the list of roles that hold that permission — and in this server
+  // that list includes a role named "VIP", which is handed out as a perk. Every
+  // VIP can therefore run /config, /web-promote and /web-balance adjust.
+  //
+  // Changing who holds Administrator is the OWNER'S call, not the bot's: taking
+  // a permission away from a role is exactly the kind of silent, hard-to-notice
+  // change that breaks a server. So print it, once, every boot, and let it be
+  // seen.
+  for (const [, guild] of client.guilds.cache) {
+    try {
+      const admins = [...guild.roles.cache.values()]
+        .filter(r => r.permissions.has(PermissionFlagsBits.Administrator) && !r.managed && r.id !== guild.id)
+        .map(r => `${r.name} (${r.id})`);
+      if (admins.length) {
+        console.log(`[Access audit] ${guild.name}: ${admins.length} non-bot role(s) hold ADMINISTRATOR and can run every staff command → ${admins.join(', ')}`);
+      }
+    } catch (e) { /* a guild we cannot read roles for tells us nothing either way */ }
+  }
 
   // Start 2FA auth server
   startAuthServer(client, { issueKey: issueKeyAndNotify, invalidateGuildSettings });
@@ -2338,6 +2541,11 @@ client.on('interactionCreate', async interaction => {
       // becomes an unhandled rejection — which Node 20 turns into process exit.
       return await handleSMSInteraction(interaction, client);
     }
+    // Manual order delivery — owns its command, its duration select, its modal
+    // and its own autocomplete, so it must be dispatched BEFORE the generic
+    // autocomplete branch below (which only knows about /setdownload and would
+    // otherwise let this one time out).
+    if (await handleManualInteraction(interaction, client)) return;
     // Autocomplete
     if (interaction.isAutocomplete() && interaction.commandName === 'setdownload') {
       const focused = interaction.options.getFocused().toLowerCase();
@@ -2370,7 +2578,7 @@ client.on('interactionCreate', async interaction => {
             { name: '🎫 Support Tickets', value: '`/panel` — Post the support panel\n`/clearlogs` — Clear ticket log channel\n`/reply` — Reply to a user\'s ticket', inline: false },
             { name: '📝 Vouches', value: '`/setupvouch` — Post the Leave a Vouch panel\n`/exportvouches` — Download a backup of all vouches\n`/importvouches` — Restore vouches from a backup file, or `source: website`', inline: false },
             { name: '🎮 Steam Stock', value: '`/gensteam [type]` — Generate a Steam account\n`/stock` — Check available stock\n`/addstock` — Staff: add accounts to stock', inline: false },
-            { name: '💳 Shop Payment Backend', value: '`/config set|view` — Staff: configure payment backend\n`/order lookup|forceconfirm` — Staff: look up/confirm an order\n`/shopstock add|check` — Staff: manage shop product stock', inline: false },
+            { name: '💳 Shop Payment Backend', value: '`/config set|view` — Staff: configure payment backend\n`/order lookup|forceconfirm` — Staff: look up/confirm an order\n`/shopstock add|check` — Staff: manage shop product stock\n`/manual-order-delivery send` — Staff: hand-deliver a product and record a real order\n`/manual-order-delivery pending` — Staff: approve a website order that never settled', inline: false },
             { name: '📲 SMS Gen', value: '`/gennumber` — Generate a phone number (private dropdowns)\n`/post-smsgen` — Staff: Post the SMS Gen panel\n`/set-smspool-api` — Admin: Set SMSPool.net key\n`/set-5sim-api` — Admin: Set 5sim.net key', inline: false },
             { name: '🛡️ Anti-Scam (Prefix)', value: '`!bothelp` — Anti-scam command list\n`!manage` — Management panel\n`!scamcheck <text>` — Test message\n`!warnings / !clearwarnings` — Warning system\n`!nuke` — Wipe channel\n`!addlink / !removelink / !listlinks` — Manage banned links\n`!addword / !removeword` — Manage profanity filter', inline: false },
             { name: '💬 DM Commands', value: '`!close` — Close your support ticket (type in DM)', inline: false },
@@ -3322,6 +3530,17 @@ client.on('interactionCreate', async interaction => {
           generated.push(key);
         }
 
+        // Keys grant a paid role, so who minted them and for what is exactly
+        // the kind of thing the gen log exists to answer. The key STRINGS stay
+        // out of it — anyone who can read the channel could redeem one.
+        logGeneration(client, {
+          kind: 'key',
+          user: interaction.user,
+          what: `${amount} × ${role.name}`,
+          detail: `Duration: ${durationLabel}`,
+          source: '/genkey',
+        }).catch(() => {});
+
         return interaction.reply({
           content: `✅ Generated **${amount}** key${amount === 1 ? '' : 's'} for **${role.name}** (${durationLabel}):\n` +
             generated.map(k => `\`${k}\``).join('\n') +
@@ -3475,8 +3694,17 @@ client.on('interactionCreate', async interaction => {
 
           const existing = await getGuildContent(interaction.guild.id, key);
           const title = existing?.title || meta.defaultTitle;
-          await setGuildContent(interaction.guild.id, key, title, body.slice(0, 4000), interaction.user.id);
-          return interaction.editReply({ content: `✅ ${meta.label} updated from file. Run \`/post-${key}\` to post it.` });
+          // 4000 was the modal's limit leaking into the file path. A file has
+          // no such ceiling and the renderer pages anything over one embed, so
+          // truncating here threw away terms the operator meant to publish.
+          // 40k is a sanity bound, not a format limit.
+          await setGuildContent(interaction.guild.id, key, title, body.slice(0, 40000), interaction.user.id);
+          const preview = await buildContentEmbeds(interaction.guild.id, key);
+          return interaction.editReply({
+            content: `✅ ${meta.label} updated from file (${body.length} chars → ${preview.length} page(s)). ` +
+              `This is exactly how \`/post-${key}\` will look:`,
+            embeds: preview.slice(0, 10),
+          });
         }
 
         // No file — open a popup form instead
@@ -3501,14 +3729,30 @@ client.on('interactionCreate', async interaction => {
         const key = cmd.replace('post-', '');
         const meta = CONTENT_TYPES[key];
 
-        const embed = await buildContentEmbed(interaction.guild.id, key);
-        if (!embed) {
+        const embeds = await buildContentEmbeds(interaction.guild.id, key);
+        if (!embeds) {
           return interaction.reply({ content: `❌ No ${meta.label} content set yet. Run \`/set-${key}\` first.`, flags: 64 });
         }
 
         const channel = interaction.options.getChannel('channel') || interaction.channel;
-        await channel.send({ embeds: [embed] });
-        await interaction.reply({ content: `✅ Posted ${meta.label} in <#${channel.id}>.`, flags: 64 });
+        // 6000 characters across all embeds in one message is a hard Discord
+        // limit, and exceeding it rejects the WHOLE message — the terms would
+        // post as nothing at all. Send in runs that fit instead.
+        const messages = [];
+        let run = [], runLen = 0;
+        for (const e of embeds) {
+          const len = (e.data.description || '').length + (e.data.title || '').length + 100;
+          if (run.length && (runLen + len > 5500 || run.length >= 10)) { messages.push(run); run = []; runLen = 0; }
+          run.push(e); runLen += len;
+        }
+        if (run.length) messages.push(run);
+        for (const m of messages) await channel.send({ embeds: m });
+
+        await interaction.reply({
+          content: `✅ Posted ${meta.label} in <#${channel.id}>` +
+            (embeds.length > 1 ? ` — ${embeds.length} pages over ${messages.length} message(s).` : '.'),
+          flags: 64,
+        });
         return;
       }
 
@@ -4555,7 +4799,15 @@ client.on('interactionCreate', async interaction => {
         const title = interaction.fields.getTextInputValue('content_title');
         const body  = interaction.fields.getTextInputValue('content_body');
         await setGuildContent(interaction.guild.id, key, title, body, interaction.user.id);
-        return interaction.reply({ content: `✅ ${CONTENT_TYPES[key].label} updated. Run \`/post-${key}\` to post it.`, flags: 64 });
+        // Show the rendered result, not just a tick. "It saved" was never in
+        // doubt — what the operator could not see was what it would look like,
+        // which is the thing that was actually wrong.
+        const preview = await buildContentEmbeds(interaction.guild.id, key);
+        return interaction.reply({
+          content: `✅ ${CONTENT_TYPES[key].label} saved to the database. This is exactly how \`/post-${key}\` will look:`,
+          embeds: preview.slice(0, 10),
+          flags: 64,
+        });
       }
 
       // Update modal
