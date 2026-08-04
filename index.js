@@ -52,6 +52,225 @@ const translate = require('./modules/translate');
 const { offerImageUpload } = require('./modules/imageAttach');
 const { makeStaffRoleResolver } = require('./modules/staffRoles');
 const serverBackup = require('./modules/serverBackup');
+const mirror = require('./modules/mirror');
+
+// ─── Mirror relay state ───────────────────────────────────────────────────────
+// Three pieces of memory, all of them there to stop a loop or a stampede.
+//
+// mirrorRoutes  — src_channel_id → route rows. Rebuilt on write, not per
+//                 message: the lookup happens on EVERY message in every guild,
+//                 and a database round trip on that path turns a busy server
+//                 into a permanent query load for a feature nobody may be
+//                 using. A null cache means "not loaded yet", not "no routes".
+// mirrorPosted  — ids this bot posted as a mirror, so the fallback path (which
+//                 posts as the bot rather than through a webhook, and so has
+//                 no webhookId to recognise it by) cannot feed itself.
+// mirrorWebhooks— ids of the webhooks we relay THROUGH, so a mirror arriving
+//                 in the destination is never mistaken for a new post.
+let mirrorRoutes = null;
+const mirrorPosted = mirror.makeRecentSet(2000);
+const mirrorWebhookIds = new Set();
+
+async function loadMirrorRoutes(force = false) {
+  if (mirrorRoutes && !force) return mirrorRoutes;
+  const next = new Map();
+  try {
+    const { rows } = await db.query('SELECT * FROM mirror_routes WHERE enabled ORDER BY id');
+    for (const r of rows) {
+      if (!next.has(r.src_channel_id)) next.set(r.src_channel_id, []);
+      next.get(r.src_channel_id).push(r);
+      if (r.webhook_id) mirrorWebhookIds.add(r.webhook_id);
+    }
+  } catch (e) {
+    // Leave the previous cache in place. A Supabase blip should degrade to
+    // "mirroring with the routes we already knew about", not to every message
+    // in the server hitting an empty map and quietly stopping.
+    console.error('[mirror] could not load routes:', e.message);
+    return mirrorRoutes || next;
+  }
+  mirrorRoutes = next;
+  return mirrorRoutes;
+}
+
+// Resolved webhook objects, by destination channel id. Fetching webhooks is a
+// rate-limited call and this runs per mirrored message, so it happens once per
+// channel per process life.
+const mirrorWebhookCache = new Map();
+const MIRROR_WEBHOOK_NAME = 'UH Mirror';
+
+/**
+ * The webhook to relay through, creating it if this is the first message down
+ * this route. Returns null when the bot cannot have one — no Manage Webhooks
+ * in the destination, or a channel type that does not take them — and the
+ * caller falls back to posting as itself. The fallback loses the source
+ * server's name and icon, which is cosmetic; posting nothing is not.
+ */
+async function mirrorWebhookFor(route, dstChannel) {
+  const key = dstChannel.id;
+  if (mirrorWebhookCache.has(key)) return mirrorWebhookCache.get(key);
+
+  // A thread cannot own a webhook — its parent does, and the send carries a
+  // threadId to say which thread inside it.
+  const holder = typeof dstChannel.isThread === 'function' && dstChannel.isThread()
+    ? dstChannel.parent : dstChannel;
+  if (!holder || typeof holder.fetchWebhooks !== 'function') {
+    mirrorWebhookCache.set(key, null);
+    return null;
+  }
+
+  try {
+    const hooks = await holder.fetchWebhooks();
+    let hook = route.webhook_id ? hooks.get(route.webhook_id) : null;
+    // Match on OUR webhook by name as well as by stored id: a route added
+    // before the id column was filled, or a webhook deleted and the row left
+    // behind, should reuse rather than pile up a second one on every restart.
+    if (!hook) {
+      hook = hooks.find(w => w.name === MIRROR_WEBHOOK_NAME
+        && w.owner && w.owner.id === client.user.id) || null;
+    }
+    if (!hook) hook = await holder.createWebhook({ name: MIRROR_WEBHOOK_NAME, reason: 'Cross-server mirror' });
+
+    if (hook && hook.id !== route.webhook_id) {
+      route.webhook_id = hook.id;
+      db.query('UPDATE mirror_routes SET webhook_id = $1 WHERE id = $2', [hook.id, route.id])
+        .catch(e => console.error('[mirror] could not save webhook id:', e.message));
+    }
+    if (hook) mirrorWebhookIds.add(hook.id);
+    mirrorWebhookCache.set(key, hook);
+    return hook;
+  } catch (e) {
+    console.error(`[mirror] no webhook for ${dstChannel.id}: ${e.message}`);
+    mirrorWebhookCache.set(key, null);   // don't retry per message
+    return null;
+  }
+}
+
+/**
+ * Relay one message down every route out of its channel.
+ *
+ * Each route is attempted independently. A destination the bot has been kicked
+ * from must not stop a message reaching the three destinations that are still
+ * fine — and this is the hot path for every message in every guild, so
+ * nothing in here is allowed to throw.
+ */
+async function relayMessage(message) {
+  const routes = (await loadMirrorRoutes()).get(message.channel.id);
+  if (!routes || !routes.length) return;
+
+  const ctx = { mirrorWebhookIds, postedByMirror: mirrorPosted };
+  const srcGuild = message.guild;
+
+  for (const route of routes) {
+    const verdict = mirror.shouldMirror(message, { botOnly: route.bot_only !== false }, ctx);
+    if (!verdict.ok) continue;
+
+    try {
+      const dst = await client.channels.fetch(route.dst_channel_id).catch(() => null);
+      if (!dst) { console.error(`[mirror] route ${route.id}: destination channel is gone`); continue; }
+
+      const payload = mirror.buildMirrorPayload(message, {
+        allowPings: !!route.allow_pings,
+        username: srcGuild ? srcGuild.name : undefined,
+        avatarURL: srcGuild && typeof srcGuild.iconURL === 'function' ? srcGuild.iconURL({ size: 128 }) : undefined,
+      });
+
+      const hook = await mirrorWebhookFor(route, dst);
+      let sent;
+      if (hook) {
+        const threadId = typeof dst.isThread === 'function' && dst.isThread() ? dst.id : undefined;
+        sent = await hook.send({ ...payload, ...(threadId ? { threadId } : {}) });
+      } else {
+        sent = await dst.send(mirror.toChannelPayload(payload));
+      }
+
+      // Before anything else can observe it. Without a webhook this message
+      // was posted by the bot itself, and if the destination is also a source
+      // its own messageCreate is already on its way here.
+      if (sent && sent.id) {
+        mirrorPosted.add(sent.id);
+        db.query(
+          `INSERT INTO mirror_messages (src_message_id, route_id, dst_message_id)
+           VALUES ($1, $2, $3) ON CONFLICT (src_message_id, route_id) DO NOTHING`,
+          [message.id, route.id, sent.id])
+          .catch(e => console.error('[mirror] could not record copy:', e.message));
+      }
+    } catch (e) {
+      // The commonest cause is a file: an attachment over the destination's
+      // upload limit rejects the whole message. A mirrored post without its
+      // image still says what happened; no post at all says nothing.
+      console.error(`[mirror] route ${route.id} failed: ${e.message}`);
+      try {
+        const dst = await client.channels.fetch(route.dst_channel_id).catch(() => null);
+        if (!dst) continue;
+        const bare = mirror.toChannelPayload(mirror.buildMirrorPayload(message, { allowPings: !!route.allow_pings }));
+        delete bare.files;
+        if (!bare.content && !bare.embeds.length) continue;
+        const sent = await dst.send(bare);
+        if (sent && sent.id) mirrorPosted.add(sent.id);
+      } catch (e2) {
+        console.error(`[mirror] route ${route.id} fallback also failed: ${e2.message}`);
+      }
+    }
+  }
+}
+
+/**
+ * An edit in the source follows into every copy. Without this a corrected post
+ * stays wrong in the other server — which is worse than never mirroring it,
+ * because the second server is then reading something the first has retracted.
+ */
+async function relayEdit(message) {
+  let rows;
+  try {
+    ({ rows } = await db.query(
+      `SELECT m.dst_message_id, r.* FROM mirror_messages m
+         JOIN mirror_routes r ON r.id = m.route_id
+        WHERE m.src_message_id = $1`, [message.id]));
+  } catch (e) { console.error('[mirror] edit lookup failed:', e.message); return; }
+  if (!rows.length) return;
+
+  for (const row of rows) {
+    try {
+      const dst = await client.channels.fetch(row.dst_channel_id).catch(() => null);
+      if (!dst) continue;
+      const payload = mirror.buildMirrorPayload(message, { allowPings: !!row.allow_pings });
+      // Files are not re-sent on an edit: the copy already carries them, and
+      // Discord would treat the edit as a fresh attachment list and duplicate
+      // every one of them.
+      delete payload.files;
+      const hook = mirrorWebhookCache.get(dst.id);
+      if (hook) {
+        const threadId = typeof dst.isThread === 'function' && dst.isThread() ? dst.id : undefined;
+        await hook.editMessage(row.dst_message_id, { ...mirror.toChannelPayload(payload), ...(threadId ? { threadId } : {}) });
+      } else {
+        const m = await dst.messages.fetch(row.dst_message_id).catch(() => null);
+        if (m) await m.edit(mirror.toChannelPayload(payload));
+      }
+    } catch (e) { console.error(`[mirror] could not follow edit on route ${row.id}: ${e.message}`); }
+  }
+}
+
+/** A deleted post is retracted everywhere it was copied to. */
+async function relayDelete(message) {
+  let rows;
+  try {
+    ({ rows } = await db.query(
+      `SELECT m.dst_message_id, r.dst_channel_id, r.id FROM mirror_messages m
+         JOIN mirror_routes r ON r.id = m.route_id
+        WHERE m.src_message_id = $1`, [message.id]));
+  } catch (e) { console.error('[mirror] delete lookup failed:', e.message); return; }
+  if (!rows.length) return;
+
+  for (const row of rows) {
+    try {
+      const dst = await client.channels.fetch(row.dst_channel_id).catch(() => null);
+      if (!dst) continue;
+      const m = await dst.messages.fetch(row.dst_message_id).catch(() => null);
+      if (m) await m.delete();
+    } catch (e) { console.error(`[mirror] could not follow delete on route ${row.id}: ${e.message}`); }
+  }
+  db.query('DELETE FROM mirror_messages WHERE src_message_id = $1', [message.id]).catch(() => {});
+}
 
 // Appends the language dropdown to a post. Every caller is a message the whole
 // server reads, which is why the dropdown answers EPHEMERALLY — see
@@ -2343,6 +2562,26 @@ const ownCommands = [
     .addSubcommand(sub => sub.setName('delete').setDescription('Delete a saved snapshot')
       .addStringOption(o => o.setName('id').setDescription('Snapshot ID (from /serverbackup list)').setRequired(true))),
 
+  // ─── Cross-server mirroring ────────────────────────────────────────────────
+  // `follow` is listed first on purpose: for an announcement channel it is
+  // strictly the better answer, because Discord does the delivery and there is
+  // nothing to keep running. `add` is for everything it does not cover.
+  new SlashCommandBuilder().setName('mirror').setDescription('Admin: Copy what this server posts into another server')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addSubcommand(sub => sub.setName('follow').setDescription('Announcement channels: let another server follow this one — no relay needed')
+      .addChannelOption(o => o.setName('from').setDescription('The announcement channel here').setRequired(true))
+      .addStringOption(o => o.setName('to_channel_id').setDescription('Channel ID in the other server').setRequired(true)))
+    .addSubcommand(sub => sub.setName('add').setDescription('Relay a channel here into a channel in another server')
+      .addChannelOption(o => o.setName('from').setDescription('The channel here to copy FROM').setRequired(true))
+      .addStringOption(o => o.setName('to_channel_id').setDescription('Channel ID in the other server to copy INTO').setRequired(true))
+      .addBooleanOption(o => o.setName('include_humans').setDescription('Also copy messages people write (default: bot posts only)').setRequired(false))
+      .addBooleanOption(o => o.setName('allow_pings').setDescription('Let @everyone in a copied post ping the other server (default: no)').setRequired(false)))
+    .addSubcommand(sub => sub.setName('list').setDescription('Show every relay set up from this server'))
+    .addSubcommand(sub => sub.setName('remove').setDescription('Stop a relay')
+      .addStringOption(o => o.setName('id').setDescription('Route ID (from /mirror list)').setRequired(true)))
+    .addSubcommand(sub => sub.setName('test').setDescription('Send a test post down every relay from a channel')
+      .addChannelOption(o => o.setName('from').setDescription('The source channel to test').setRequired(true))),
+
   // ─── Shop payment backend (ported from p-bot) ──────────────────────────────
   new SlashCommandBuilder().setName('config').setDescription('Staff: Configure the shop payment backend')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
@@ -2519,6 +2758,16 @@ client.once('ready', async () => {
   // be judged against the hardcoded defaults, so an allow-listed gif link would
   // still get deleted for the first few seconds after every deploy.
   try { await antiscam.loadModLists(); } catch (e) { console.error('[AntiScam] load failed:', e.message); }
+
+  // Mirror routes, before the first message can arrive. Loading them lazily
+  // would leave the edit and delete listeners unable to tell "no mirrors" from
+  // "not loaded yet", so an edit made in the first seconds after a deploy would
+  // never reach the copy.
+  try {
+    const routes = await loadMirrorRoutes(true);
+    const n = [...routes.values()].reduce((a, r) => a + r.length, 0);
+    if (n) console.log(`[Mirror] ${n} route(s) across ${routes.size} source channel(s)`);
+  } catch (e) { console.error('[Mirror] route load failed:', e.message); }
 
   // Resume SMS orders that were still open when the process died. Each one
   // represents provider credit already spent, so leaving them unpolled means
@@ -2817,6 +3066,14 @@ client.on('messageCreate', async message => {
         await support.handleDM(message, client);
         return;
       }
+      // Cross-server mirroring. FIRST, and in its own try/catch, because every
+      // branch below this one can return: the counting channel returns, an
+      // anti-scam prefix command returns. A relay placed after them would work
+      // for most channels and silently do nothing in the ones that happen to
+      // be something else as well.
+      try { await relayMessage(message); }
+      catch (e) { console.error('[mirror] relay error:', e && e.message); }
+
       // Counting game (dedicated channel — skip other message processing)
       const msgSettings = await getGuildSettings(message.guild.id);
       if (msgSettings.countingChannelId && message.channel.id === msgSettings.countingChannelId) {
@@ -2836,6 +3093,36 @@ client.on('messageCreate', async message => {
     // Log and carry on. A broken message must not take the bot down.
     console.error('[messageCreate] error:', err && err.stack ? err.stack : err);
   }
+});
+
+// An edit or a delete in a mirrored channel follows into the copies. Both are
+// keyed on the message id in the database rather than on the route cache, so
+// they still work for a copy made before the last restart.
+//
+// Only worth the round trip when a route exists at all — mirrorRoutes is null
+// until the first message loads it, and an empty map afterwards on a bot with
+// no mirrors set up, which is the case that must stay free.
+const anyMirrors = () => mirrorRoutes && mirrorRoutes.size > 0;
+
+client.on('messageUpdate', async (_old, message) => {
+  try {
+    if (!anyMirrors() || !message || !message.guild) return;
+    if (!mirrorRoutes.has(message.channelId)) return;
+    // A partial has no embeds or content to copy — fetching it is the only way
+    // to know what it now says.
+    if (message.partial) { message = await message.fetch().catch(() => null); if (!message) return; }
+    await relayEdit(message);
+  } catch (e) { console.error('[messageUpdate] mirror error:', e && e.message); }
+});
+
+client.on('messageDelete', async (message) => {
+  try {
+    if (!anyMirrors() || !message) return;
+    // A deleted message is usually a partial — its channelId survives even
+    // when nothing else does, which is all this needs.
+    if (!mirrorRoutes.has(message.channelId)) return;
+    await relayDelete(message);
+  } catch (e) { console.error('[messageDelete] mirror error:', e && e.message); }
 });
 
 // ─── Interactions ─────────────────────────────────────────────────────────────
@@ -2899,6 +3186,7 @@ client.on('interactionCreate', async interaction => {
             { name: '📣 Updates & Status', value: '`/postupdate` — Post a product update\n`/statusupdate` — Post a status update\n`/announce` — Send a custom announcement', inline: false },
             { name: '🌐 Server Setup', value: '`/setwebsite` — Pin website URL\n`/setupreseller` — Post reseller panel\n`/setresellerlinks` — Update reseller button links\n`/postimage` — Post an image', inline: false },
             { name: '💾 Server Snapshots', value: '`/serverbackup create` — Save the server\'s roles, channels & permissions\n`/serverbackup list|view|export` — Browse or download a snapshot\n`/serverbackup restore` — Rebuild from one (never deletes anything)', inline: false },
+            { name: '🔁 Cross-Server Mirroring', value: '`/mirror follow` — Announcement channels: let another server follow this one (Discord delivers it)\n`/mirror add` — Any channel: relay its posts into another server\n`/mirror list|remove|test` — Manage the relays', inline: false },
             { name: '🎫 Support Tickets', value: '`/panel` — Post the support panel\n`/clearlogs` — Clear ticket log channel\n`/reply` — Reply to a user\'s ticket', inline: false },
             { name: '📝 Vouches', value: '`/setupvouch` — Post the Leave a Vouch panel\n`/exportvouches` — Download a backup of all vouches\n`/importvouches` — Restore vouches from a backup file, or `source: website`', inline: false },
             { name: '🎮 Steam Stock', value: '`/gensteam [type]` — Generate a Steam account\n`/stock` — Check available stock\n`/addstock` — Staff: add accounts to stock', inline: false },
@@ -4307,6 +4595,212 @@ client.on('interactionCreate', async interaction => {
               new ButtonBuilder().setCustomId('sbrestore_cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
             )],
           });
+        }
+
+        return interaction.editReply({ content: '❌ Unknown subcommand.' });
+      }
+
+      // ── /mirror ────────────────────────────────────────────────────────────
+      if (cmd === 'mirror') {
+        if (!interaction.guild) return interaction.reply({ content: '❌ Server only.', flags: 64 });
+        if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
+          return interaction.reply({ content: '❌ Administrator only.', flags: 64 });
+        }
+        const sub = interaction.options.getSubcommand();
+        await interaction.deferReply({ flags: 64 });
+
+        // A relay points content INTO someone else's server. Being an admin
+        // here is permission to send from this server; it is not permission to
+        // put things in that one. So the destination is checked from the
+        // destination's side: this bot must be in it, and the person asking
+        // must be an admin there too.
+        //
+        // Without this, an admin of any server the bot joins could pipe an
+        // unlimited feed into any other server it is in — including this one.
+        const resolveDestination = async (channelId) => {
+          if (!/^\d{17,20}$/.test(channelId)) return { error: 'That is not a channel ID. Right-click a channel → Copy Channel ID.' };
+          const ch = await client.channels.fetch(channelId).catch(() => null);
+          if (!ch) return { error: 'I cannot see that channel. Either the ID is wrong or I am not in that server.' };
+          if (!ch.guild) return { error: 'That is not a channel in a server.' };
+          if (typeof ch.isTextBased !== 'function' || !ch.isTextBased()) return { error: 'That channel cannot receive posts.' };
+
+          const me = await ch.guild.members.fetchMe().catch(() => null);
+          const perms = me ? ch.permissionsFor(me) : null;
+          if (!perms || !perms.has(PermissionFlagsBits.SendMessages)) {
+            return { error: `I cannot post in **#${ch.name}** (${ch.guild.name}). Give me Send Messages there first.` };
+          }
+
+          const them = await ch.guild.members.fetch(interaction.user.id).catch(() => null);
+          if (!them) return { error: `You are not in **${ch.guild.name}**. Only someone who administrates the receiving server can point a mirror at it.` };
+          if (!them.permissions.has(PermissionFlagsBits.Administrator)
+              && !them.permissions.has(PermissionFlagsBits.ManageGuild)) {
+            return { error: `You are not an admin of **${ch.guild.name}**. Being an admin here does not make it your call what gets posted there.` };
+          }
+          return { channel: ch, webhookable: !!(perms && perms.has(PermissionFlagsBits.ManageWebhooks)) };
+        };
+
+        // ── follow: Discord does the delivery ────────────────────────────────
+        if (sub === 'follow') {
+          const from = interaction.options.getChannel('from');
+          const dest = await resolveDestination(interaction.options.getString('to_channel_id').trim());
+          if (dest.error) return interaction.editReply({ content: `❌ ${dest.error}` });
+
+          if (from.type !== ChannelType.GuildAnnouncement) {
+            return interaction.editReply({ content:
+              `❌ **#${from.name}** is not an Announcement channel, and Follow only works on those.\n\n` +
+              'Two ways forward:\n' +
+              `• Channel Settings on **#${from.name}** → turn on **Announcement Channel**, then run this again. Discord then delivers every published post itself — nothing to keep running, no permissions to keep granted.\n` +
+              '• Or use `/mirror add`, which relays through me instead. Works on any channel, but only while I am online.' });
+          }
+          try {
+            await from.addFollower(dest.channel.id, `Mirror requested by ${interaction.user.tag}`);
+          } catch (e) {
+            return interaction.editReply({ content:
+              `❌ Discord refused the follow: ${e.message}\n\nI need **Manage Webhooks** in **#${dest.channel.name}** (${dest.channel.guild.name}) — that is what a follow creates.` });
+          }
+          return interaction.editReply({ embeds: [new EmbedBuilder()
+            .setColor(0x2ecc71).setTitle('✅ Following')
+            .setDescription(`**#${from.name}** → **#${dest.channel.name}** in **${dest.channel.guild.name}**`)
+            .addFields(
+              { name: 'How this one works', value: 'Discord delivers it, not me. It keeps working if I go offline, and it costs nothing to run.' },
+              { name: 'The catch', value: 'Only posts that are **Published** get through — someone has to press Publish on each one, or the post has to be made by something that publishes automatically. Posts made before now are not sent.' },
+              { name: 'To undo', value: `Delete the webhook Discord made in **#${dest.channel.name}** (Channel Settings → Integrations).` })] });
+        }
+
+        // ── add: relay through the bot ───────────────────────────────────────
+        if (sub === 'add') {
+          const from = interaction.options.getChannel('from');
+          if (typeof from.isTextBased !== 'function' || !from.isTextBased()) {
+            return interaction.editReply({ content: `❌ **#${from.name}** is not a channel messages get posted in.` });
+          }
+          const dest = await resolveDestination(interaction.options.getString('to_channel_id').trim());
+          if (dest.error) return interaction.editReply({ content: `❌ ${dest.error}` });
+
+          // The loop check, before the row exists. Named rather than just
+          // refused: told "that would loop", an operator has to go find it.
+          let existing = [];
+          try { ({ rows: existing } = await db.query('SELECT * FROM mirror_routes WHERE enabled')); }
+          catch (_) { /* an empty list only ever makes this check weaker, never wrong */ }
+          const cycle = mirror.findCycle(existing, from.id, dest.channel.id);
+          if (cycle) {
+            const path = cycle.map(id => `<#${id}>`).join(' → ');
+            return interaction.editReply({ content:
+              `❌ That would make a loop:\n${path}\n\nThe two servers would post at each other until I am rate-limited off Discord, which stops every other command as well.` });
+          }
+
+          const botOnly = interaction.options.getBoolean('include_humans') !== true;
+          const allowPings = interaction.options.getBoolean('allow_pings') === true;
+          let row;
+          try {
+            ({ rows: [row] } = await db.query(
+              `INSERT INTO mirror_routes (src_guild_id, src_channel_id, dst_guild_id, dst_channel_id, bot_only, allow_pings, created_by)
+               VALUES ($1,$2,$3,$4,$5,$6,$7)
+               ON CONFLICT (src_channel_id, dst_channel_id) DO UPDATE
+                 SET bot_only = EXCLUDED.bot_only, allow_pings = EXCLUDED.allow_pings, enabled = true
+               RETURNING *`,
+              [interaction.guild.id, from.id, dest.channel.guild.id, dest.channel.id, botOnly, allowPings, interaction.user.id]));
+          } catch (e) {
+            return interaction.editReply({ content: `❌ Could not save the route: ${e.message}` });
+          }
+          await loadMirrorRoutes(true);
+          mirrorWebhookCache.delete(dest.channel.id);
+
+          const notes = [];
+          notes.push(botOnly
+            ? 'Only posts **I** make are copied. Messages people write are left here.'
+            : '**Every** message in this channel is copied, including ones people write.');
+          notes.push(allowPings
+            ? '`@everyone` in a copied post **will** ping the other server.'
+            : '`@everyone` in a copied post is copied as text but **will not ping** the other server.');
+          if (!dest.webhookable) {
+            notes.push(`I do not have **Manage Webhooks** in **#${dest.channel.name}**, so copies will be posted under my own name instead of **${interaction.guild.name}**\'s. Grant it and they will wear the right identity.`);
+          }
+          notes.push('Buttons that only mean something in this server are removed on the way over. The translate dropdown is kept — it works anywhere.');
+          notes.push('Edits and deletions here follow into the copy. Posts made before now are not sent.');
+
+          return interaction.editReply({ embeds: [new EmbedBuilder()
+            .setColor(0x2ecc71).setTitle('✅ Mirror added')
+            .setDescription(`**#${from.name}** → **#${dest.channel.name}** in **${dest.channel.guild.name}**\nRoute \`#${row.id}\``)
+            .addFields({ name: 'What this does', value: notes.map(n => `• ${n}`).join('\n').slice(0, 1024) })
+            .setFooter({ text: 'This relay only runs while I am online. /mirror test sends one through now.' })] });
+        }
+
+        // ── list ─────────────────────────────────────────────────────────────
+        if (sub === 'list') {
+          let rows;
+          try {
+            ({ rows } = await db.query(
+              'SELECT * FROM mirror_routes WHERE src_guild_id = $1 OR dst_guild_id = $1 ORDER BY id',
+              [interaction.guild.id]));
+          } catch (e) { return interaction.editReply({ content: `❌ Could not read the routes: ${e.message}` }); }
+          if (!rows.length) {
+            return interaction.editReply({ content:
+              'No mirrors set up.\n\n`/mirror follow` — announcement channels, delivered by Discord itself.\n`/mirror add` — any channel, relayed by me.' });
+          }
+          const out = rows.map(r => {
+            const dir = r.src_guild_id === interaction.guild.id ? 'out' : 'in';
+            return `${dir === 'out' ? '📤' : '📥'} ${mirror.describeRoute(r, id => `<#${id}>`)}`;
+          });
+          return interaction.editReply({ embeds: [new EmbedBuilder()
+            .setColor(0x5865f2).setTitle('🔁 Mirrors')
+            .setDescription(out.join('\n').slice(0, 4000))
+            .setFooter({ text: '📤 leaves this server • 📥 arrives here • /mirror remove id:<ID> stops one' })] });
+        }
+
+        // ── remove ───────────────────────────────────────────────────────────
+        if (sub === 'remove') {
+          const id = interaction.options.getString('id').replace(/^#/, '').trim();
+          if (!/^\d+$/.test(id)) return interaction.editReply({ content: '❌ That is not a route ID. `/mirror list` shows them.' });
+          let row;
+          try {
+            // Either end can stop a mirror. The receiving server especially:
+            // being unable to turn off an inbound feed would make this a way
+            // to spam a server permanently.
+            ({ rows: [row] } = await db.query(
+              `DELETE FROM mirror_routes
+                WHERE id = $1 AND (src_guild_id = $2 OR dst_guild_id = $2) RETURNING *`,
+              [id, interaction.guild.id]));
+          } catch (e) { return interaction.editReply({ content: `❌ Could not remove it: ${e.message}` }); }
+          if (!row) return interaction.editReply({ content: '❌ No route with that ID involves this server.' });
+          await loadMirrorRoutes(true);
+          mirrorWebhookCache.delete(row.dst_channel_id);
+          return interaction.editReply({ content:
+            `✅ Stopped route \`#${row.id}\` — <#${row.src_channel_id}> no longer copies into <#${row.dst_channel_id}>.\n` +
+            'Copies already posted are left where they are; removing a mirror does not delete anything.' });
+        }
+
+        // ── test ─────────────────────────────────────────────────────────────
+        if (sub === 'test') {
+          const from = interaction.options.getChannel('from');
+          const routes = (await loadMirrorRoutes(true)).get(from.id) || [];
+          if (!routes.length) return interaction.editReply({ content: `❌ Nothing is mirrored out of **#${from.name}**.` });
+
+          // A real post through the real path — the point is to find out
+          // whether permissions and webhooks actually work, which a dry run
+          // by definition cannot tell you.
+          const probe = await from.send({ embeds: [new EmbedBuilder()
+            .setColor(0x5865f2).setTitle('🔁 Mirror test')
+            .setDescription(`Sent by ${interaction.user.tag} to check the relay. Safe to delete.`)
+            .setTimestamp()] }).catch(e => ({ error: e.message }));
+          if (probe.error) return interaction.editReply({ content: `❌ I cannot even post in **#${from.name}**: ${probe.error}` });
+
+          // The listener will have relayed it; give it a moment, then report
+          // what actually landed rather than what should have.
+          await new Promise(r => setTimeout(r, 2500));
+          let copies = [];
+          try {
+            ({ rows: copies } = await db.query(
+              'SELECT route_id, dst_message_id FROM mirror_messages WHERE src_message_id = $1', [probe.id]));
+          } catch (_) {}
+          const byRoute = new Map(copies.map(c => [String(c.route_id), c.dst_message_id]));
+          const lines = routes.map(r => byRoute.has(String(r.id))
+            ? `✅ \`#${r.id}\` → <#${r.dst_channel_id}>`
+            : `❌ \`#${r.id}\` → <#${r.dst_channel_id}> — nothing arrived, check the log`);
+          return interaction.editReply({ embeds: [new EmbedBuilder()
+            .setColor(byRoute.size === routes.length ? 0x2ecc71 : 0xe67e22)
+            .setTitle(`Mirror test — ${byRoute.size}/${routes.length} arrived`)
+            .setDescription(lines.join('\n').slice(0, 4000))
+            .setFooter({ text: 'The test post is still in the source channel — delete it and the copies go with it.' })] });
         }
 
         return interaction.editReply({ content: '❌ Unknown subcommand.' });
