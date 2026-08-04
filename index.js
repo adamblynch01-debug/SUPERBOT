@@ -203,6 +203,11 @@ async function syncVouchToWebsite(guildId, entry, externalId) {
       rating: entry.rating,
       body: entry.feedback || null,
       discord_id: entry.userId || null,
+      // Rendered by the storefront as cdn.discordapp.com/avatars/<id>/<hash>.
+      // Sent as the hash and not as a downloaded copy: an avatar url is
+      // unsigned and stable (unlike the attachment url below), so it tracks
+      // the member instead of freezing them at the day they vouched.
+      avatar_hash: entry.avatarHash || null,
       external_id: String(externalId || `${guildId}:${entry.id}:${entry.timestamp}`),
       // The screenshot is the half of a vouch people actually believe, so it
       // has to travel with it. Sent as a URL and downloaded on the other side:
@@ -5016,6 +5021,12 @@ client.on('interactionCreate', async interaction => {
           id: gData.count,
           userId: interaction.user.id,
           username: interaction.user.tag || interaction.user.username,
+          // The author's Discord avatar HASH, captured here because most
+          // people who leave a vouch have never logged into the website —
+          // there is no web_users row for the backend to read one off. Null
+          // for a member still on a default avatar. See
+          // backend/migrations/review_avatars.sql.
+          avatarHash: interaction.user.avatar || null,
           rating: ratingNum,
           feedback,
           imageUrl,
