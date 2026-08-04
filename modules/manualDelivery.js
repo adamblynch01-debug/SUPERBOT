@@ -306,7 +306,12 @@ async function submitKeys(interaction, client) {
       .addFields({ name: `📦 ${title}${qty > 1 ? ` ×${qty}` : ''}`.slice(0, 256), value: '```' + values.join('\n').slice(0, 1000) + '```' })
       .addFields({
         name: '🧾 Invoice',
-        value: `\`${data.invoice_no}\`\nKeep this. Use \`/claim-customer\` with it${data.email ? ` and \`${data.email}\`` : ''} to get your customer role, or quote it to staff about this order.`,
+        // No email on the order is no longer a dead end: the claim accepts the
+        // Discord account it was delivered to, and creates a site account from
+        // it if there is none. Round 29 item 6.
+        value: `\`${data.invoice_no}\`\nKeep this. Use \`/claim-customer\` with it`
+          + `${data.email ? ` and \`${data.email}\`` : ' (leave the email blank — this order was delivered to you on Discord)'}`
+          + ' to get your customer role and put this order on your uhservices.xyz account, or quote it to staff.',
       })
       .setFooter({ text: `Invoice: ${data.invoice_no}` })
       .setTimestamp();
@@ -330,7 +335,7 @@ async function submitKeys(interaction, client) {
       { name: 'Order ID', value: `${data.order_id}`, inline: true },
       { name: 'Source',   value: '🖐️ Manual (staff)', inline: true },
       { name: 'Buyer',    value: `<@${buyerId}> \`${buyerId}\``, inline: true },
-      { name: 'Email',    value: data.email || '— none, /claim-customer will not work', inline: true },
+      { name: 'Email',    value: data.email || '— none (claimable by Discord)', inline: true },
       { name: 'Charged',  value: money(data.total_cents), inline: true },
       { name: 'Keys from', value: data.claimed_from_stock ? '📦 Stock (consumed)' : '⌨️ Typed by staff', inline: true },
       { name: 'Delivered by', value: `<@${interaction.user.id}>`, inline: true },
@@ -348,9 +353,10 @@ async function submitKeys(interaction, client) {
          : `⚠️ **The DM did not send** (${dmErr}). The order is recorded — hand the value over yourself:\n\`\`\`${values.join('\n').slice(0, 800)}\`\`\``,
     data.claimed_from_stock ? `📦 ${qty} key(s) taken from stock.` : '⌨️ Values were typed, no stock consumed.',
   ];
-  // An order with no email is a real order the buyer cannot claim against, and
-  // saying so now is cheaper than the ticket it becomes later.
-  if (!data.email) lines.push('⚠️ No email on this order, so `/claim-customer` cannot verify it. Add one by re-running with the buyer\'s address if they need the customer role.');
+  // No longer a dead end — the claim falls back to the Discord account this was
+  // delivered to — but still worth saying, because it changes what the buyer has
+  // to do and there is no receipt going out to anybody.
+  if (!data.email) lines.push('ℹ️ No email on this order. The buyer claims it with `/claim-customer` leaving the email blank — it verifies against their Discord account and creates their site account if they have none. No receipt was emailed.');
   if (!ch) lines.push(`⚠️ Could not post to the manual delivery channel — set \`MANUAL_DELIVERY_CHANNEL_ID\`.`);
 
   return interaction.editReply(lines.join('\n'));

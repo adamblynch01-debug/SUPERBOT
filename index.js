@@ -1514,6 +1514,56 @@ async function grantCustomerRole(member, role) {
   }
 }
 
+// Round 29 item 6: "If user has not made an account and no email found. Have it
+// register with their discord account then. So they can redeem. So order can be
+// looked up by user also!!"
+//
+// Both claim paths — the /claim-customer command and the panel modal — now go
+// through here, because a claim does three things and only one of them used to
+// happen. It granted a role; the order itself was left unattached, so it showed
+// up in no list the buyer could open, and a buyer with no site account had no
+// list to open in the first place.
+//
+// POST /api/orders/claim proves ownership, creates the account from the Discord
+// identity if there is none, and attaches this order plus every other unowned
+// order carrying the same snowflake. The role is added AFTER it returns, so a
+// backend failure never leaves someone holding a role for an order that was not
+// attached.
+//
+// `email` is optional now. An order delivered by staff through
+// /manual-order-delivery can carry no address at all, which made the required
+// field impossible to satisfy and the order impossible to claim — even though
+// the Discord account named on it was already accepted as proof.
+//
+// `member` is who the claim is FOR, which on the staff path is not the caller.
+async function claimOrderFor(member, order_id, email) {
+  const res = await axios.post(`${BACKEND_URL}/api/orders/claim`, {
+    secret: API_SECRET,
+    order_id,
+    email: email || null,
+    discord_id: member.id,
+    // The account is created from these when there is none. global_name is the
+    // display name; `username` is the handle, and one of the two always exists.
+    discord_username: member.user?.globalName || member.user?.username || null,
+    discord_avatar: member.user?.avatar || null,
+  });
+  return res.data;
+}
+
+// The refusal a failed claim should read as. Kept next to the call because the
+// useful message depends on WHY it failed, and "that email does not match" is
+// nonsense advice for an order that has no email on it to match against.
+function claimRefusal(v, order_id, extra = '') {
+  const label = v.invoice_no || order_id;
+  if (!v.paid) return `❌ Invoice \`${label}\` is **${v.status}** — only paid/delivered orders qualify.`;
+  if (!v.has_email) {
+    return `❌ Invoice \`${label}\` was delivered by staff and carries no email address, so it can only be claimed`
+      + ` by the Discord account it was delivered to.${extra}`;
+  }
+  const hint = v.email_hint ? ` The address on this order looks like \`${v.email_hint}\`.` : '';
+  return `❌ That email does not match invoice \`${label}\`.${hint}${extra}`;
+}
+
 // Stricter gate for the commands that can move money or repoint where money
 // goes. /config writes BTC_XPUB, LTC_XPUB, PAYPAL_EMAIL, CASHAPP_CASHTAG and
 // the Gmail credentials through the backend using the shared API_SECRET — that
@@ -2124,7 +2174,11 @@ const ownCommands = [
       .addStringOption(o => o.setName('review_id').setDescription('Review ID (from /webreviews list)').setRequired(true))),
   new SlashCommandBuilder().setName('claim-customer').setDescription('Verify a paid order and grant the customer role')
     .addStringOption(o => o.setName('order_id').setDescription('Your order / invoice ID').setRequired(true))
-    .addStringOption(o => o.setName('email').setDescription('The email used on the order').setRequired(true))
+    // Optional since round 29 item 6: an order delivered by staff can carry no
+    // address at all, and the Discord account named on it proves the claim on
+    // its own. Discord requires every required option to precede the optional
+    // ones, so this must stay below order_id.
+    .addStringOption(o => o.setName('email').setDescription('The email used on the order (skip if the order has none)').setRequired(false))
     .addUserOption(o => o.setName('user').setDescription('Staff only: grant to another member').setRequired(false)),
   // `role` is the only required option. Identify the target EITHER by picking a
   // Discord member (resolved through their linked web account) OR by typing the
@@ -4243,30 +4297,18 @@ client.on('interactionCreate', async interaction => {
         if (!targetMember) return interaction.editReply({ content: '❌ Could not resolve the target member.' });
 
         try {
-          const res = await axios.post(`${BACKEND_URL}/api/orders/verify-claim`, {
-            secret: API_SECRET, order_id, email,
-          });
-          const v = res.data;
-          // Same widening as the claim panel: the Discord account named on the
-          // order proves ownership on its own, because a buyer may hold more
-          // than one address and only one of them was captured at checkout.
-          // Checked against the TARGET, not the caller — otherwise staff
-          // granting on someone's behalf would verify themselves.
-          const ownsByDiscord = !!v.discord_id && String(v.discord_id) === targetMember.id;
-          if (!v.email_match && !ownsByDiscord) {
-            const hint = v.email_hint ? ` The address on this order looks like \`${v.email_hint}\`.` : '';
-            return interaction.editReply({ content: `❌ That email does not match the order on record.${hint}` });
-          }
-          if (!v.paid) {
-            return interaction.editReply({ content: `❌ Order \`${order_id}\` is **${v.status}** — only paid/delivered orders qualify.` });
-          }
+          // Verified against the TARGET, not the caller — otherwise staff
+          // granting on someone's behalf would verify themselves, and the
+          // account the order gets attached to would be the wrong one.
+          const v = await claimOrderFor(targetMember, order_id, email);
+          if (!v.success) return interaction.editReply({ content: claimRefusal(v, order_id) });
 
           const role = resolveCustomerRole(interaction.guild);
           if (!role) return interaction.editReply({ content: '❌ The customer role is not configured on this bot — set `CUSTOMER_ROLE_ID` to the role id.' });
 
           const failure = await grantCustomerRole(targetMember, role);
           if (failure) {
-            return interaction.editReply({ content: `⚠️ Order \`${v.invoice_no || order_id}\` is verified, but I could not add the role: ${failure}` });
+            return interaction.editReply({ content: `⚠️ Order \`${v.invoice_no || order_id}\` is verified and attached to their account, but I could not add the role: ${failure}` });
           }
           const embed = new EmbedBuilder()
             .setColor(0x00ff88).setTitle('✅ Customer Verified')
@@ -4274,6 +4316,17 @@ client.on('interactionCreate', async interaction => {
             // string as typed — it confirms which order was actually claimed
             // when a customer supplies the old numeric id.
             .setDescription(`<@${targetMember.id}> has been granted the <@&${role.id}> role for order \`${v.invoice_no || order_id}\`.`)
+            .addFields({
+              name: 'Site account',
+              value: v.account_created
+                ? `Created **${v.username}** — they can sign in at uhservices.xyz with **SIGN IN WITH DISCORD**.`
+                : `Linked to **${v.username}**.`,
+              inline: false,
+            }, {
+              name: 'Orders attached',
+              value: v.orders_attached === 1 ? '1 order' : `${v.orders_attached} orders`,
+              inline: true,
+            })
             .setTimestamp();
           return interaction.editReply({ embeds: [embed] });
         } catch (err) {
@@ -4601,10 +4654,14 @@ client.on('interactionCreate', async interaction => {
           new ActionRowBuilder().addComponents(
             new TextInputBuilder()
               .setCustomId('claim_email')
-              .setLabel('Email used at checkout')
+              .setLabel('Email used at checkout (optional)')
               .setStyle(TextInputStyle.Short)
-              .setPlaceholder('you@example.com')
-              .setRequired(true)
+              // An order handed over by staff can have no address on it, and a
+              // required field the buyer cannot possibly fill is what made
+              // their own paid order unclaimable. Leaving it blank falls back
+              // to the Discord account named on the order. Round 29 item 6.
+              .setPlaceholder('you@example.com — leave blank to claim by Discord')
+              .setRequired(false)
               .setMaxLength(120)
           )
         );
@@ -4749,28 +4806,16 @@ client.on('interactionCreate', async interaction => {
       if (interaction.customId === 'claim_customer_modal') {
         await interaction.deferReply({ ephemeral: true });
         const order_id = interaction.fields.getTextInputValue('claim_order_id').trim();
-        const email = interaction.fields.getTextInputValue('claim_email').trim();
+        // Optional since round 29 item 6 — an order delivered by hand can carry
+        // no address, and the Discord account below proves the claim without one.
+        const email = (interaction.fields.getTextInputValue('claim_email') || '').trim();
         try {
-          const res = await axios.post(`${BACKEND_URL}/api/orders/verify-claim`, {
-            secret: API_SECRET, order_id, email,
-          });
-          const v = res.data;
-
-          // The Discord account named ON the order is stronger proof than any
-          // address the claimer types, so it stands on its own. Without it a
-          // customer whose order carries a second address of theirs — the
-          // common case, and the one that produced "that email does not match
-          // the invoice on record" for the buyer's own invoice — had no way
-          // through at all.
-          const ownsByDiscord = !!v.discord_id && String(v.discord_id) === interaction.user.id;
-          if (!v.email_match && !ownsByDiscord) {
-            const hint = v.email_hint ? ` The address on this order looks like \`${v.email_hint}\`.` : '';
+          const v = await claimOrderFor(interaction.member, order_id, email);
+          if (!v.success) {
             return interaction.editReply({
-              content: `❌ That email does not match invoice \`${v.invoice_no || order_id}\`.${hint}\nUse the address from your order confirmation — if you no longer have it, open a support ticket and staff can grant the role.`,
+              content: claimRefusal(v, order_id,
+                '\nUse the address from your order confirmation — if you no longer have it, open a support ticket and staff can grant the role.'),
             });
-          }
-          if (!v.paid) {
-            return interaction.editReply({ content: `❌ Invoice \`${order_id}\` is **${v.status}** — only paid/delivered orders qualify.` });
           }
 
           const role = resolveCustomerRole(interaction.guild);
@@ -4778,17 +4823,33 @@ client.on('interactionCreate', async interaction => {
 
           const failure = await grantCustomerRole(interaction.member, role);
           if (failure) {
-            return interaction.editReply({ content: `⚠️ Invoice \`${v.invoice_no || order_id}\` is verified, but I could not add the role: ${failure}\nOpen a support ticket and staff can grant it manually.` });
+            return interaction.editReply({ content: `⚠️ Invoice \`${v.invoice_no || order_id}\` is verified and attached to your account, but I could not add the role: ${failure}\nOpen a support ticket and staff can grant it manually.` });
           }
+          const VIA = { discord: 'Discord account on the order', account: 'Your site account', email: 'Email on the order' };
           const embed = new EmbedBuilder()
             .setColor(0x00ff88)
             .setTitle('✅ Claim Successful')
             .addFields(
               { name: 'Invoice ID', value: `\`${v.invoice_no || order_id}\``, inline: true },
-              { name: 'Email', value: email, inline: true },
               { name: 'User', value: `<@${interaction.user.id}>`, inline: true },
-              { name: 'Verified by', value: v.email_match ? 'Email on the order' : 'Discord account on the order', inline: true },
+              { name: 'Verified by', value: VIA[v.via] || 'Order record', inline: true },
               { name: 'Role Added', value: `<@&${role.id}>`, inline: false },
+              // The point of the whole item: the order stops being a loose
+              // invoice number and starts being something they can open.
+              {
+                name: v.account_created ? '🆕 Account created' : '👤 Your account',
+                value: v.account_created
+                  ? `**${v.username}** — sign in at https://uhservices.xyz with **SIGN IN WITH DISCORD** to see your orders and redeem your keys. No password needed.`
+                  : `**${v.username}** — your orders are at https://uhservices.xyz/account`,
+                inline: false,
+              },
+              {
+                name: 'Orders now on your account',
+                value: v.orders_attached === 1
+                  ? 'This one.'
+                  : `${v.orders_attached} orders, including this one.`,
+                inline: false,
+              },
             )
             .setFooter({ text: BOT_NAME, iconURL: client.user.displayAvatarURL() })
             .setTimestamp();

@@ -72,13 +72,26 @@ function startAuthServer(discordClient, { issueKey, invalidateGuildSettings, pan
 
   // POST /api/auth/initiate-2fa
   app.post('/api/auth/initiate-2fa', async (req, res) => {
-    const { email, discordId } = req.body;
-    if (!email || !discordId)
-      return res.status(400).json({ message: 'Email and discordId are required.' });
+    // `account_label` is what the DM names the account as, and it exists
+    // because an account no longer necessarily HAS an email. Round 29 item 6
+    // made web_users.email nullable — a customer who signed up through SIGN IN
+    // WITH DISCORD has a username and nothing else — and this DM used to hard
+    // require an address, so their very first login 400'd here and reached them
+    // as "Discord login failed".
+    //
+    // The caller sends the address when there is one and `@username` when there
+    // is not; either way it is only ever displayed, never matched on.
+    const { email, discordId, account_label } = req.body;
+    const label = String(account_label || email || '').trim();
+    if (!discordId || !label)
+      return res.status(400).json({ message: 'discordId and an account label (email or username) are required.' });
 
     const sessionId = crypto.randomUUID();
     const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
-    pendingSessions.set(sessionId, { email, discordId, verified: false, expiresAt });
+    // `email` stays on the session as whatever the caller sent, including null
+    // — nothing downstream matches on it, and inventing a value here would put
+    // a fake address in front of the customer.
+    pendingSessions.set(sessionId, { email: email || null, label, discordId, verified: false, expiresAt });
 
     try {
       const user = await discordClient.users.fetch(discordId);
@@ -86,7 +99,10 @@ function startAuthServer(discordClient, { issueKey, invalidateGuildSettings, pan
         .setColor(0xF59E0B)
         .setTitle('🔐 Two-Factor Authentication Required')
         .setDescription(`A login attempt was made on **UHSERVICES.XYZ**.\n\nClick the button below to verify it's you.`)
-        .addFields({ name: '📧 Account', value: email, inline: true })
+        // An address gets the envelope, a bare username does not — the icon is
+        // the only thing telling the customer which of the two they are looking
+        // at, and "📧 Account: @ghost" reads as a broken template.
+        .addFields({ name: label.includes('@') && label.includes('.') ? '📧 Account' : '👤 Account', value: label, inline: true })
         .setFooter({ text: 'This request expires in 10 minutes • UH SERVICES' })
         .setTimestamp();
       const row = new ActionRowBuilder().addComponents(
@@ -95,7 +111,7 @@ function startAuthServer(discordClient, { issueKey, invalidateGuildSettings, pan
           .setLabel('Authenticate').setStyle(ButtonStyle.Success).setEmoji('🔑')
       );
       await user.send({ embeds: [embed], components: [row] });
-      console.log(`📨 Sent 2FA DM to Discord user ${discordId} for ${email}`);
+      console.log(`📨 Sent 2FA DM to Discord user ${discordId} for ${label}`);
       return res.json({ userId: sessionId, message: 'Verification DM sent.' });
     } catch (err) {
       pendingSessions.delete(sessionId);
