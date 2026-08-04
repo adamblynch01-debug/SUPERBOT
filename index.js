@@ -49,6 +49,7 @@ const {
   commands: manualCommands, handleManualInteraction, setManualAccessGate,
 } = require('./modules/manualDelivery');
 const translate = require('./modules/translate');
+const { offerImageUpload } = require('./modules/imageAttach');
 
 // Appends the language dropdown to a post. Every caller is a message the whole
 // server reads, which is why the dropdown answers EPHEMERALLY — see
@@ -4994,10 +4995,14 @@ client.on('interactionCreate', async interaction => {
         }
 
         try {
-          await interaction.channel.send(withLanguageRow(payload));
+          const posted = await interaction.channel.send(withLanguageRow(payload));
           await interaction.editReply({ content: `✅ Update posted to <#${interaction.channel.id}>${describeSync(siteSync)}` });
           // A warning needs long enough to actually be read.
           autoDelete(interaction, siteSync && !siteSync.ok ? 30000 : 5000);
+          // The modal has an image_url field, but only for people who already
+          // host the picture somewhere. This is for the far commoner case: the
+          // screenshot is sitting on the poster's desktop.
+          offerImageUpload({ interaction, message: posted, embed, fileBase: `update-${posted.id}` });
         } catch (err) { await interaction.editReply({ content: `❌ Failed: ${err.message}${describeSync(siteSync)}` }); autoDelete(interaction, 12000); }
         return;
       }
@@ -5027,8 +5032,12 @@ client.on('interactionCreate', async interaction => {
         embed.setDescription(message).setFooter({ text: `${BOT_NAME} | ${SITE_URL}`, iconURL: client.user.displayAvatarURL() }).setTimestamp();
         const buttonRow = dlUrl ? new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel('⬇️  DOWNLOAD').setURL(dlUrl).setStyle(ButtonStyle.Link)) : null;
         try {
-          await targetCh.send(withLanguageRow({ content: pingText, embeds: [embed], ...(buttonRow ? { components: [buttonRow] } : {}) }));
+          const posted = await targetCh.send(withLanguageRow({ content: pingText, embeds: [embed], ...(buttonRow ? { components: [buttonRow] } : {}) }));
           await interaction.reply({ content: `✅ Announcement posted to <#${targetCh.id}>`, flags: 64 }); autoDelete(interaction, 5000);
+          // Offered here even when the announcement went to another channel:
+          // the admin is typing in THIS one, so this is where they can drop a
+          // file. autoDelete only removes the reply above, not the follow-up.
+          offerImageUpload({ interaction, message: posted, embed, fileBase: `announce-${posted.id}` });
         } catch (err) { await interaction.reply({ content: `❌ Failed: ${err.message}`, flags: 64 }); autoDelete(interaction, 8000); }
         return;
       }
@@ -5061,9 +5070,10 @@ client.on('interactionCreate', async interaction => {
         }
 
         try {
-          await statusCh.send(withLanguageRow({ content: pingText, embeds: [embed] }));
+          const posted = await statusCh.send(withLanguageRow({ content: pingText, embeds: [embed] }));
           await interaction.editReply({ content: `✅ Status update posted to <#${statusCh.id}>${describeSync(siteSync)}` });
           autoDelete(interaction, siteSync && !siteSync.ok ? 30000 : 5000);
+          offerImageUpload({ interaction, message: posted, embed, fileBase: `status-${posted.id}` });
         } catch (err) { await interaction.editReply({ content: `❌ Failed: ${err.message}${describeSync(siteSync)}` }); autoDelete(interaction, 12000); }
         return;
       }
@@ -5183,37 +5193,21 @@ client.on('interactionCreate', async interaction => {
         // …and onto the storefront, where it becomes the durable copy.
         syncVouchToWebsite(interaction.guild.id, entry, vouchMsg?.id);
 
-        if (imageUrl) {
-          await interaction.reply({ content: '✅ Thank you for your vouch!', ephemeral: true });
-        } else {
-          await interaction.reply({ content: '✅ Thank you for your vouch! 📸 Want to add a screenshot? Just upload it as a message in this channel within the next 60 seconds and I\'ll attach it automatically — no need for imgur or any external site.', ephemeral: true });
-
-          if (vouchMsg && interaction.channel) {
-            const collector = interaction.channel.createMessageCollector({
-              filter: m => m.author.id === interaction.user.id && m.attachments.size > 0,
-              max: 1,
-              time: 60000,
-            });
-            collector.on('collect', async m => {
-              const att = [...m.attachments.values()].find(a => a.contentType?.startsWith('image/')) || m.attachments.first();
-              if (att) {
-                try {
-                  const ext = (att.name?.split('.').pop() || 'png').toLowerCase().replace(/[^a-z0-9]/g, '') || 'png';
-                  const fileName = `vouch-${entry.id}.${ext}`;
-                  embed.setImage(`attachment://${fileName}`);
-                  const file = new AttachmentBuilder(att.url, { name: fileName });
-                  await vouchMsg.edit({ embeds: [embed], files: [file] });
-                  entry.imageUrl = vouchMsg.embeds?.[0]?.image?.url || att.url;
-                  saveVouches();
-                  // Second sync, same external_id: the vouch already reached
-                  // the website without a picture, and this is the picture.
-                  syncVouchToWebsite(interaction.guild.id, entry, vouchMsg.id);
-                } catch (e) { console.error('Vouch image attach error:', e); }
-              }
-              try { if (m.deletable) await m.delete(); } catch (_) {}
-            });
-          }
-        }
+        await interaction.reply({ content: '✅ Thank you for your vouch!', ephemeral: true });
+        // This flow invented the upload-it-here step; it now shares the one
+        // copy in modules/imageAttach.js with /announce, /postupdate and
+        // /statusupdate. The helper declines by itself when the embed already
+        // carries a picture, which is the `imageUrl` case.
+        offerImageUpload({
+          interaction, message: vouchMsg, embed, fileBase: `vouch-${entry.id}`,
+          onAttached: (url) => {
+            entry.imageUrl = url;
+            saveVouches();
+            // Second sync, same external_id: the vouch already reached the
+            // website without a picture, and this is the picture.
+            syncVouchToWebsite(interaction.guild.id, entry, vouchMsg.id);
+          },
+        });
         return;
       }
     }
