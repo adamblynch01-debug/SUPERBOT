@@ -51,6 +51,7 @@ const {
 const translate = require('./modules/translate');
 const { offerImageUpload } = require('./modules/imageAttach');
 const { makeStaffRoleResolver } = require('./modules/staffRoles');
+const serverBackup = require('./modules/serverBackup');
 
 // Appends the language dropdown to a post. Every caller is a message the whole
 // server reads, which is why the dropdown answers EPHEMERALLY — see
@@ -1476,6 +1477,179 @@ function getProductColor(name) {
 // Now: Administrator, or one of THIS guild's staff roles by id. The name check
 // is kept only as a last-resort bootstrap when no id is configured anywhere,
 // and it warns loudly so it gets fixed.
+// ─── Server snapshot restore ─────────────────────────────────────────────────
+//
+// Runs after the confirm button. Everything here is additive: roles and
+// channels are matched by name and updated in place, missing ones are created,
+// and NOTHING is ever deleted. A "restore" that wipes first is one mistyped
+// snapshot id away from being the disaster it exists to protect against.
+//
+// The other rule that shapes this: one bad entry must never fail the job.
+// Someone running this is usually rebuilding a server that is already gone,
+// and "12 of 40 channels, then an error" is the worst outcome available. Every
+// step is caught individually and the failures are reported at the end.
+async function runRestore(interaction, snapId, allowOther) {
+  const guild = interaction.guild;
+  await interaction.update({
+    embeds: [new EmbedBuilder().setColor(0x5865F2).setTitle('⏳ Restoring…')
+      .setDescription('Creating roles first, then categories, then channels. This can take a minute.')],
+    components: [],
+  });
+
+  const problems = [];
+  const note = (what, err) => {
+    problems.push(`${what}: ${err && err.message ? err.message : err}`);
+    console.warn('[ServerBackup]', what, '-', err && err.message);
+  };
+
+  try {
+    const { rows } = await db.query('SELECT * FROM guild_snapshots WHERE id = $1', [snapId]);
+    const row = rows[0];
+    if (!row) return interaction.editReply({ embeds: [], content: `❌ Snapshot \`${snapId}\` is gone.` });
+    if (row.guild_id !== guild.id && !allowOther) {
+      return interaction.editReply({ embeds: [], content: '❌ That snapshot belongs to another server.' });
+    }
+    const snap = row.data;
+
+    await guild.roles.fetch();
+    await guild.channels.fetch();
+
+    // What the BOT can grant. Discord rejects the whole request when asked for
+    // a permission the actor does not hold, so one missing bit would otherwise
+    // fail an entire role rather than just that bit.
+    const me = guild.members.me || await guild.members.fetchMe();
+    const botPerms = me.permissions.bitfield;
+
+    // ── Roles ──
+    // Highest first, so Discord's own clamping (nothing above the bot's top
+    // role) at least preserves the relative order of what it can place.
+    const rolePlan = serverBackup.planRoles(snap, [...guild.roles.cache.values()]);
+    const idMap = new Map();
+    let rolesMade = 0, rolesUpdated = 0;
+    const permsDropped = new Set();
+
+    for (const { from, to, everyone } of rolePlan.update) {
+      idMap.set(from.id, to.id);
+      const { granted, missing } = serverBackup.maskPermissions(from.permissions, botPerms);
+      if (BigInt(missing)) serverBackup.namePermissions(missing, PermissionFlagsBits).forEach(p => permsDropped.add(p));
+      try {
+        // @everyone has no colour, no hoist and no mentionable to speak of —
+        // sending them is a 400 on some API versions and meaningless on all.
+        await to.edit(everyone
+          ? { permissions: granted }
+          : { name: from.name, color: from.color, hoist: from.hoist, mentionable: from.mentionable, permissions: granted });
+        rolesUpdated++;
+      } catch (err) { note(`role "${from.name}"`, err); }
+    }
+
+    for (const from of rolePlan.create) {
+      const { granted, missing } = serverBackup.maskPermissions(from.permissions, botPerms);
+      if (BigInt(missing)) serverBackup.namePermissions(missing, PermissionFlagsBits).forEach(p => permsDropped.add(p));
+      try {
+        const made = await guild.roles.create({
+          name: from.name, color: from.color, hoist: from.hoist,
+          mentionable: from.mentionable, permissions: granted,
+          reason: `Snapshot ${snapId} restore by ${interaction.user.tag}`,
+        });
+        idMap.set(from.id, made.id);
+        rolesMade++;
+      } catch (err) { note(`role "${from.name}"`, err); }
+    }
+
+    // ── Channels ──
+    // Rebuilt after the roles on purpose: a channel's permission overwrites
+    // are written in terms of role ids, and a role that does not exist yet
+    // cannot be referenced. Doing it the other way round produces channels
+    // with no permissions on them, which reads as a successful restore and is
+    // the exact state that makes a private channel public.
+    const chanPlan = serverBackup.planChannels(snap, [...guild.channels.cache.values()]
+      .filter(c => !serverBackup.THREAD_TYPES.has(c.type)),
+      (c) => { const p = c.parentId ? guild.channels.cache.get(c.parentId) : null; return p ? p.name : null; });
+
+    const memberHere = (id) => guild.members.cache.has(id);
+    const catByName = new Map();
+    for (const c of guild.channels.cache.values()) {
+      if (c.type === serverBackup.CH.GuildCategory && !catByName.has(c.name)) catByName.set(c.name, c.id);
+    }
+    for (const { from, to } of chanPlan.update) {
+      if (from.type === serverBackup.CH.GuildCategory) catByName.set(from.name, to.id);
+    }
+
+    let chansMade = 0, chansUpdated = 0, owDropped = 0;
+    const overwritesFor = (ch) => {
+      const { kept, dropped } = serverBackup.remapOverwrites(ch.overwrites, idMap, memberHere);
+      owDropped += dropped.length;
+      return kept.map(o => ({ id: o.id, allow: BigInt(o.allow) & botPerms, deny: BigInt(o.deny) & botPerms }));
+    };
+
+    for (const { from, to } of chanPlan.update) {
+      try {
+        // permissionOverwrites.set REPLACES the channel's overwrites with this
+        // list. That is intended — the snapshot IS the intended permission
+        // state — but it is also the one place a restore removes something, so
+        // it is confined to channels the snapshot actually describes.
+        await to.permissionOverwrites.set(overwritesFor(from), `Snapshot ${snapId} restore`);
+        if (from.topic != null && 'setTopic' in to) { try { await to.setTopic(from.topic); } catch (_) {} }
+        chansUpdated++;
+      } catch (err) { note(`channel "#${from.name}"`, err); }
+    }
+
+    for (const ch of chanPlan.create) {
+      try {
+        const parentId = ch.parentName ? (catByName.get(ch.parentName) || null) : null;
+        const payload = serverBackup.channelCreatePayload(ch, parentId, overwritesFor(ch));
+        payload.reason = `Snapshot ${snapId} restore by ${interaction.user.tag}`;
+        const made = await guild.channels.create(payload);
+        if (ch.type === serverBackup.CH.GuildCategory) catByName.set(ch.name, made.id);
+        chansMade++;
+      } catch (err) { note(`channel "#${ch.name}"`, err); }
+    }
+
+    // ── Emojis ──
+    // Re-uploaded from the source guild's CDN URL, which is public and does
+    // not expire the way a message attachment does. Best-effort: a full emoji
+    // slot list is a limit, not an error worth stopping for.
+    let emojisMade = 0;
+    const haveEmoji = new Set([...guild.emojis.cache.values()].map(e => e.name));
+    for (const e of (snap.emojis || [])) {
+      if (haveEmoji.has(e.name)) continue;
+      try { await guild.emojis.create({ attachment: e.url, name: e.name }); emojisMade++; }
+      catch (err) { note(`emoji :${e.name}:`, err); break; }   // out of slots — the rest will fail the same way
+    }
+
+    const out = new EmbedBuilder()
+      .setColor(problems.length ? 0xffa500 : 0x00d26a)
+      .setTitle(problems.length ? '⚠️ Restore finished with some skips' : '✅ Restore finished')
+      .setDescription(`Snapshot \`${snapId}\` → **${guild.name}**`)
+      .addFields(
+        { name: 'Roles', value: `${rolesMade} created · ${rolesUpdated} updated`, inline: true },
+        { name: 'Channels', value: `${chansMade} created · ${chansUpdated} updated`, inline: true },
+        { name: 'Emojis', value: `${emojisMade} added`, inline: true },
+      );
+    if (permsDropped.size) {
+      // Named, not counted. "Two permissions were dropped" sends someone
+      // hunting; the list tells them whether it mattered.
+      out.addFields({ name: 'Permissions the bot could not grant',
+        value: `The bot does not hold these itself, so they were left off:\n\`${[...permsDropped].join('`, `').slice(0, 900)}\`` });
+    }
+    if (owDropped) {
+      out.addFields({ name: 'Permission rules dropped', value:
+        `${owDropped} rule(s) pointed at a role or member that does not exist here. Applying them to whatever those ids mean in this server is how a restore locks people out, so they were skipped.` });
+    }
+    if (problems.length) {
+      out.addFields({ name: `Skipped (${problems.length})`, value: problems.slice(0, 8).join('\n').slice(0, 1024) });
+    }
+    out.setFooter({ text: 'Nothing was deleted.' }).setTimestamp();
+    return interaction.editReply({ embeds: [out], components: [] });
+  } catch (err) {
+    console.error('[ServerBackup] restore failed:', err);
+    return interaction.editReply({
+      embeds: [], components: [],
+      content: `❌ Restore stopped: ${err.message}\n\nAnything already created is still there — nothing was deleted.`,
+    });
+  }
+}
+
 function hasAccess(interaction) {
   const member = interaction.member;
   if (!member || !interaction.guild) return false;
@@ -2146,6 +2320,29 @@ const ownCommands = [
   new SlashCommandBuilder().setName('leaveguild').setDescription('Owner only: Make the bot leave a specific server')
     .addStringOption(o => o.setName('guild_id').setDescription('The server ID to leave (from /listguilds)').setRequired(true)),
 
+  // ─── Server snapshots ──────────────────────────────────────────────────────
+  // Administrator only, and not by convenience: `restore` can create every
+  // role and channel in a snapshot, and `create` reads the whole permission
+  // layout of the server into a row someone else could later restore
+  // elsewhere. Both are things only the people who already run the server
+  // should be able to do.
+  new SlashCommandBuilder().setName('serverbackup').setDescription('Admin: Snapshot this server, or rebuild it from one')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addSubcommand(sub => sub.setName('create').setDescription('Save this server\'s roles, channels and permissions as a snapshot')
+      .addStringOption(o => o.setName('label').setDescription('What to call it — e.g. "before the rebrand"').setRequired(false)))
+    .addSubcommand(sub => sub.setName('list').setDescription('List saved snapshots'))
+    .addSubcommand(sub => sub.setName('view').setDescription('Show exactly what is inside a snapshot')
+      .addStringOption(o => o.setName('id').setDescription('Snapshot ID (from /serverbackup list)').setRequired(true)))
+    .addSubcommand(sub => sub.setName('restore').setDescription('Rebuild this server from a snapshot — never deletes anything')
+      .addStringOption(o => o.setName('id').setDescription('Snapshot ID (from /serverbackup list)').setRequired(true))
+      // Cross-guild restore is the disaster case: the snapshot was taken in
+      // the server that is now gone, and is being poured into a fresh one.
+      .addBooleanOption(o => o.setName('allow_other_server').setDescription('Allow restoring a snapshot taken in a DIFFERENT server').setRequired(false)))
+    .addSubcommand(sub => sub.setName('export').setDescription('Download a snapshot as a JSON file')
+      .addStringOption(o => o.setName('id').setDescription('Snapshot ID (from /serverbackup list)').setRequired(true)))
+    .addSubcommand(sub => sub.setName('delete').setDescription('Delete a saved snapshot')
+      .addStringOption(o => o.setName('id').setDescription('Snapshot ID (from /serverbackup list)').setRequired(true))),
+
   // ─── Shop payment backend (ported from p-bot) ──────────────────────────────
   new SlashCommandBuilder().setName('config').setDescription('Staff: Configure the shop payment backend')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
@@ -2701,6 +2898,7 @@ client.on('interactionCreate', async interaction => {
             { name: '📦 Products & Downloads', value: '`/downloads` — Browse & download products\n`/setupdownloads` — Post download panel to #downloads\n`/setdownload` — Set a product download link', inline: false },
             { name: '📣 Updates & Status', value: '`/postupdate` — Post a product update\n`/statusupdate` — Post a status update\n`/announce` — Send a custom announcement', inline: false },
             { name: '🌐 Server Setup', value: '`/setwebsite` — Pin website URL\n`/setupreseller` — Post reseller panel\n`/setresellerlinks` — Update reseller button links\n`/postimage` — Post an image', inline: false },
+            { name: '💾 Server Snapshots', value: '`/serverbackup create` — Save the server\'s roles, channels & permissions\n`/serverbackup list|view|export` — Browse or download a snapshot\n`/serverbackup restore` — Rebuild from one (never deletes anything)', inline: false },
             { name: '🎫 Support Tickets', value: '`/panel` — Post the support panel\n`/clearlogs` — Clear ticket log channel\n`/reply` — Reply to a user\'s ticket', inline: false },
             { name: '📝 Vouches', value: '`/setupvouch` — Post the Leave a Vouch panel\n`/exportvouches` — Download a backup of all vouches\n`/importvouches` — Restore vouches from a backup file, or `source: website`', inline: false },
             { name: '🎮 Steam Stock', value: '`/gensteam [type]` — Generate a Steam account\n`/stock` — Check available stock\n`/addstock` — Staff: add accounts to stock', inline: false },
@@ -3928,6 +4126,192 @@ client.on('interactionCreate', async interaction => {
         return interaction.reply({ content: `✅ Left **${name}** (\`${targetId}\`).`, flags: 64 });
       }
 
+      // ── /serverbackup ────────────────────────────────────────────────────
+      if (cmd === 'serverbackup') {
+        if (!interaction.guild) return interaction.reply({ content: '❌ Run this in a server.', flags: 64 });
+        // Administrator, not hasAccess(). `restore` builds out an entire
+        // server and `create` reads its whole permission layout into a row —
+        // neither is a staff-shift task.
+        if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
+          return interaction.reply({ content: '❌ Administrator only.', flags: 64 });
+        }
+        const sub = interaction.options.getSubcommand();
+
+        // ── create ──
+        if (sub === 'create') {
+          await interaction.deferReply({ flags: 64 });
+          try {
+            // The caches are what get read, and they are only complete if we
+            // ask. A partial cache produces a snapshot that looks fine and is
+            // missing half the server — the worst possible failure for a
+            // backup, because it is only discovered at restore time.
+            await interaction.guild.roles.fetch();
+            await interaction.guild.channels.fetch();
+            try { await interaction.guild.emojis.fetch(); } catch (_) {}
+
+            const snap = serverBackup.snapshotGuild(interaction.guild);
+            const counts = serverBackup.snapshotCounts(snap);
+            const label = (interaction.options.getString('label') || '').slice(0, 120) || null;
+
+            const { rows } = await db.query(
+              `INSERT INTO guild_snapshots (guild_id, guild_name, label, taken_by, counts, data)
+               VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, taken_at`,
+              [interaction.guild.id, interaction.guild.name, label, interaction.user.id,
+               JSON.stringify(counts), JSON.stringify(snap)]);
+
+            return interaction.editReply({ embeds: [new EmbedBuilder()
+              .setColor(0x00d26a)
+              .setTitle('📸 Snapshot saved')
+              .setDescription(`**${interaction.guild.name}**${label ? `\n*${label}*` : ''}`)
+              .addFields(
+                { name: 'ID', value: `\`${rows[0].id}\``, inline: true },
+                { name: 'Roles', value: String(counts.roles), inline: true },
+                { name: 'Categories', value: String(counts.categories), inline: true },
+                { name: 'Channels', value: String(counts.channels), inline: true },
+                { name: 'Permission rules', value: String(counts.overwrites), inline: true },
+                { name: 'Emojis', value: String(counts.emojis), inline: true },
+              )
+              .setFooter({ text: 'Structure and permissions only — message history is not included.' })
+              .setTimestamp()] });
+          } catch (err) {
+            console.error('[ServerBackup] create failed:', err);
+            return interaction.editReply({ content: `❌ Could not save the snapshot: ${err.message}` });
+          }
+        }
+
+        // ── list ──
+        if (sub === 'list') {
+          await interaction.deferReply({ flags: 64 });
+          // `data` is deliberately not selected: it is hundreds of KB per row,
+          // and everything shown here lives in `counts`.
+          const { rows } = await db.query(
+            `SELECT id, guild_name, label, taken_by, taken_at, counts
+               FROM guild_snapshots WHERE guild_id = $1 ORDER BY taken_at DESC LIMIT 20`,
+            [interaction.guild.id]);
+          if (!rows.length) {
+            return interaction.editReply({ content: 'No snapshots yet. `/serverbackup create` takes one.' });
+          }
+          const body = rows.map(r => {
+            const c = r.counts || {};
+            return `\`${r.id}\` · <t:${Math.floor(new Date(r.taken_at).getTime() / 1000)}:f>` +
+                   `${r.label ? ` · **${r.label}**` : ''}\n` +
+                   `　${c.roles || 0} roles · ${c.categories || 0} categories · ${c.channels || 0} channels · by <@${r.taken_by}>`;
+          }).join('\n\n');
+          return interaction.editReply({ embeds: [new EmbedBuilder()
+            .setColor(0x5865F2).setTitle(`📚 Snapshots of ${interaction.guild.name}`)
+            .setDescription(body.slice(0, 4000))
+            .setFooter({ text: '/serverbackup view id:<ID> to see inside one' })] });
+        }
+
+        // ── view / export / delete / restore all need the row ──
+        const snapId = interaction.options.getString('id');
+        if (!/^\d{1,19}$/.test(String(snapId || ''))) {
+          return interaction.reply({ content: '❌ That is not a snapshot ID. `/serverbackup list` shows them.', flags: 64 });
+        }
+        await interaction.deferReply({ flags: 64 });
+        const { rows } = await db.query('SELECT * FROM guild_snapshots WHERE id = $1', [snapId]);
+        const row = rows[0];
+        if (!row) return interaction.editReply({ content: `❌ No snapshot with ID \`${snapId}\`.` });
+
+        // A snapshot holds the full permission layout of a server. Reading one
+        // taken elsewhere would let an admin of any guild the bot is in dump
+        // another guild's structure — so the row is fetched by id alone (ids
+        // are not guessable in sequence terms, but they ARE sequential) and
+        // then checked. `restore` opts out of this on purpose; see below.
+        const sameGuild = row.guild_id === interaction.guild.id;
+
+        if (sub === 'delete') {
+          if (!sameGuild) return interaction.editReply({ content: '❌ That snapshot belongs to another server.' });
+          await db.query('DELETE FROM guild_snapshots WHERE id = $1', [snapId]);
+          return interaction.editReply({ content: `🗑️ Snapshot \`${snapId}\` deleted.` });
+        }
+
+        if (sub === 'view') {
+          if (!sameGuild) return interaction.editReply({ content: '❌ That snapshot belongs to another server.' });
+          const snap = row.data;
+          const cats = (snap.channels || []).filter(c => c.type === serverBackup.CH.GuildCategory);
+          const byCat = new Map(cats.map(c => [c.id, []]));
+          const loose = [];
+          for (const c of (snap.channels || [])) {
+            if (c.type === serverBackup.CH.GuildCategory) continue;
+            (byCat.get(c.parentId) || loose).push(c);
+          }
+          const tree = cats.map(cat =>
+            `**${cat.name}**\n` + ((byCat.get(cat.id) || []).map(c => `　#${c.name}`).join('\n') || '　*(empty)*')
+          ).concat(loose.length ? [`**(no category)**\n` + loose.map(c => `　#${c.name}`).join('\n')] : []).join('\n');
+
+          const roleNames = (snap.roles || []).filter(serverBackup.isRestorableRole)
+            .map(r => r.name).filter(n => n !== '@everyone');
+
+          return interaction.editReply({ embeds: [new EmbedBuilder()
+            .setColor(0x5865F2)
+            .setTitle(`🔎 Snapshot ${snapId}${row.label ? ` — ${row.label}` : ''}`)
+            .setDescription(`Taken <t:${Math.floor(new Date(row.taken_at).getTime() / 1000)}:R> from **${row.guild_name}**`)
+            .addFields(
+              { name: `Roles (${roleNames.length})`, value: (roleNames.join(', ') || '—').slice(0, 1024) },
+              { name: 'Structure', value: (tree || '—').slice(0, 1024) },
+            )] });
+        }
+
+        if (sub === 'export') {
+          if (!sameGuild) return interaction.editReply({ content: '❌ That snapshot belongs to another server.' });
+          const buf = Buffer.from(JSON.stringify(row.data, null, 2), 'utf8');
+          // 8MB is the floor on Discord's upload limit. A snapshot that big is
+          // not something to truncate silently into an invalid JSON file.
+          if (buf.length > 7.5 * 1024 * 1024) {
+            return interaction.editReply({ content: `❌ That snapshot is ${(buf.length / 1048576).toFixed(1)}MB — too large to attach here.` });
+          }
+          return interaction.editReply({
+            content: `📦 Snapshot \`${snapId}\` — structure and permissions only, no message history.`,
+            files: [new AttachmentBuilder(buf, { name: `snapshot-${snapId}.json` })],
+          });
+        }
+
+        if (sub === 'restore') {
+          // The cross-guild case is the whole point of the feature — the
+          // server is gone and this is being poured into a fresh one — so it
+          // is allowed, but never by accident. It has to be asked for.
+          const allowOther = interaction.options.getBoolean('allow_other_server') === true;
+          if (!sameGuild && !allowOther) {
+            return interaction.editReply({
+              content: `❌ Snapshot \`${snapId}\` was taken in **${row.guild_name || 'another server'}** (\`${row.guild_id}\`), not this one.\n` +
+                       `If that is deliberate — rebuilding a lost server here — run it again with \`allow_other_server: True\`.`,
+            });
+          }
+
+          const snap = row.data;
+          await interaction.guild.roles.fetch();
+          await interaction.guild.channels.fetch();
+
+          const liveRoles = [...interaction.guild.roles.cache.values()];
+          const liveChannels = [...interaction.guild.channels.cache.values()]
+            .filter(c => !serverBackup.THREAD_TYPES.has(c.type));
+          const catNameOf = (c) => {
+            const p = c.parentId ? interaction.guild.channels.cache.get(c.parentId) : null;
+            return p ? p.name : null;
+          };
+          const rolePlan = serverBackup.planRoles(snap, liveRoles);
+          const chanPlan = serverBackup.planChannels(snap, liveChannels, catNameOf);
+          const lines = serverBackup.describePlan(rolePlan, chanPlan, snap);
+
+          const confirmId = `sbrestore::${snapId}::${allowOther ? '1' : '0'}`;
+          return interaction.editReply({
+            embeds: [new EmbedBuilder()
+              .setColor(0xffa500)
+              .setTitle('⚠️ Restore — read this first')
+              .setDescription(`Snapshot \`${snapId}\` from **${row.guild_name}**\ninto **${interaction.guild.name}**`)
+              .addFields({ name: 'What will happen', value: lines.map(l => `• ${l}`).join('\n').slice(0, 1024) })
+              .setFooter({ text: 'Matching is by name. Existing roles and channels are updated in place.' })],
+            components: [new ActionRowBuilder().addComponents(
+              new ButtonBuilder().setCustomId(confirmId).setLabel('Restore now').setStyle(ButtonStyle.Danger),
+              new ButtonBuilder().setCustomId('sbrestore_cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+            )],
+          });
+        }
+
+        return interaction.editReply({ content: '❌ Unknown subcommand.' });
+      }
+
       if (cmd === 'statusupdate') {
         if (!hasAccess(interaction)) return interaction.reply({ content: '❌ No permission.', flags: 64 });
         const modal = new ModalBuilder().setCustomId('setstatus_modal').setTitle('Status Update');
@@ -4688,6 +5072,20 @@ client.on('interactionCreate', async interaction => {
       // getGuildSettings, which hits the DB on every button press and is not
       // needed for them.
       if (await handleWebTicketButton(interaction)) return;
+
+      // Server-snapshot restore. Answered before getGuildSettings for the same
+      // reason: it does not need it, and this is a long job that should not
+      // start with an avoidable DB round trip.
+      if (customId === 'sbrestore_cancel') {
+        return interaction.update({ content: 'Cancelled — nothing was changed.', embeds: [], components: [] });
+      }
+      if (customId.startsWith('sbrestore::')) {
+        if (!member.permissions.has(PermissionFlagsBits.Administrator)) {
+          return interaction.reply({ content: '❌ Administrator only.', flags: 64 });
+        }
+        const [, snapId, allowOther] = customId.split('::');
+        return runRestore(interaction, snapId, allowOther === '1');
+      }
 
       const btnSettings = await getGuildSettings(guild.id);
 
