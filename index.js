@@ -50,6 +50,7 @@ const {
 } = require('./modules/manualDelivery');
 const translate = require('./modules/translate');
 const { offerImageUpload } = require('./modules/imageAttach');
+const { makeStaffRoleResolver } = require('./modules/staffRoles');
 
 // Appends the language dropdown to a post. Every caller is a message the whole
 // server reads, which is why the dropdown answers EPHEMERALLY — see
@@ -870,6 +871,22 @@ function normalizeStockType(raw) {
 const GEN_ROLE_ID_ENV      = process.env.GEN_ROLE_ID      || '1525288697656901712'; // 💎 Gen Member
 const OVERSEER_ROLE_ID_ENV = process.env.OVERSEER_ROLE_ID || '1518372339115360358'; // OVERSEER — unlimited
 
+// Staff roles are resolved PER GUILD — see modules/staffRoles.js for why a
+// single shared id was wrong in exactly one of the two servers, silently.
+const { staffRoleIdsFor, defaultOverseerRoleId } = makeStaffRoleResolver({
+  primaryGuildId:       GUILD_ID,
+  envMapRaw:            process.env.STAFF_ROLE_IDS,
+  staffRoleId:          process.env.STAFF_ROLE_ID,
+  legacyOverseerRoleId: OVERSEER_ROLE_ID_ENV,
+  // Only when already warm: this must not become an await. The panel writes
+  // overseer_role_id and invalidates the cache, so a change lands within one
+  // refresh either way.
+  getCachedOverseerRoleId: (guildId) => {
+    const cached = guildSettingsCache.get(guildId);
+    return cached && cached.expiresAt > Date.now() ? cached.data.overseerRoleId : null;
+  },
+});
+
 // ─── Per-guild settings — Postgres-backed, cached in memory ────────────────
 // Cache exists so hot paths (every message, every interaction) don't hit the
 // DB every time — 30s is short enough that a panel edit shows up almost
@@ -913,7 +930,9 @@ async function getGuildSettings(guildId) {
 
     invitesNeeded:      row?.invites_needed ?? (isOriginal ? INVITES_NEEDED_ENV : 10),
     genRoleId:          row?.gen_role_id          || (isOriginal ? GEN_ROLE_ID_ENV        : null),
-    overseerRoleId:     row?.overseer_role_id     || (isOriginal ? OVERSEER_ROLE_ID_ENV   : null),
+    // Per guild, not per bot — see staffRoleIdsFor(). This is what makes the
+    // store server's own OVERSEER count for stock access and gen limits too.
+    overseerRoleId:     row?.overseer_role_id     || defaultOverseerRoleId(guildId),
     countingChannelId:  row?.counting_channel_id  || (isOriginal ? COUNTING_CHANNEL_ID : null),
     leaveVouchChannelId:row?.leave_vouch_channel_id || (isOriginal ? LEAVE_VOUCH_CHANNEL_ID : null),
     vouchesChannelId:   row?.vouches_channel_id    || (isOriginal ? VOUCHES_CHANNEL_ID    : null),
@@ -1454,16 +1473,16 @@ function getProductColor(name) {
 // or `/order forceconfirm` to deliver an unpaid order. A role NAME is not a
 // permission: anyone who can create or rename a role can grant it.
 //
-// Now: Administrator, or the configured staff role BY ID, or an env-set
-// STAFF_ROLE_ID. The name check is kept only as a last-resort bootstrap when no
-// id is configured anywhere, and it warns loudly so it gets fixed.
+// Now: Administrator, or one of THIS guild's staff roles by id. The name check
+// is kept only as a last-resort bootstrap when no id is configured anywhere,
+// and it warns loudly so it gets fixed.
 function hasAccess(interaction) {
   const member = interaction.member;
   if (!member || !interaction.guild) return false;
   if (member.permissions.has(PermissionFlagsBits.Administrator)) return true;
 
-  const staffRoleId = process.env.STAFF_ROLE_ID || OVERSEER_ROLE_ID_ENV || null;
-  if (staffRoleId) return member.roles.cache.has(String(staffRoleId));
+  const staffRoleIds = staffRoleIdsFor(interaction.guild.id);
+  if (staffRoleIds.length) return staffRoleIds.some(id => member.roles.cache.has(id));
 
   if (member.roles.cache.some(r => r.name === 'MODERATOR')) {
     console.warn('[Access] Granted by ROLE NAME "MODERATOR" — set STAFF_ROLE_ID to a role id; a name is not a permission.');
@@ -2388,17 +2407,19 @@ client.once('ready', async () => {
     console.log('✅ Global slash commands registered');
   } catch (err) { console.error('Failed to register commands:', err); }
 
-  // ─── Administrator audit ────────────────────────────────────────────────────
+  // ─── Access audit ───────────────────────────────────────────────────────────
   // The lockdown above hides staff commands from everyone except Administrator,
   // and hasAccess() lets Administrator through unconditionally. Both are only as
-  // tight as the list of roles that hold that permission — and in this server
-  // that list includes a role named "VIP", which is handed out as a perk. Every
-  // VIP can therefore run /config, /web-promote and /web-balance adjust.
+  // tight as the list of roles holding that permission — which is why this is
+  // printed every boot: it is how a role named "VIP", handed out as a perk, was
+  // found to grant /config, /web-promote and /web-balance adjust. That one has
+  // since been dealt with in Discord, where it belongs. Taking a permission off
+  // a live role is the owner's call, not the bot's, so this still only reports.
   //
-  // Changing who holds Administrator is the OWNER'S call, not the bot's: taking
-  // a permission away from a role is exactly the kind of silent, hard-to-notice
-  // change that breaks a server. So print it, once, every boot, and let it be
-  // seen.
+  // The second line is the other half of the same question and the half that
+  // stayed silent for longer: a staff role id that is not present in the guild
+  // it is being checked against denies everyone, forever, and looks from the
+  // outside exactly like "the bot ignores my role".
   for (const [, guild] of client.guilds.cache) {
     try {
       const admins = [...guild.roles.cache.values()]
@@ -2406,6 +2427,15 @@ client.once('ready', async () => {
         .map(r => `${r.name} (${r.id})`);
       if (admins.length) {
         console.log(`[Access audit] ${guild.name}: ${admins.length} non-bot role(s) hold ADMINISTRATOR and can run every staff command → ${admins.join(', ')}`);
+      }
+
+      const staffIds = staffRoleIdsFor(guild.id);
+      const present = staffIds.filter(id => guild.roles.cache.has(id));
+      const missing = staffIds.filter(id => !guild.roles.cache.has(id));
+      console.log(`[Access audit] ${guild.name}: staff roles → `
+        + (present.map(id => `${guild.roles.cache.get(id).name} (${id})`).join(', ') || 'NONE — Administrator is the only way in'));
+      if (missing.length) {
+        console.warn(`[Access audit] ${guild.name}: ${missing.length} configured staff role id(s) do NOT exist here and grant nothing → ${missing.join(', ')}`);
       }
     } catch (e) { /* a guild we cannot read roles for tells us nothing either way */ }
   }
