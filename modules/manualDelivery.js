@@ -284,7 +284,14 @@ async function submitKeys(interaction, client) {
   }
 
   const values = data.values || [];
-  const title  = `${data.product_name}${data.tier_label ? ` — ${data.tier_label}` : ''}`;
+  // GAME — PRODUCT — DURATION, the same order lineLabel() in internalEvents.js
+  // builds for a website order, and skipped on the same condition (a game whose
+  // name is already inside the product name would only repeat itself). A
+  // one-off with no tier has no game and keeps the old two-part title.
+  const _game = String(data.game_name || '').trim();
+  const _lead = _game && !new RegExp(`(^|\\s)${_game.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\s|$)`, 'i').test(String(data.product_name || ''))
+    ? `${_game} — ` : '';
+  const title  = `${_lead}${data.product_name}${data.tier_label ? ` — ${data.tier_label}` : ''}`;
 
   // The buyer's DM is byte-for-byte the one a website order produces — same
   // title, same fenced block, same Invoice footer — so a hand-delivered order

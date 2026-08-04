@@ -44,12 +44,23 @@ const FAILURE_MARKERS = new Set([
   'NO_ACCOUNT_LINKED', 'ALREADY_CREDITED', 'CREDIT_FAILED',
 ]);
 
-// A delivered line, named the way the buyer bought it. The backend's
-// delivery.js now attaches tier_label and qty to every entry in
-// delivered_goods; older payloads have neither and fall back to the bare
-// product name, which is all this ever showed.
+// A delivered line, named the way the buyer bought it:
+//     GAME — PRODUCT — DURATION  ×N
+// The backend's delivery.js attaches game, tier_label and qty to every entry
+// in delivered_goods; older payloads have none of them and fall back to the
+// bare product name, which is all this ever showed.
+//
+// The game leads because it is the coarsest thing and the only one the buyer
+// definitely recognises — they picked a tile before they picked a product.
+// Skipped when it would only repeat itself: an HWID spoofer's game is
+// "HWID Spoofer", and "HWID Spoofer — H8ED PERMANENT SPOOFER" reads like a
+// bug. Balance top-ups and donations have no game at all, by design.
 function lineLabel(g) {
+  const game = (g && g.game) ? String(g.game).trim() : '';
   let s = (g && g.product) || 'Item';
+  if (game && !new RegExp(`(^|\\s)${game.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\s|$)`, 'i').test(s)) {
+    s = `${game} — ${s}`;
+  }
   if (g && g.tier_label) s += ` — ${g.tier_label}`;
   if (g && Number(g.qty) > 1) s += ` ×${Number(g.qty)}`;
   return s;
