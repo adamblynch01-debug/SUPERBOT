@@ -176,9 +176,19 @@ function startAuthServer(discordClient, { issueKey, invalidateGuildSettings, pan
     return res.json({ success: true, key: result.key, dmSent: result.dmSent });
   });
 
-  // Health check
+  // Health check. `botReady` alone was misleading — it stays true on a zombied
+  // websocket. The ping and the age of the last interaction are what actually
+  // distinguish "connected" from "logged in an hour ago and deaf ever since".
   app.get('/health', (req, res) => {
-    res.json({ status: 'ok', botReady: discordClient.isReady() });
+    const last = discordClient._lastInteractionAt || null;
+    res.json({
+      status: 'ok',
+      botReady: discordClient.isReady(),
+      wsStatus: discordClient.ws.status,            // 0 = Ready
+      wsPingMs: Math.round(discordClient.ws.ping),
+      uptimeSec: Math.round(process.uptime()),
+      lastInteractionAgoSec: last ? Math.round((Date.now() - last) / 1000) : null,
+    });
   });
 
   app.use((err, req, res, next) => {

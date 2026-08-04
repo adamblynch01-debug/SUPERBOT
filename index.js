@@ -2612,6 +2612,13 @@ client.on('messageCreate', async message => {
 
 // ─── Interactions ─────────────────────────────────────────────────────────────
 client.on('interactionCreate', async interaction => {
+  // One line per interaction, before anything can throw or hang. When a command
+  // "does nothing", the first question is whether the gateway delivered it at
+  // all — silence on this line means the problem is upstream of this process
+  // (the client, or Discord) and no amount of reading handler code will find it.
+  client._lastInteractionAt = Date.now();
+  console.log(`[Interaction] ${interaction.commandName || interaction.customId || interaction.type}`
+    + ` · ${interaction.user ? interaction.user.tag : '?'} · ${interaction.guild ? interaction.guild.name : 'DM'}`);
   try {
     // Awaited IIFE — see note: a bare `return asyncFn()` inside would otherwise
     // escape this try/catch and crash the process as an unhandled rejection.
@@ -5246,5 +5253,16 @@ function shutdown(signal) {
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+
+// ─── Gateway health ───────────────────────────────────────────────────────────
+// There were no listeners on any of these, so a dropped or zombied websocket
+// looked exactly like a healthy bot: the process stays up, /health still says
+// ready, and commands simply stop arriving with nothing written anywhere.
+client.on('shardDisconnect',   (ev, id)  => console.warn(`[Gateway] shard ${id} DISCONNECTED — code ${ev && ev.code}`));
+client.on('shardReconnecting', (id)      => console.warn(`[Gateway] shard ${id} reconnecting…`));
+client.on('shardResume',       (id, n)   => console.log(`[Gateway] shard ${id} resumed (${n} events replayed)`));
+client.on('shardReady',        (id)      => console.log(`[Gateway] shard ${id} ready`));
+client.on('shardError',        (err, id) => console.error(`[Gateway] shard ${id} error:`, err && err.message));
+client.on('error',             (err)     => console.error('[Client] error:', err && err.message));
 
 client.login(TOKEN);
