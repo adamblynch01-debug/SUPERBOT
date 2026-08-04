@@ -48,6 +48,19 @@ const { logGeneration } = require('./modules/genLog');
 const {
   commands: manualCommands, handleManualInteraction, setManualAccessGate,
 } = require('./modules/manualDelivery');
+const translate = require('./modules/translate');
+
+// Appends the language dropdown to a post. Every caller is a message the whole
+// server reads, which is why the dropdown answers EPHEMERALLY — see
+// modules/translate.js. Five action rows is a hard Discord limit and exceeding
+// it rejects the whole message, so a post that already uses all five keeps its
+// buttons and goes without the dropdown rather than failing to send at all.
+function withLanguageRow(payload) {
+  const components = [...(payload.components || [])];
+  if (components.length >= 5) return payload;
+  components.push(translate.languageRow());
+  return { ...payload, components };
+}
 
 // ─── ENV Config ───────────────────────────────────────────────────────────────
 const TOKEN          = process.env.DISCORD_TOKEN;
@@ -2105,6 +2118,10 @@ const ownCommands = [
     .addChannelOption(o => o.setName('channel').setDescription('Channel to post in (defaults to current channel)').setRequired(false)),
   new SlashCommandBuilder().setName('post-payment-method').setDescription('Staff: Post the Payment Methods')
     .addChannelOption(o => o.setName('channel').setDescription('Channel to post in (defaults to current channel)').setRequired(false)),
+  // Everyone, not staff: this is the customer telling us what to read to them.
+  new SlashCommandBuilder().setName('language').setDescription('Choose the language the bot answers you in')
+    .addStringOption(o => o.setName('language').setDescription('Your language / tu idioma / votre langue').setRequired(true)
+      .addChoices(...translate.LANGS.map(l => ({ name: `${l.flag} ${l.native}`, value: l.code })))),
   new SlashCommandBuilder().setName('listguilds').setDescription('Owner only: List every server the bot is currently in'),
   new SlashCommandBuilder().setName('leaveguild').setDescription('Owner only: Make the bot leave a specific server')
     .addStringOption(o => o.setName('guild_id').setDescription('The server ID to leave (from /listguilds)').setRequired(true)),
@@ -3805,8 +3822,11 @@ client.on('interactionCreate', async interaction => {
         // 6000 characters across all embeds in one message is a hard Discord
         // limit, and exceeding it rejects the WHOLE message — the terms would
         // post as nothing at all. Send in runs that fit instead.
+        // The dropdown goes on EVERY message of a paginated document, not just
+        // the last: it translates the message it is attached to, so a reader
+        // looking at page 2 needs one there to translate page 2.
         const messages = chunkEmbedsIntoMessages(embeds);
-        for (const m of messages) await channel.send({ embeds: m });
+        for (const m of messages) await channel.send(withLanguageRow({ embeds: m }));
 
         await interaction.reply({
           content: `✅ Posted ${meta.label} in <#${channel.id}>` +
@@ -3814,6 +3834,27 @@ client.on('interactionCreate', async interaction => {
           flags: 64,
         });
         return;
+      }
+
+      // ── /language ────────────────────────────────────────────────────────
+      if (cmd === 'language') {
+        const code = interaction.options.getString('language');
+        const meta = translate.LANG_BY_CODE.get(code);
+        if (!meta) return interaction.reply({ content: '❌ Unknown language.', flags: 64 });
+        const saved = await translate.setUserLang(interaction.guildId || 'dm', interaction.user.id, code);
+        if (!saved) {
+          return interaction.reply({ content: '❌ Could not save that just now — try again in a moment.', flags: 64 });
+        }
+        // Answered in the language just chosen, translated by the same path
+        // every post uses. If translation is down, this sentence arrives in
+        // English — which is itself the honest signal that it is down.
+        const body = code === translate.DEFAULT_LANG
+          ? 'Done. Anything this bot sends you privately — order deliveries included — will be in English.'
+          : await translate.translateText(
+              'Done. Anything this bot sends you privately — order deliveries included — will be in this language from now on.'
+              + ' Posts in the server stay in English for everyone; use the language dropdown under a post to read that one.',
+              code);
+        return interaction.reply({ content: `${meta.flag} **${meta.native}** — ${body}`, flags: 64 });
       }
 
       // ── /listguilds ──────────────────────────────────────────────────────
@@ -4535,6 +4576,14 @@ client.on('interactionCreate', async interaction => {
 
     // ── Select menus ──────────────────────────────────────────────────────────
     if (interaction.isStringSelectMenu()) {
+      // Language dropdown — first, and deliberately knowing nothing about which
+      // post it is on. It translates the embeds of the message it was clicked
+      // from, which is what makes it work on posts written long before it
+      // existed and on posts nobody has thought of yet.
+      if (interaction.customId === 'xlate_lang') {
+        return translate.handleLanguageSelect(interaction, { chunkEmbedsIntoMessages });
+      }
+
       // Steam stock — type chosen from the postgensteam panel dropdown
       if (interaction.customId === 'gensteam_select_type') {
         if (!await canAccessStock(interaction.member)) {
@@ -4938,7 +4987,7 @@ client.on('interactionCreate', async interaction => {
         }
 
         try {
-          await interaction.channel.send(payload);
+          await interaction.channel.send(withLanguageRow(payload));
           await interaction.editReply({ content: `✅ Update posted to <#${interaction.channel.id}>${describeSync(siteSync)}` });
           // A warning needs long enough to actually be read.
           autoDelete(interaction, siteSync && !siteSync.ok ? 30000 : 5000);
@@ -4971,7 +5020,7 @@ client.on('interactionCreate', async interaction => {
         embed.setDescription(message).setFooter({ text: `${BOT_NAME} | ${SITE_URL}`, iconURL: client.user.displayAvatarURL() }).setTimestamp();
         const buttonRow = dlUrl ? new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel('⬇️  DOWNLOAD').setURL(dlUrl).setStyle(ButtonStyle.Link)) : null;
         try {
-          await targetCh.send({ content: pingText, embeds: [embed], ...(buttonRow ? { components: [buttonRow] } : {}) });
+          await targetCh.send(withLanguageRow({ content: pingText, embeds: [embed], ...(buttonRow ? { components: [buttonRow] } : {}) }));
           await interaction.reply({ content: `✅ Announcement posted to <#${targetCh.id}>`, flags: 64 }); autoDelete(interaction, 5000);
         } catch (err) { await interaction.reply({ content: `❌ Failed: ${err.message}`, flags: 64 }); autoDelete(interaction, 8000); }
         return;
@@ -5005,7 +5054,7 @@ client.on('interactionCreate', async interaction => {
         }
 
         try {
-          await statusCh.send({ content: pingText, embeds: [embed] });
+          await statusCh.send(withLanguageRow({ content: pingText, embeds: [embed] }));
           await interaction.editReply({ content: `✅ Status update posted to <#${statusCh.id}>${describeSync(siteSync)}` });
           autoDelete(interaction, siteSync && !siteSync.ok ? 30000 : 5000);
         } catch (err) { await interaction.editReply({ content: `❌ Failed: ${err.message}${describeSync(siteSync)}` }); autoDelete(interaction, 12000); }

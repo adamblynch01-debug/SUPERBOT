@@ -22,6 +22,23 @@ const crypto = require('crypto');
 const { EmbedBuilder } = require('discord.js');
 const { query } = require('../db');
 const { registerWebTicketRoutes } = require('./webTickets');
+const { getUserLang, translateEmbeds, DEFAULT_LANG } = require('./translate');
+
+// A delivery DM in the buyer's own language, but ONLY if they have chosen one
+// with /language. No choice means no lookup hit, no network call and byte-for-
+// byte the message this has always sent — which is the right default for the
+// one path in this system that must never get slower or more fragile. The
+// license keys travel inside ``` fences, which modules/translate.js masks.
+async function localizeForBuyer(discordId, guildId, embeds) {
+  try {
+    const lang = await getUserLang(guildId || process.env.GUILD_ID || 'dm', String(discordId));
+    if (!lang || lang === DEFAULT_LANG) return embeds;
+    return await translateEmbeds(embeds, lang);
+  } catch (err) {
+    console.warn('[Internal] delivery DM translation skipped:', err.message);
+    return embeds;
+  }
+}
 
 // Discord's hard caps. Exceeding any one rejects the WHOLE message, so
 // everything user-supplied is clipped on the way in. Clipping is always marked
@@ -393,7 +410,7 @@ function registerInternalRoutes(app, client) {
         if (fieldCount > 0) {
           try {
             const user = await client.users.fetch(String(discord_id));
-            await user.send({ embeds: [embed] });
+            await user.send({ embeds: await localizeForBuyer(discord_id, guild_id, [embed]) });
             out.dm = true;
             console.log(`[Internal] Delivered goods to Discord user ${discord_id}`);
           } catch (err) {

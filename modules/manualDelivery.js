@@ -34,6 +34,7 @@ const {
 } = require('discord.js');
 const axios = require('axios');
 const { query } = require('../db');
+const { getUserLang, translateEmbeds, DEFAULT_LANG } = require('./translate');
 
 const BACKEND_URL = process.env.BACKEND_URL || process.env.API_URL || 'http://localhost:3000';
 const API_SECRET  = process.env.API_SECRET;
@@ -315,7 +316,15 @@ async function submitKeys(interaction, client) {
       })
       .setFooter({ text: `Invoice: ${data.invoice_no}` })
       .setTimestamp();
-    await buyer.send({ embeds: [dm] });
+    // "byte-for-byte the one a website order produces" still holds: that one
+    // gets the same treatment, and neither is translated unless the buyer has
+    // picked a language with /language.
+    let out = [dm];
+    try {
+      const lang = await getUserLang(GUILD_ID, String(buyerId));
+      if (lang && lang !== DEFAULT_LANG) out = await translateEmbeds(out, lang);
+    } catch (e) { console.warn('[ManualDelivery] DM translation skipped:', e.message); }
+    await buyer.send({ embeds: out });
     dmOk = true;
   } catch (err) {
     dmErr = err.code === 50007 ? 'their DMs are closed' : err.message;
