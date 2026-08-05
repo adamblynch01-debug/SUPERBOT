@@ -53,6 +53,7 @@ const { offerImageUpload } = require('./modules/imageAttach');
 const { makeStaffRoleResolver } = require('./modules/staffRoles');
 const serverBackup = require('./modules/serverBackup');
 const mirror = require('./modules/mirror');
+const counting = require('./modules/counting');
 
 // ─── Mirror relay state ───────────────────────────────────────────────────────
 // Three pieces of memory, all of them there to stop a loop or a stampede.
@@ -1372,103 +1373,42 @@ async function claimStockAccount(interaction, type) {
   }
 }
 
-// Small, safe math expression evaluator for the counting game — deliberately
-// NOT eval() (that would let anyone run arbitrary JS by posting it in the
-// counting channel). Hand-written tokenizer + recursive-descent parser that
-// only understands digits, + - * / ^ and parentheses. Returns a number, or
-// null if the input isn't a valid expression this parser understands.
-function evalMathExpression(expr) {
-  const clean = expr.replace(/\s+/g, '');
-  if (!clean) return null;
-  if (!/^[0-9+\-*/^().]+$/.test(clean)) return null; // reject anything unexpected outright
+// The counting-game evaluator lives in modules/counting.js. It replaced a
+// parser here that understood digits, `+ - * / ^` and parentheses and nothing
+// else — and treated everything it did not understand as a wrong answer, which
+// reset the whole server's streak. `5 × 5` was enough to do it, and `×` is the
+// character a phone keyboard inserts when you press the multiply key.
 
-  let pos = 0;
-  const peek = () => clean[pos];
-  const consume = () => clean[pos++];
+// Two people can type the same number within a second of each other. The
+// slower message is a race, not a miscount, and resetting on it is the single
+// most common way a streak died unfairly.
+const COUNTING_RACE_MS = 3000;
 
-  function parseNumber() {
-    const start = pos;
-    while (pos < clean.length && /[0-9.]/.test(clean[pos])) pos++;
-    if (pos === start) return null;
-    const n = parseFloat(clean.slice(start, pos));
-    return Number.isNaN(n) ? null : n;
-  }
-
-  function parseFactor() {
-    if (peek() === '(') {
-      consume();
-      const v = parseExpression();
-      if (v === null || peek() !== ')') return null;
-      consume();
-      return v;
-    }
-    if (peek() === '-') { consume(); const v = parseFactor(); return v === null ? null : -v; }
-    return parseNumber();
-  }
-
-  function parsePower() {
-    const base = parseFactor();
-    if (base === null) return null;
-    if (peek() === '^') {
-      consume();
-      const exp = parsePower(); // right-associative: 2^3^2 = 2^(3^2)
-      return exp === null ? null : Math.pow(base, exp);
-    }
-    return base;
-  }
-
-  function parseTerm() {
-    let v = parsePower();
-    if (v === null) return null;
-    while (peek() === '*' || peek() === '/') {
-      const op = consume();
-      const rhs = parsePower();
-      if (rhs === null) return null;
-      if (op === '*') v *= rhs;
-      else { if (rhs === 0) return null; v /= rhs; }
-    }
-    return v;
-  }
-
-  function parseExpression() {
-    let v = parseTerm();
-    if (v === null) return null;
-    while (peek() === '+' || peek() === '-') {
-      const op = consume();
-      const rhs = parseTerm();
-      if (rhs === null) return null;
-      v = op === '+' ? v + rhs : v - rhs;
-    }
-    return v;
-  }
-
-  const result = parseExpression();
-  if (result === null || pos !== clean.length) return null; // leftover characters = malformed input
-  return result;
+/** Trims float noise off a value before showing it to the channel. */
+function fmtCount(n) {
+  if (!Number.isFinite(n)) return String(n);
+  return Number.isInteger(n) ? String(n) : String(Number(n.toFixed(6)));
 }
 
 async function handleCountingMessage(message) {
   const gid   = message.guild.id;
   const state = countingData.get(gid) || { count: 0, lastUserId: null, highScore: 0 };
-  const raw   = message.content.trim();
+  const raw   = message.content;
   const expected = state.count + 1;
+
+  const read = counting.readCount(raw, expected);
+
+  // Not a count at all — "gg", "nice one", a reaction emoji. This used to
+  // reset the streak, because anything the old parser could not read was
+  // treated as a wrong answer. Talking in the channel is not miscounting.
+  if (read.verdict === 'chatter') return;
+
   const sameUserTwice = state.lastUserId === message.author.id;
 
-  // Accept either a plain number ("10") or a math expression that evaluates
-  // to the expected number ("5+5", "20/2", "10^2", "2*(1+4)") — a common
-  // way counting-game communities spice things up.
-  let num = NaN;
-  if (/^\d+$/.test(raw)) {
-    num = parseInt(raw, 10);
-  } else {
-    const evaluated = evalMathExpression(raw);
-    if (evaluated !== null && Number.isInteger(evaluated)) num = evaluated;
-  }
-  const isValidNumber = !Number.isNaN(num);
-
-  if (isValidNumber && num === expected && !sameUserTwice) {
+  if (read.verdict === 'correct' && !sameUserTwice) {
     state.count = expected;
     state.lastUserId = message.author.id;
+    state.lastAt = Date.now();
     if (state.count > (state.highScore || 0)) state.highScore = state.count;
     countingData.set(gid, state);
     saveCounting();
@@ -1476,14 +1416,24 @@ async function handleCountingMessage(message) {
     return;
   }
 
-  // Wrong number, repeat user, or non-numeric message — reset the count
+  // The race: someone else's message says the number that was accepted a
+  // moment ago. Delete the duplicate, keep the streak.
+  if (!sameUserTwice && state.count > 0 && state.lastAt &&
+      Date.now() - state.lastAt < COUNTING_RACE_MS &&
+      counting.readCount(raw, state.count).verdict === 'correct') {
+    try { if (message.deletable) await message.delete(); } catch (_) {}
+    return;
+  }
+
+  // A genuine miscount, or the same person counting twice in a row.
   const brokenAt = state.count;
   const reason = sameUserTwice
-    ? "counted twice in a row"
-    : (!isValidNumber ? "didn't post a valid number or equation" : `posted ${raw} instead of ${expected}`);
+    ? 'counted twice in a row'
+    : `posted **${fmtCount(read.value)}** instead of **${expected}**`;
 
   state.count = 0;
   state.lastUserId = null;
+  state.lastAt = 0;
   countingData.set(gid, state);
   saveCounting();
 
