@@ -92,10 +92,34 @@ const PROTECT = [
 const MASK_OPEN = '\u27E6';
 const MASK_CLOSE = '\u27E7';
 
-function mask(text) {
+const escapeRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+// The header above claims product names are protected. They were not: no
+// pattern in PROTECT can tell "H8ED Private External — Month" from a sentence,
+// and none ever will, because a product name is only a name by DECREE of
+// whoever sells it. A Spanish-speaking buyer's delivery DM came back offering
+// them "H8ED Privado Externo — Día", which is not a thing this shop sells and
+// not a thing they can quote back to staff.
+//
+// So the caller names them. Whoever builds the embed already holds
+// product_name and tier_label as separate values and knows exactly which
+// characters are a catalogue key; this module never can. Literals are masked
+// BEFORE the generic rules, so a name containing a price or a URL is taken
+// whole rather than nibbled apart, and longest-first so a tier label that also
+// appears inside a product name cannot shadow it.
+//
+// Two characters or fewer are ignored: a product called "GB" would otherwise
+// mask that substring out of the ordinary words around it.
+function literalRules(extra) {
+  return [...new Set((extra || []).map(s => String(s == null ? '' : s).trim()).filter(s => s.length > 2))]
+    .sort((a, b) => b.length - a.length)
+    .map(s => new RegExp(escapeRe(s), 'gi'));
+}
+
+function mask(text, extra) {
   const kept = [];
   let out = String(text);
-  for (const re of PROTECT) {
+  for (const re of [...literalRules(extra), ...PROTECT]) {
     out = out.replace(re, (m) => {
       kept.push(m);
       return `${MASK_OPEN}${kept.length - 1}${MASK_CLOSE}`;
@@ -223,11 +247,18 @@ function chunk(text, limit = 1500) {
 // Returns the translated string, or the ORIGINAL if anything at all went wrong.
 // Never throws and never returns a partial translation: half a document in
 // Spanish reads as a bug in the post, not as a failure of this module.
-async function translateText(text, lang) {
+async function translateText(text, lang, protect) {
   const src = String(text == null ? '' : text);
   if (!src.trim() || lang === DEFAULT_LANG || !LANG_BY_CODE.has(lang)) return src;
 
-  const hash = hashOf(src);
+  // The protected literals are part of the cache key, not just of the request.
+  // The same sentence masked differently is a different translation, and the
+  // one already in Postgres from before this existed is the unmasked one — so
+  // reusing it by source alone would serve exactly the output being fixed.
+  // With no literals the key is unchanged, so every entry cached so far stays
+  // valid for the calls that produced it.
+  const literals = [...new Set((protect || []).map(s => String(s == null ? '' : s).trim()).filter(s => s.length > 2))].sort();
+  const hash = hashOf(literals.length ? `${src} ${literals.join(' ')}` : src);
   const hit = await cacheGet(hash, lang);
   if (hit !== null) return hit;
 
@@ -235,7 +266,7 @@ async function translateText(text, lang) {
   try {
     const pieces = [];
     for (const part of chunk(src)) {
-      const { masked, kept } = mask(part);
+      const { masked, kept } = mask(part, protect);
       // A chunk with no words left after masking is a divider or a bare URL;
       // sending it wastes a call and sometimes comes back mangled.
       if (!masked.replace(new RegExp(`${MASK_OPEN}\\d+${MASK_CLOSE}`, 'g'), '').trim()) {
@@ -263,17 +294,17 @@ async function translateText(text, lang) {
 // Read straight off interaction.message, so this works on a post whose builder
 // this module has never seen. The footer is left alone on purpose: it is the
 // bot name, a page number and a URL, none of which are sentences.
-async function translateEmbed(embedJson, lang) {
+async function translateEmbed(embedJson, lang, protect) {
   const d = JSON.parse(JSON.stringify(embedJson || {}));
-  if (d.title) d.title = await translateText(d.title, lang);
-  if (d.description) d.description = await translateText(d.description, lang);
+  if (d.title) d.title = await translateText(d.title, lang, protect);
+  if (d.description) d.description = await translateText(d.description, lang, protect);
   if (Array.isArray(d.fields)) {
     for (const f of d.fields) {
-      if (f.name) f.name = await translateText(f.name, lang);
-      if (f.value) f.value = await translateText(f.value, lang);
+      if (f.name) f.name = await translateText(f.name, lang, protect);
+      if (f.value) f.value = await translateText(f.value, lang, protect);
     }
   }
-  if (d.author && d.author.name) d.author.name = await translateText(d.author.name, lang);
+  if (d.author && d.author.name) d.author.name = await translateText(d.author.name, lang, protect);
   // Embed limits are enforced by Discord on the way out and a translation is
   // routinely longer than its English source — German and Russian especially.
   // Trimming here is what stops a 4096-character document coming back as a
@@ -287,9 +318,13 @@ async function translateEmbed(embedJson, lang) {
   return EmbedBuilder.from(d);
 }
 
-async function translateEmbeds(embeds, lang) {
+// `protect` is optional and defaults to nothing, so the dropdown path — which
+// reads an arbitrary post off interaction.message and cannot know what is in it
+// — behaves exactly as before. Only the callers that HOLD the catalogue values
+// pass them.
+async function translateEmbeds(embeds, lang, protect) {
   const out = [];
-  for (const e of embeds || []) out.push(await translateEmbed(e.toJSON ? e.toJSON() : (e.data || e), lang));
+  for (const e of embeds || []) out.push(await translateEmbed(e.toJSON ? e.toJSON() : (e.data || e), lang, protect));
   return out;
 }
 

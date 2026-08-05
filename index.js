@@ -15,6 +15,7 @@ const {
   REST, Routes, SlashCommandBuilder,
   ModalBuilder, TextInputBuilder, TextInputStyle,
   StringSelectMenuBuilder, StringSelectMenuOptionBuilder,
+  GuildSystemChannelFlags,
 } = require('discord.js');
 
 const { createCanvas, loadImage } = require('canvas');
@@ -43,11 +44,16 @@ const support    = require('./modules/support');
 const { startAuthServer, handle2FAInteraction } = require('./modules/auth2fa');
 const { getAllProducts, getProduct, setProductUrl, getProductChunks, getProductByName, refresh: dlRefresh } = require('./modules/downloads');
 const { handleWebTicketButton, handleWebTicketModal } = require('./modules/webTickets');
-const { commands: smsCommands, handleSMSInteraction, setSMSAccessGate } = require('./modules/sms-gen');
-const { logGeneration } = require('./modules/genLog');
+const { commands: smsCommands, handleSMSInteraction, setSMSAccessGate, setSmsSettingsProvider } = require('./modules/sms-gen');
+const { logGeneration, setGenLogSettingsProvider } = require('./modules/genLog');
 const {
   commands: manualCommands, handleManualInteraction, setManualAccessGate,
+  setManualSettingsProvider,
 } = require('./modules/manualDelivery');
+const {
+  commands: storefrontCommands, handleStorefrontCommand, handleStorefrontButton, setStorefrontGate,
+  buildWebsitePanel, storeConfig: storefrontConfig, upsertPanel, MARK_SITE,
+} = require('./modules/storefrontPanels');
 const translate = require('./modules/translate');
 const { offerImageUpload } = require('./modules/imageAttach');
 const { makeStaffRoleResolver } = require('./modules/staffRoles');
@@ -381,13 +387,22 @@ const VERIFIED_ROLE_ENV  = process.env.VERIFIED_ROLE_NAME  || 'Verified';
 const VERIFY_CHANNEL_ENV = process.env.VERIFY_CHANNEL_NAME || 'get-verify';
 const WELCOME_CHANNEL_ENV= process.env.WELCOME_CHANNEL_NAME|| 'welcome';
 const WELCOME_CHANNEL_ID = process.env.WELCOME_CHANNEL_ID || '1400773021274341396';
-// #invites — every join announcement, the reward panel and the leave notice
-// resolve through here. The old literal (1482585544998256781) was a channel the
-// tracker had been posting into by accident; the operator's actual invites
-// channel is below. Env var still wins, and guild_settings.invites_channel_id
-// wins over both.
-const INVITES_CHANNEL_ID = process.env.INVITES_CHANNEL_ID || '1400878017667923968';
+// TWO channels, not one. They were the same setting until now, and a previous
+// round guessed the wrong one of the pair: the reward panel has been landing in
+// #invite-tracker, which is the log.
+//
+//   #invites       — the reward panel. One pinned post with three buttons, in a
+//                    channel members are meant to read.
+//   #invite-tracker— "X was invited by Y", "X left". One line per join, forever.
+//
+// Putting the panel in the log buried it under the log. Putting the log in
+// #invites turns a panel channel into a firehose — which is what a second
+// server saw, because it had neither ID set and both fell back to the name
+// "invites".
+const INVITES_CHANNEL_ID = process.env.INVITES_CHANNEL_ID || '1482585544998256781';
 const INVITES_CHANNEL_ENV= process.env.INVITES_CHANNEL_NAME|| 'invites';
+const INVITE_LOG_CHANNEL_ID = process.env.INVITE_LOG_CHANNEL_ID || '1400878017667923968';
+const INVITE_LOG_CHANNEL_ENV= process.env.INVITE_LOG_CHANNEL_NAME|| 'invite-tracker';
 const INVITES_NEEDED_ENV = parseInt(process.env.INVITES_NEEDED || '10');
 
 // Updates module
@@ -631,6 +646,9 @@ async function clearStockCooldown(guildId, userId, type) {
 // gate the rest of the bot already uses, and every entry point of that flow
 // (command, select menu, modal) is checked against it.
 setManualAccessGate({ hasAccess: (i) => hasAccess(i) });
+// Same gate for the storefront panels. Posting one rewrites a channel every
+// member reads, so it is staff-only for the same reason /post-tos is.
+setStorefrontGate({ hasAccess: (i) => hasAccess(i) });
 
 setSMSAccessGate({
   canAccess:     canAccessStock,
@@ -1010,6 +1028,7 @@ async function mintKeysForPanel({ guildId, roleId, duration, count, createdBy })
     what: `${n} × ${role.name}`,
     detail: `Duration: ${durationLabel}`,
     source: 'web panel',
+    guildId,
   }).catch(() => {});
 
   return { ok: true, keys, roleName: role.name, durationLabel };
@@ -1215,12 +1234,14 @@ async function getGuildSettings(guildId) {
     welcomeChannelId:   row?.welcome_channel_id    || (isOriginal ? WELCOME_CHANNEL_ID : null),
     verifyChannelId:    row?.verify_channel_id     || null,
     invitesChannelId:   row?.invites_channel_id    || (isOriginal ? INVITES_CHANNEL_ID : null),
+    inviteLogChannelId: row?.invite_log_channel_id || (isOriginal ? INVITE_LOG_CHANNEL_ID : null),
 
     // Name-based bootstrap fallbacks — only used when the ID above isn't set.
     verifiedRoleName:   row?.verified_role_name    || (isOriginal ? VERIFIED_ROLE_ENV   : 'Verified'),
     verifyChannelName:  row?.verify_channel_name   || (isOriginal ? VERIFY_CHANNEL_ENV  : 'get-verify'),
     welcomeChannelName: row?.welcome_channel_name  || (isOriginal ? WELCOME_CHANNEL_ENV : 'welcome'),
     invitesChannelName: row?.invites_channel_name  || (isOriginal ? INVITES_CHANNEL_ENV : 'invites'),
+    inviteLogChannelName: row?.invite_log_channel_name || (isOriginal ? INVITE_LOG_CHANNEL_ENV : 'invite-tracker'),
 
     invitesNeeded:      row?.invites_needed ?? (isOriginal ? INVITES_NEEDED_ENV : 10),
     genRoleId:          row?.gen_role_id          || (isOriginal ? GEN_ROLE_ID_ENV        : null),
@@ -1230,6 +1251,55 @@ async function getGuildSettings(guildId) {
     countingChannelId:  row?.counting_channel_id  || (isOriginal ? COUNTING_CHANNEL_ID : null),
     leaveVouchChannelId:row?.leave_vouch_channel_id || (isOriginal ? LEAVE_VOUCH_CHANNEL_ID : null),
     vouchesChannelId:   row?.vouches_channel_id    || (isOriginal ? VOUCHES_CHANNEL_ID    : null),
+
+    // ── Moderation and tickets ────────────────────────────────────────────
+    // These seven columns have existed since the panel was written. The panel
+    // validated them, saved them, and said "Saved 19 field(s)". Nothing read
+    // them — this object stopped at vouchesChannelId, so every one of them was
+    // a field you could fill in that did nothing at all. That is worse than a
+    // missing setting: a missing one at least looks missing.
+    //
+    // Deliberately NOT env-defaulted even on the original guild. antiscam.js
+    // and support.js still read their own env vars as the fallback when these
+    // come back null, so answering "null" here means "the panel has nothing to
+    // say about this guild" and the module keeps its old behaviour exactly.
+    // Answering with the env value here would instead mean the second server
+    // silently inherits the first server's channel ids, which is the bug.
+    logChannelId:       row?.log_channel_id       || null,
+    staffRoleId:        row?.staff_role_id        || null,
+    ticketLogChannel:   row?.ticket_log_channel   || null,
+    // ?? not ||, because 0 is a legitimate value for all four: 0 warnings
+    // before a ban is "ban on the first offence", and a 0-minute mute is a
+    // delete-only policy. || would silently turn either into the default.
+    warningsBeforeBan:   row?.warnings_before_ban   ?? null,
+    muteDurationMinutes: row?.mute_duration_minutes ?? null,
+    spamMessageLimit:    row?.spam_message_limit    ?? null,
+    spamTimeWindow:      row?.spam_time_window      ?? null,
+
+    // ── The twelve that only ever existed as env vars ─────────────────────
+    // An env var is one value for the whole process and the bot is in two
+    // servers, so each of these was a single id shared by both. On the second
+    // server that meant either the message went to the FIRST server's channel
+    // — client.channels.fetch is bot-wide and resolves across guilds without
+    // complaint — or it went nowhere.
+    //
+    // Same rule as the seven above: null, never the env value. Each consumer
+    // applies its own env fallback, so null means "the panel has nothing to
+    // say about this guild" and the original server is untouched until
+    // somebody fills a field in on purpose.
+    ordersChannelId:         row?.orders_channel_id          || null,
+    restockChannelId:        row?.restock_channel_id         || null,
+    vaultRestockChannelId:   row?.vault_restock_channel_id   || null,
+    manualDeliveryChannelId: row?.manual_delivery_channel_id || null,
+    smsGenChannelId:         row?.sms_gen_channel_id         || null,
+    genLogChannelId:         row?.gen_log_channel_id         || null,
+    alertsChannelId:         row?.alerts_channel_id          || null,
+    rankBoostLogChannel:     row?.rank_boost_log_channel     || null,
+    rankBoostRoleId:         row?.rank_boost_role_id         || null,
+    // NOT staffRoleId. staff_role_id is the money gate; this is the ticket
+    // rota. Collapsing them hands the till to everyone who answers tickets.
+    ticketStaffRoleId:       row?.ticket_staff_role_id       || null,
+    customerRoleId:          row?.customer_role_id           || null,
   };
 
   guildSettingsCache.set(guildId, { data, expiresAt: Date.now() + SETTINGS_CACHE_MS });
@@ -1239,6 +1309,63 @@ async function getGuildSettings(guildId) {
 function invalidateGuildSettings(guildId) {
   guildSettingsCache.delete(guildId);
 }
+
+// ─── The panel's settings, handed to the modules that enforce them ──────────
+// antiscam.js and support.js both used to read env vars at require time — one
+// set of thresholds and one set of channel ids for the whole bot, regardless of
+// how many servers it is in. They take a provider now, and this is where it is
+// installed: getGuildSettings is the single place a guild's configuration is
+// read and cached, so a save in the panel (which calls invalidateGuildSettings)
+// takes effect on the next message rather than at the next restart.
+//
+// Each module keeps its own env values as the fallback, which is why these
+// return the row's value or nothing at all — see the comment on the seven
+// fields above. Nothing here invents a default; that decision belongs to the
+// module that has to live with it.
+antiscam.setModConfigProvider(async (guildId) => {
+  const s = await getGuildSettings(guildId);
+  return {
+    warningsBeforeBan:   s.warningsBeforeBan,
+    muteDurationMinutes: s.muteDurationMinutes,
+    spamMessageLimit:    s.spamMessageLimit,
+    spamTimeWindow:      s.spamTimeWindow,
+    logChannelId:        s.logChannelId,
+  };
+});
+
+support.setSupportSettingsProvider(async (guildId) => {
+  const s = await getGuildSettings(guildId);
+  return {
+    ticketLogChannel:  s.ticketLogChannel,
+    // The ticket rota and the money gate are separate fields in the panel now,
+    // and this is why: staff_role_id gates /web-balance, /addstock, /clearstock
+    // and /giveaway. Ticket staff need Reply and Close, not the till. Falling
+    // back to staffRoleId when the ticket field is blank would have quietly
+    // re-merged the two for every guild that only filled in one.
+    ticketStaffRoleId:   s.ticketStaffRoleId,
+    rankBoostLogChannel: s.rankBoostLogChannel,
+    rankBoostRoleId:     s.rankBoostRoleId,
+  };
+});
+
+// The three modules that log to a channel of their own. Each keeps its own env
+// var and hardcoded fallback for when this answers null, so the original server
+// is untouched — what changes is that the second server can now name its own
+// channel instead of quietly writing into the first server's.
+setGenLogSettingsProvider(async (guildId) => {
+  const s = await getGuildSettings(guildId);
+  return { genLogChannelId: s.genLogChannelId };
+});
+
+setManualSettingsProvider(async (guildId) => {
+  const s = await getGuildSettings(guildId);
+  return { manualDeliveryChannelId: s.manualDeliveryChannelId };
+});
+
+setSmsSettingsProvider(async (guildId) => {
+  const s = await getGuildSettings(guildId);
+  return { smsGenChannelId: s.smsGenChannelId };
+});
 
 async function canAccessStock(member) {
   if (member.permissions.has('Administrator')) return true;
@@ -1437,6 +1564,7 @@ async function claimStockAccount(interaction, type) {
     remaining,
     delivered,
     source: interaction.isButton?.() ? 'panel button' : '/gensteam',
+    guildId: interaction.guild && interaction.guild.id,
   }).catch(() => {});
 
   if (delivered) {
@@ -1591,14 +1719,32 @@ async function recordJoin(gid, memberId, inviterId, code, fake) {
 // Accounts younger than this are counted but not rewarded.
 const FAKE_ACCOUNT_AGE_MS = Number(process.env.FAKE_ACCOUNT_AGE_DAYS || 7) * 24 * 60 * 60 * 1000;
 
-// "Who invited who", posted in the invites channel on every join. The tracker
+// Where the running commentary goes: every join, every leave. Explicitly NOT
+// the reward panel's channel.
+//
+// The last resort is null, not the panel channel. Falling back to #invites is
+// what a second server did when it had no ID configured, and it turned a
+// three-button post into a scrolling log — so a guild with no tracker channel
+// stays quiet and says why once, rather than quietly filling the wrong room.
+const warnedNoInviteLog = new Set();
+function inviteLogChannel(guild, settings) {
+  const ch = (settings.inviteLogChannelId && guild.channels.cache.get(settings.inviteLogChannelId))
+    || findChannelByName(guild, settings.inviteLogChannelName);
+  if (!ch && !warnedNoInviteLog.has(guild.id)) {
+    warnedNoInviteLog.add(guild.id);
+    console.warn(`[Invites] ${guild.name}: no invite log channel — set invite_log_channel_id in the panel, `
+      + `or create #${settings.inviteLogChannelName}. Join/leave lines are being dropped.`);
+  }
+  return ch || null;
+}
+
+// "Who invited who", posted in the invite log on every join. The tracker
 // kept the numbers but never said this out loud anywhere, so the only way to
 // see it was to press a button on your own profile.
 async function announceInvite(member, inviterId, fake, isRejoin) {
   try {
     const settings = await getGuildSettings(member.guild.id);
-    const ch = (settings.invitesChannelId && member.guild.channels.cache.get(settings.invitesChannelId))
-      || findChannelByName(member.guild, settings.invitesChannelName);
+    const ch = inviteLogChannel(member.guild, settings);
     // Returns the channel it posted to (null if it could not resolve one), so
     // /testinvite can report WHERE the announcement landed instead of just
     // "sent". A tracker posting into the wrong channel does not error — that is
@@ -1660,7 +1806,10 @@ const PRODUCT_COLORS = [
 const productColorMap    = {};
 let colorIndex           = 0;
 const productLastStatus  = {};
-const websiteMessages    = {};
+// websiteMessages used to live here — "which message is the website panel",
+// held in memory and therefore forgotten on every restart. The panel now
+// carries its own marker in its footer, so finding it is a search, not a
+// recollection. See /setwebsite below.
 const resellerMessages   = {};
 const pendingUpdates     = {};
 const resellerLinks      = { apply: 'https://uhservices.xyz/', panel: 'https://uhservices.xyz/' };
@@ -1921,19 +2070,31 @@ function hasAccess(interaction) {
 // So: resolve by id, and never create. A role the bot invents is by
 // construction not the role the server was built around, and handing someone a
 // decoy is worse than telling them the feature is misconfigured.
+//
+// Async now, and per-guild. A role id belongs to exactly one server — the same
+// "Customer" role has a different id in each — so the single env var could only
+// ever be right for one of them. On the other server the id is simply absent,
+// which sent every claim down the name fallback and, before that fallback was
+// hardened, straight into manufacturing a decoy role.
 const CUSTOMER_ROLE_ID_FALLBACK = '1242149583228768306'; // 🤝 Real One
-function resolveCustomerRole(guild) {
-  const id = process.env.CUSTOMER_ROLE_ID || CUSTOMER_ROLE_ID_FALLBACK;
+async function resolveCustomerRole(guild) {
+  let fromPanel = null;
+  try {
+    fromPanel = (await getGuildSettings(guild.id)).customerRoleId;
+  } catch (e) {
+    console.error('[Customer] settings read failed:', e.message);
+  }
+  const id = fromPanel || process.env.CUSTOMER_ROLE_ID || CUSTOMER_ROLE_ID_FALLBACK;
   const byId = guild.roles.cache.get(String(id));
   if (byId) return byId;
   // Only if the configured id is absent from THIS guild — a name is a last
   // resort, and it warns rather than pretending it is equivalent.
   const name = process.env.CUSTOMER_ROLE_NAME;
   if (name) {
-    console.warn(`[Customer] Role id ${id} not found in ${guild.id}; falling back to the name "${name}". Set CUSTOMER_ROLE_ID.`);
+    console.warn(`[Customer] Role id ${id} not found in ${guild.id}; falling back to the name "${name}". Set the customer role for this server in the panel.`);
     return guild.roles.cache.find(r => r.name === name) || null;
   }
-  console.warn(`[Customer] Role id ${id} not found in guild ${guild.id} — set CUSTOMER_ROLE_ID.`);
+  console.warn(`[Customer] Role id ${id} not found in guild ${guild.id} — set the customer role for this server in the panel.`);
   return null;
 }
 
@@ -2373,10 +2534,23 @@ function parseDuration(str) {
 }
 
 // Normalizes a channel name: lowercase, strip emoji/symbols/pipes/spaces, keep only letters/numbers/hyphens/underscores.
+// NFKD first, and that step is the whole reason the second server behaved as if
+// none of these settings existed. Its channels are named in MATHEMATICAL BOLD —
+// "📩︱𝐈𝐧𝐯𝐢𝐭𝐞𝐬", where 𝐈 is U+1D408, not the letter I. Those codepoints are
+// letters as far as \p{L} is concerned and they survived the strip, but
+// toLowerCase() has nothing to map them to, so the normalized name stayed
+// "𝐈𝐧𝐯𝐢𝐭𝐞𝐬" and never equalled "invites". Every name-based fallback in the bot
+// — welcome, verify, invites, the lot — silently resolved to nothing there.
+// NFKD decomposes the whole mathematical-alphanumeric block back to ASCII.
+//
+// Hyphens and underscores go too, so "𝐈𝐍𝐕𝐈𝐓𝐄_𝐓𝐑𝐀𝐂𝐊𝐄𝐑" answers to
+// "invite-tracker". A separator is a typographic choice, not an identity.
 function normalizeChannelName(name) {
   return (name || '')
+    .normalize('NFKD')
+    .replace(/\p{M}/gu, '')            // combining marks left behind by the decomposition
     .toLowerCase()
-    .replace(/[^\p{L}\p{N}\-_]/gu, ''); // strip everything except letters, numbers, hyphen, underscore (drops emoji, pipes, spaces)
+    .replace(/[^\p{L}\p{N}]/gu, '');   // drops emoji, pipes, spaces, hyphens, underscores
 }
 
 // Finds a channel whose normalized name contains the normalized target — survives emoji prefixes, pipes, capitalization, etc.
@@ -2717,6 +2891,7 @@ const allCommands = [
   ...ownCommands, ...support.supportCommands,
   ...smsCommands.map(c => c.toJSON()),
   ...manualCommands.map(c => c.toJSON()),
+  ...storefrontCommands.map(c => c.toJSON()),
 ];
 
 // ─── Command lockdown ─────────────────────────────────────────────────────────
@@ -2782,6 +2957,21 @@ client.once('ready', async () => {
       inviteCache.set(guild.id, cache);
     } catch (_) {}
   }
+
+  // Discord's own "X joined the server" line, turned off where this bot posts a
+  // welcome of its own.
+  //
+  // The complaint was "why showing users landing on general channel, when
+  // theres a welcome channel" — two different welcomes for the same person, in
+  // two different rooms, one of them a chat channel nobody wanted it in. The
+  // system channel is a GUILD setting, not something a bot writes; the only way
+  // to stop it is to set the flag, which needs Manage Server.
+  //
+  // Guarded three ways, because turning a server's own setting off from code is
+  // the sort of thing that should be conservative: only if this bot actually has
+  // a welcome channel to replace it with, only if the flag is not already set,
+  // and only if the permission is there — no attempt, no error spam.
+  await suppressNativeJoinMessages();
 
   // Invite counters + claimed-reward counts. Loaded before anything can read
   // them, so a join arriving seconds after boot does not write a zeroed row
@@ -3051,6 +3241,53 @@ client.on('guildMemberAdd', async member => {
   } catch (err) { console.error('Welcome card error:', err); }
 });
 
+// ─── Discord's own join line ─────────────────────────────────────────────────
+// Two flags, not one:
+//   SuppressJoinNotifications        — the "X joined the server" line itself.
+//   SuppressJoinNotificationReplies  — the "Wave to say hi!" sticker prompt
+//                                      Discord hangs off it, which outlives the
+//                                      line and looks like the feature is still
+//                                      half on.
+// Boost and setup-tip flags are deliberately left as the operator set them:
+// nothing in this bot replaces those, so turning them off would be taking a
+// decision that is not ours.
+async function suppressNativeJoinMessages() {
+  const WANT = GuildSystemChannelFlags.SuppressJoinNotifications
+             | GuildSystemChannelFlags.SuppressJoinNotificationReplies;
+
+  for (const [, guild] of client.guilds.cache) {
+    try {
+      // Only where this bot has something to say instead. A guild that has not
+      // configured a welcome channel and has no channel named like one is
+      // relying on Discord's line, and silencing it would leave joins invisible.
+      const settings = await getGuildSettings(guild.id);
+      const welcomeCh = (settings.welcomeChannelId && guild.channels.cache.get(settings.welcomeChannelId))
+        || findChannelByName(guild, settings.welcomeChannelName);
+      if (!welcomeCh) continue;
+
+      // Numbers, not BigInt: SystemChannelFlagsBitField is a 32-bit field and
+      // its resolver rejects a BigInt outright.
+      const current = Number(guild.systemChannelFlags?.bitfield ?? 0);
+      if ((current & WANT) === WANT) continue;   // already off
+
+      if (!guild.members.me?.permissions.has(PermissionFlagsBits.ManageGuild)) {
+        console.warn(`[Welcome] ${guild.name}: Discord still announces joins in `
+          + `#${guild.systemChannel?.name || 'the system channel'}, and turning that off needs **Manage Server**. `
+          + `Grant it, or untick "Send a random welcome message" in Server Settings → Overview.`);
+        continue;
+      }
+
+      // OR, never assign: the operator may have set other flags on purpose.
+      await guild.setSystemChannelFlags(current | WANT,
+        'Bot posts its own welcome card in #' + welcomeCh.name);
+      console.log(`[Welcome] ${guild.name}: Discord's own join message turned off — `
+        + `#${welcomeCh.name} is the welcome now.`);
+    } catch (e) {
+      console.warn(`[Welcome] ${guild.name}: could not adjust the system channel flags —`, e.message);
+    }
+  }
+}
+
 // ─── Member leaves ───────────────────────────────────────────────────────────
 // There was no guildMemberRemove handler at all, so `left` was permanently 0
 // and `real` only ever grew. The #invites panel promises "users who leave don't
@@ -3067,8 +3304,7 @@ client.on('guildMemberRemove', async member => {
     await saveInviteStats(member.guild.id, inviterId);
 
     const settings = await getGuildSettings(member.guild.id);
-    const ch = (settings.invitesChannelId && member.guild.channels.cache.get(settings.invitesChannelId))
-      || findChannelByName(member.guild, settings.invitesChannelName);
+    const ch = inviteLogChannel(member.guild, settings);
     if (!ch) return;
     await ch.send({
       embeds: [new EmbedBuilder()
@@ -3223,6 +3459,11 @@ client.on('interactionCreate', async interaction => {
     // autocomplete branch below (which only knows about /setdownload and would
     // otherwise let this one time out).
     if (await handleManualInteraction(interaction, client)) return;
+    // The #website and #payment-methods panels. findChannelByName is handed in
+    // rather than re-implemented in the module: it is the NFKD-folding resolver,
+    // which is the only reason "#💰︱𝐏𝐚𝐲𝐦𝐞𝐧𝐭-𝐦𝐞𝐭𝐡𝐨𝐝𝐬" resolves at all.
+    if (interaction.isChatInputCommand()
+      && await handleStorefrontCommand(interaction, { findChannel: findChannelByName })) return;
     // Autocomplete
     if (interaction.isAutocomplete() && interaction.commandName === 'setdownload') {
       const focused = interaction.options.getFocused().toLowerCase();
@@ -3251,7 +3492,7 @@ client.on('interactionCreate', async interaction => {
             { name: '🔐 Verification & Invites', value: '`/setup-verify` — Set up verification channel\n`/setup-invites` — Set up invite reward channel\n`/show-voucher-stats` — Invite leaderboard / one member\'s stats', inline: false },
             { name: '📦 Products & Downloads', value: '`/downloads` — Browse & download products\n`/setupdownloads` — Post download panel to #downloads\n`/setdownload` — Set a product download link', inline: false },
             { name: '📣 Updates & Status', value: '`/postupdate` — Post a product update\n`/statusupdate` — Post a status update\n`/announce` — Send a custom announcement', inline: false },
-            { name: '🌐 Server Setup', value: '`/setwebsite` — Pin website URL\n`/setupreseller` — Post reseller panel\n`/setresellerlinks` — Update reseller button links\n`/postimage` — Post an image', inline: false },
+            { name: '🌐 Server Setup', value: '`/setup-website` — Post the website panel\n`/setup-payments` — Post the payment methods panel (live fees)\n`/setupreseller` — Post reseller panel\n`/setresellerlinks` — Update reseller button links\n`/postimage` — Post an image', inline: false },
             { name: '💾 Server Snapshots', value: '`/serverbackup create` — Save the server\'s roles, channels & permissions\n`/serverbackup list|view|export` — Browse or download a snapshot\n`/serverbackup restore` — Rebuild from one (never deletes anything)', inline: false },
             { name: '🔁 Cross-Server Mirroring', value: '`/mirror follow` — Announcement channels: let another server follow this one (Discord delivers it)\n`/mirror add` — Any channel: relay its posts into another server\n`/mirror list|remove|test` — Manage the relays\n`/mirror panic` — Stop everything arriving here, right now\n`/mirror block|unblock|resume` — Refuse a server outright, or restart a paused route', inline: false },
             { name: '🎫 Support Tickets', value: '`/panel` — Post the support panel\n`/clearlogs` — Clear ticket log channel\n`/reply` — Reply to a user\'s ticket', inline: false },
@@ -3413,7 +3654,16 @@ client.on('interactionCreate', async interaction => {
           new ButtonBuilder().setCustomId('redeem_key').setLabel('🎁 Redeem Your Key').setStyle(ButtonStyle.Success),
         );
         await invCh.send({ embeds: [embed], components: [row] });
-        await interaction.editReply('✅ Invite system set up!'); autoDelete(interaction, 5000);
+        // Naming the channel, because the failure this fixes was silent: the
+        // command said "set up!" while the panel went into the log. If the
+        // answer below is not the channel the operator meant, they can see so
+        // without going to look for the post.
+        const logCh = inviteLogChannel(guild, settings);
+        await interaction.editReply(
+          `✅ Invite panel posted to <#${invCh.id}> — **#${invCh.name}** (\`${invCh.id}\`).\n`
+          + `📋 Join/leave lines go to ${logCh ? `<#${logCh.id}> — **#${logCh.name}**` : '**nowhere** — no invite log channel resolved'}.\n`
+          + 'Wrong channel? Set **Invites channel ID** / **Invite log channel ID** in the web panel.'
+        );
         return;
       }
 
@@ -3433,16 +3683,18 @@ client.on('interactionCreate', async interaction => {
         const ch = await announceInvite(interaction.member, interaction.user.id, false, false);
         if (!ch) {
           return interaction.editReply(
-            '❌ No invites channel could be resolved, so the announcement was dropped.\n' +
-            `• \`INVITES_CHANNEL_ID\` → \`${settings.invitesChannelId || '(unset)'}\`\n` +
-            `• name fallback → \`#${settings.invitesChannelName}\`\n` +
+            '❌ No invite **log** channel could be resolved, so the announcement was dropped.\n' +
+            `• \`INVITE_LOG_CHANNEL_ID\` → \`${settings.inviteLogChannelId || '(unset)'}\`\n` +
+            `• name fallback → \`#${settings.inviteLogChannelName}\`\n` +
+            'It no longer falls back to the invites panel channel — a log in the panel channel is the bug this split fixed.\n' +
             'Either the id points at a channel the bot cannot see, or it lacks **View Channel** / **Send Messages** there.'
           );
         }
         return interaction.editReply(
           `✅ Test join announcement posted to <#${ch.id}> — **#${ch.name}** (\`${ch.id}\`).\n` +
-          'That is the exact channel a real join will use. If it is the wrong one, ' +
-          'set `INVITES_CHANNEL_ID` or `guild_settings.invites_channel_id` to the right id.'
+          'That is the exact channel a real join will use — the **log**, not the panel.\n' +
+          `The reward panel lives separately in \`${settings.invitesChannelId || `#${settings.invitesChannelName}`}\`. ` +
+          'Either can be changed in the web panel.'
         );
       }
 
@@ -3575,26 +3827,29 @@ client.on('interactionCreate', async interaction => {
       }
 
       // ── /setwebsite ───────────────────────────────────────────────────────
+      // Used to post an embed whose entire body was the URL as a markdown link,
+      // and to remember which message that was in `websiteMessages` — an
+      // in-memory object, so a restart lost it and the next /setwebsite posted a
+      // SECOND one. Both are gone: it renders the same panel /setup-website
+      // does, and finds the previous one by the marker in its own footer, which
+      // is a fact about the message rather than a fact about this process.
       if (cmd === 'setwebsite') {
         if (!hasAccess(interaction)) return interaction.reply({ content: '❌ No permission.', flags: 64 });
+        await interaction.deferReply({ flags: 64 });
         let url = interaction.options.getString('url').trim();
         if (url && !url.startsWith('http')) url = 'https://' + url;
         const wsCh = findChannelByName(interaction.guild, 'website') || interaction.channel;
-        const displayUrl = url.replace(/^https?:\/\//, '');
-        const embed = new EmbedBuilder().setDescription(`### [${displayUrl}](${url})`).setColor(0x5865F2).setTimestamp();
-        const gKey = interaction.guild.id;
-        const existing = websiteMessages[gKey];
-        if (existing) {
-          try {
-            const ch = await client.channels.fetch(existing.channelId);
-            const msg = await ch.messages.fetch(existing.messageId);
-            await msg.edit({ content: '', embeds: [embed] });
-            await interaction.reply({ content: `✅ Website updated to **${url}** in <#${existing.channelId}>`, flags: 64 }); autoDelete(interaction, 5000); return;
-          } catch (_) {}
+        const cfg = await storefrontConfig();
+        const payload = buildWebsitePanel(interaction.guild, cfg, url);
+        try {
+          const { edited } = await upsertPanel(wsCh, MARK_SITE, payload, client.user);
+          await interaction.editReply(
+            `${edited ? '♻️ Refreshed' : '📌 Posted'} the website panel in <#${wsCh.id}> — **${url}**`
+            + (cfg ? '' : '\n⚠️ The store did not answer, so the accepted-payments line was left off. Run it again once it is up.')
+          );
+        } catch (e) {
+          await interaction.editReply(`❌ Could not post there: ${e.message}`);
         }
-        const msg = await wsCh.send({ content: '', embeds: [embed] });
-        websiteMessages[gKey] = { channelId: wsCh.id, messageId: msg.id };
-        await interaction.reply({ content: `📌 Website posted in <#${wsCh.id}>`, flags: 64 }); autoDelete(interaction, 5000);
         return;
       }
 
@@ -4214,6 +4469,7 @@ client.on('interactionCreate', async interaction => {
           what: `${amount} × ${role.name}`,
           detail: `Duration: ${durationLabel}`,
           source: '/genkey',
+          guildId: interaction.guild && interaction.guild.id,
         }).catch(() => {});
 
         return interaction.reply({
@@ -5486,8 +5742,8 @@ client.on('interactionCreate', async interaction => {
           const v = await claimOrderFor(targetMember, order_id, email);
           if (!v.success) return interaction.editReply({ content: claimRefusal(v, order_id) });
 
-          const role = resolveCustomerRole(interaction.guild);
-          if (!role) return interaction.editReply({ content: '❌ The customer role is not configured on this bot — set `CUSTOMER_ROLE_ID` to the role id.' });
+          const role = await resolveCustomerRole(interaction.guild);
+          if (!role) return interaction.editReply({ content: '❌ The customer role is not configured for this server — set it in the web panel (Settings → Customer role).' });
 
           const failure = await grantCustomerRole(targetMember, role);
           if (failure) {
@@ -5793,6 +6049,10 @@ client.on('interactionCreate', async interaction => {
       // needed for them.
       if (await handleWebTicketButton(interaction)) return;
 
+      // "How do I pay?" on the payment panel. Also before getGuildSettings —
+      // it answers from /api/config and needs nothing from this guild's row.
+      if (await handleStorefrontButton(interaction)) return;
+
       // Server-snapshot restore. Answered before getGuildSettings for the same
       // reason: it does not need it, and this is a long job that should not
       // start with an avoidable DB round trip.
@@ -6023,8 +6283,8 @@ client.on('interactionCreate', async interaction => {
             });
           }
 
-          const role = resolveCustomerRole(interaction.guild);
-          if (!role) return interaction.editReply({ content: '❌ The customer role is not configured on this bot — set `CUSTOMER_ROLE_ID` to the role id. Open a ticket and staff can grant it manually.' });
+          const role = await resolveCustomerRole(interaction.guild);
+          if (!role) return interaction.editReply({ content: '❌ The customer role is not configured for this server — staff can set it in the web panel (Settings → Customer role). Open a ticket and staff can grant it manually in the meantime.' });
 
           const failure = await grantCustomerRole(interaction.member, role);
           if (failure) {

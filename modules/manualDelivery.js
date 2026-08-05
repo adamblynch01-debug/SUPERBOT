@@ -35,6 +35,8 @@ const {
 const axios = require('axios');
 const { query } = require('../db');
 const { getUserLang, translateEmbeds, DEFAULT_LANG } = require('./translate');
+// One renderer for the buyer's DM, shared with the website delivery path.
+const { buildDeliveryEmbed } = require('./deliveryEmbed');
 
 const BACKEND_URL = process.env.BACKEND_URL || process.env.API_URL || 'http://localhost:3000';
 const API_SECRET  = process.env.API_SECRET;
@@ -70,13 +72,30 @@ const commands = [
 
 function money(cents) { return `$${((Number(cents) || 0) / 100).toFixed(2)}`; }
 
-async function manualChannel(client) {
-  const id = process.env.MANUAL_DELIVERY_CHANNEL_ID || MANUAL_CHANNEL_FALLBACK;
+// The panel's per-guild manual delivery channel, installed by index.js. The env
+// var and the fallback below are one id for the whole bot, and
+// client.channels.fetch resolves a channel in ANY guild the bot is in — so a
+// hand-delivered order on the second server was logged into the first server's
+// channel, complete with the buyer's email.
+let settingsFor = async () => null;
+function setManualSettingsProvider(fn) { if (typeof fn === 'function') settingsFor = fn; }
+
+async function manualChannel(client, guildId) {
+  let id = null;
+  if (guildId) {
+    try {
+      const s = await settingsFor(guildId);
+      id = (s && s.manualDeliveryChannelId) || null;
+    } catch (e) {
+      console.error('[ManualDelivery] could not read guild settings:', e.message);
+    }
+  }
+  id = id || process.env.MANUAL_DELIVERY_CHANNEL_ID || MANUAL_CHANNEL_FALLBACK;
   try {
     const ch = await client.channels.fetch(String(id));
     return ch && typeof ch.send === 'function' ? ch : null;
   } catch (e) {
-    console.error(`[ManualDelivery] channel ${id} unreachable: ${e.message} — set MANUAL_DELIVERY_CHANNEL_ID`);
+    console.error(`[ManualDelivery] channel ${id} unreachable: ${e.message} — set it in the panel for this server, or MANUAL_DELIVERY_CHANNEL_ID`);
     return null;
   }
 }
@@ -285,44 +304,36 @@ async function submitKeys(interaction, client) {
   }
 
   const values = data.values || [];
-  // GAME — PRODUCT — DURATION, the same order lineLabel() in internalEvents.js
-  // builds for a website order, and skipped on the same condition (a game whose
-  // name is already inside the product name would only repeat itself). A
-  // one-off with no tier has no game and keeps the old two-part title.
-  const _game = String(data.game_name || '').trim();
-  const _lead = _game && !new RegExp(`(^|\\s)${_game.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\s|$)`, 'i').test(String(data.product_name || ''))
-    ? `${_game} — ` : '';
-  const title  = `${_lead}${data.product_name}${data.tier_label ? ` — ${data.tier_label}` : ''}`;
+  // The buyer's DM is the one a website order produces — not by both files
+  // agreeing to build the same thing, which is how the two drifted, but because
+  // deliveryEmbed.js builds it and internalEvents.js calls the same function.
+  const { embed: dm, protect, lines: summaryLines, delivered } = buildDeliveryEmbed({
+    items: [{ game: data.game_name, product: data.product_name, tier: data.tier_label, qty, values }],
+    invoiceNo: data.invoice_no,
+    orderId: data.order_id,
+    email: data.email,
+  });
+  // Staff-facing strings still need a one-liner for the log below. It already
+  // carries its own bold and its own ×qty, so neither is added again.
+  const title = summaryLines[0] || `**${String(data.product_name || 'Item')}**`;
 
-  // The buyer's DM is byte-for-byte the one a website order produces — same
-  // title, same fenced block, same Invoice footer — so a hand-delivered order
-  // is indistinguishable to the customer from one they bought on the site.
   let dmOk = false, dmErr = null;
-  try {
+  // The backend answered, but with nothing in hand. "Your Order is Ready!" over
+  // an empty box is worse than no DM: it tells the buyer to go looking for a key
+  // that was never issued. Staff see it below and hand it over themselves.
+  if (!delivered) dmErr = 'the backend returned no values to deliver';
+  else try {
     const buyer = await client.users.fetch(String(buyerId));
-    const dm = new EmbedBuilder()
-      .setColor(0x00ff00)
-      .setTitle('✅ Your Order is Ready!')
-      .setDescription('Thank you for your purchase. Here are your goods:')
-      .addFields({ name: `📦 ${title}${qty > 1 ? ` ×${qty}` : ''}`.slice(0, 256), value: '```' + values.join('\n').slice(0, 1000) + '```' })
-      .addFields({
-        name: '🧾 Invoice',
-        // No email on the order is no longer a dead end: the claim accepts the
-        // Discord account it was delivered to, and creates a site account from
-        // it if there is none. Round 29 item 6.
-        value: `\`${data.invoice_no}\`\nKeep this. Use \`/claim-customer\` with it`
-          + `${data.email ? ` and \`${data.email}\`` : ' (leave the email blank — this order was delivered to you on Discord)'}`
-          + ' to get your customer role and put this order on your uhservices.xyz account, or quote it to staff.',
-      })
-      .setFooter({ text: `Invoice: ${data.invoice_no}` })
-      .setTimestamp();
-    // "byte-for-byte the one a website order produces" still holds: that one
-    // gets the same treatment, and neither is translated unless the buyer has
-    // picked a language with /language.
     let out = [dm];
     try {
       const lang = await getUserLang(GUILD_ID, String(buyerId));
-      if (lang && lang !== DEFAULT_LANG) out = await translateEmbeds(out, lang);
+      // What the buyer bought is not a sentence. The prose around it is theirs
+      // to read in their own language; the product, the tier and the invoice
+      // are what they quote back to staff and what /claim-customer looks up, so
+      // they leave in the name this shop sells them under. The renderer hands
+      // back exactly the strings it wrote, so the mask cannot fall out of step
+      // with the embed.
+      if (lang && lang !== DEFAULT_LANG) out = await translateEmbeds(out, lang, protect);
     } catch (e) { console.warn('[ManualDelivery] DM translation skipped:', e.message); }
     await buyer.send({ embeds: out });
     dmOk = true;
@@ -338,7 +349,7 @@ async function submitKeys(interaction, client) {
   const logEmbed = new EmbedBuilder()
     .setColor(dmOk ? 0xfaa61a : 0xED4245)
     .setTitle('🖐️ Manual Order Delivered')
-    .setDescription(`**${title}** ×${qty}`)
+    .setDescription(title)
     .addFields(
       { name: 'Invoice',  value: `\`${data.invoice_no}\``, inline: true },
       { name: 'Order ID', value: `${data.order_id}`, inline: true },
@@ -353,11 +364,11 @@ async function submitKeys(interaction, client) {
     .setTimestamp();
   if (note) logEmbed.addFields({ name: 'Reason', value: note.slice(0, 1024), inline: false });
 
-  const ch = await manualChannel(client);
+  const ch = await manualChannel(client, interaction.guild && interaction.guild.id);
   if (ch) await ch.send({ embeds: [logEmbed] }).catch(e => console.error('[ManualDelivery] log post failed:', e.message));
 
   const lines = [
-    `✅ Order **\`${data.invoice_no}\`** created — **${title}** ×${qty} for <@${buyerId}>.`,
+    `✅ Order \`${data.invoice_no}\` created for <@${buyerId}> — ${title}`,
     dmOk ? '📬 The buyer has been DM\'d.'
          : `⚠️ **The DM did not send** (${dmErr}). The order is recorded — hand the value over yourself:\n\`\`\`${values.join('\n').slice(0, 800)}\`\`\``,
     data.claimed_from_stock ? `📦 ${qty} key(s) taken from stock.` : '⌨️ Values were typed, no stock consumed.',
@@ -482,4 +493,7 @@ async function handleManualInteraction(interaction, client) {
   return true;
 }
 
-module.exports = { commands, handleManualInteraction, setManualAccessGate, MANUAL_CHANNEL_FALLBACK };
+module.exports = {
+  commands, handleManualInteraction, setManualAccessGate, MANUAL_CHANNEL_FALLBACK,
+  setManualSettingsProvider,
+};

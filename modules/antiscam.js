@@ -4,17 +4,50 @@
 const { EmbedBuilder } = require('discord.js');
 const db = require('../db');
 
-// ─── Config (overrideable via env) ─────────────────────────────────────────
-const WARNINGS_BEFORE_BAN   = parseInt(process.env.WARNINGS_BEFORE_BAN   || '3');
-const MUTE_DURATION_MINUTES = parseInt(process.env.MUTE_DURATION_MINUTES || '30');
-const SPAM_MESSAGE_LIMIT    = parseInt(process.env.SPAM_MESSAGE_LIMIT    || '3');
-const SPAM_TIME_WINDOW      = parseInt(process.env.SPAM_TIME_WINDOW      || '10'); // seconds
+// ─── Config ────────────────────────────────────────────────────────────────
+// These four numbers and the log channel used to be module constants read from
+// env at require time — ONE set of thresholds for the whole bot, no matter how
+// many servers it was in. The panel has had inputs for all five since it was
+// written, they validated, they saved to guild_settings, and the save toast
+// said "Saved 19 field(s)". Nothing read them. A setting that persists and is
+// never consulted is worse than a missing one: the missing one at least looks
+// missing.
+//
+// They are per-guild now, resolved through a provider index.js installs (see
+// setModConfigProvider). The env values below stay as the fallback, so a guild
+// that has saved nothing behaves exactly as before.
+const intOr = (v, d) => { const n = parseInt(v, 10); return Number.isFinite(n) && n >= 0 ? n : d; };
 
-// Kept as a STRING. Discord snowflakes are 19 digits — larger than
-// Number.MAX_SAFE_INTEGER — so parseInt() silently rounds them
-// (…341396 → …341400) and the channels.cache.get() below then misses every
-// time. Moderation logs went nowhere for as long as this was a number.
-let LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID ? String(process.env.LOG_CHANNEL_ID).trim() : null;
+// LOG_CHANNEL_ID is kept as a STRING. Discord snowflakes are 19 digits — larger
+// than Number.MAX_SAFE_INTEGER — so parseInt() silently rounds them
+// (…341396 → …341400) and channels.cache.get() then misses every time.
+// Moderation logs went nowhere for as long as this was a number.
+const ENV_MOD_CONFIG = {
+  warningsBeforeBan:   intOr(process.env.WARNINGS_BEFORE_BAN, 3),
+  muteDurationMinutes: intOr(process.env.MUTE_DURATION_MINUTES, 30),
+  spamMessageLimit:    intOr(process.env.SPAM_MESSAGE_LIMIT, 3),
+  spamTimeWindow:      intOr(process.env.SPAM_TIME_WINDOW, 10), // seconds
+  logChannelId: process.env.LOG_CHANNEL_ID ? String(process.env.LOG_CHANNEL_ID).trim() : null,
+};
+
+// index.js installs the real one; the stub keeps this module usable on its own
+// (the tests require it without a database).
+let modConfigProvider = async () => null;
+function setModConfigProvider(fn) { if (typeof fn === 'function') modConfigProvider = fn; }
+
+// A saved value wins over the env one, but only if it is actually a value —
+// `null` is what an unset column reads as, and spreading that over a default
+// would blank it.
+async function modConfig(guildId) {
+  let saved = null;
+  try { saved = await modConfigProvider(guildId); }
+  catch (e) { console.error('[AntiScam] could not read guild settings:', e.message); }
+  const out = { ...ENV_MOD_CONFIG };
+  if (saved) for (const [k, v] of Object.entries(saved)) {
+    if (v !== null && v !== undefined && v !== '') out[k] = v;
+  }
+  return out;
+}
 
 // ─── Mutable lists (can be changed via commands) ───────────────────────────
 let BANNED_LINKS = [
@@ -145,8 +178,14 @@ const INSTANT_DELETE_PHRASES = [
 ];
 
 // ─── State ─────────────────────────────────────────────────────────────────
-const userWarnings   = new Map(); // userId -> count
-const userScamTimes  = new Map(); // userId -> [timestamps]
+// Keyed by GUILD and user, not user alone. With one key per user, a warning
+// earned on the store server counted towards a ban on the second one — three
+// servers' worth of first offences and you are banned from a server you have
+// never misbehaved in. Warnings are a fact about a member, and a member is a
+// person in a particular guild.
+const userWarnings   = new Map(); // `${guildId}:${userId}` -> count
+const userScamTimes  = new Map(); // `${guildId}:${userId}` -> [timestamps]
+const modKey = (guildId, userId) => `${guildId}:${userId}`;
 
 // ─── Detection helpers ─────────────────────────────────────────────────────
 // Cut every allow-listed URL out of the text before anything looks at it. Note
@@ -198,17 +237,18 @@ function hasProfanity(content) {
   return { found: false, word: null };
 }
 
-function isSpamFlood(userId) {
+function isSpamFlood(guildId, userId, cfg) {
   const now  = Date.now();
-  const cutoff = now - SPAM_TIME_WINDOW * 1000;
-  const times = (userScamTimes.get(userId) || []).filter(t => t > cutoff);
+  const key  = modKey(guildId, userId);
+  const cutoff = now - cfg.spamTimeWindow * 1000;
+  const times = (userScamTimes.get(key) || []).filter(t => t > cutoff);
   times.push(now);
-  userScamTimes.set(userId, times);
-  return times.length >= SPAM_MESSAGE_LIMIT;
+  userScamTimes.set(key, times);
+  return times.length >= cfg.spamMessageLimit;
 }
 
 // ─── Embed builders ────────────────────────────────────────────────────────
-function banEmbed(user, reason, warnCount, channel) {
+function banEmbed(user, reason, warnCount, channel, maxWarn) {
   const e = new EmbedBuilder()
     .setTitle('🔨 User Banned').setColor(0xFF0000).setTimestamp()
     .setAuthor({ name: `${user.tag} was banned`, iconURL: user.displayAvatarURL() })
@@ -216,7 +256,7 @@ function banEmbed(user, reason, warnCount, channel) {
     .addFields(
       { name: '👤 User',     value: `${user}\n\`${user.tag}\``, inline: true },
       { name: '🪪 User ID',  value: `\`${user.id}\``,           inline: true },
-      { name: '⚠️ Warnings', value: `\`${warnCount}/${WARNINGS_BEFORE_BAN}\``, inline: true },
+      { name: '⚠️ Warnings', value: `\`${warnCount}/${maxWarn}\``, inline: true },
       { name: '📋 Reason',   value: reason.slice(0, 500),       inline: false },
     )
     .setFooter({ text: 'Anti-Scam Bot • Ban Log' });
@@ -240,7 +280,7 @@ function timeoutEmbed(user, reason, durMins, channel) {
   return e;
 }
 
-function scamDeleteEmbed(user, reason, content, warnCount, channel) {
+function scamDeleteEmbed(user, reason, content, warnCount, channel, maxWarn) {
   const e = new EmbedBuilder()
     .setTitle('🚨 Scam Message Deleted').setColor(0xFFA500).setTimestamp()
     .setAuthor({ name: user.tag, iconURL: user.displayAvatarURL() })
@@ -248,7 +288,7 @@ function scamDeleteEmbed(user, reason, content, warnCount, channel) {
     .addFields(
       { name: '👤 User',     value: `${user}\n\`${user.tag}\``, inline: true },
       { name: '🪪 User ID',  value: `\`${user.id}\``,           inline: true },
-      { name: '⚠️ Warnings', value: `\`${warnCount}/${WARNINGS_BEFORE_BAN}\``, inline: true },
+      { name: '⚠️ Warnings', value: `\`${warnCount}/${maxWarn}\``, inline: true },
       { name: '📍 Channel',  value: channel.toString(),         inline: true },
       { name: '📋 Reason',   value: reason.slice(0, 500),       inline: false },
     )
@@ -272,13 +312,33 @@ function spamBanEmbed(user, reason, deletedCount) {
 }
 
 // ─── Handlers ──────────────────────────────────────────────────────────────
-async function sendLog(guild, client, embed) {
-  if (!LOG_CHANNEL_ID) return;
-  const ch = guild.channels.cache.get(String(LOG_CHANNEL_ID));
-  if (ch) try { await ch.send({ embeds: [embed] }); } catch (_) {}
+// A guild only complains about its missing log channel once per boot. Silence
+// was the whole problem here: on the second server the configured id belonged
+// to the FIRST server, so channels.cache.get() missed on every single call and
+// moderation ran invisibly. That lookup is per-guild, so it was never going to
+// throw — it just returned undefined, forever.
+const warnedNoLog = new Set();
+async function sendLog(guild, client, embed, cfg) {
+  const id = cfg && cfg.logChannelId;
+  if (!id) {
+    if (!warnedNoLog.has(guild.id)) {
+      warnedNoLog.add(guild.id);
+      console.warn(`[AntiScam] ${guild.name}: no log channel — set it in the panel (Settings → Log channel). Moderation is running unlogged.`);
+    }
+    return;
+  }
+  const ch = guild.channels.cache.get(String(id));
+  if (!ch) {
+    if (!warnedNoLog.has(guild.id)) {
+      warnedNoLog.add(guild.id);
+      console.warn(`[AntiScam] ${guild.name}: log channel ${id} is not a channel in this server — it probably belongs to another one. Set it in the panel.`);
+    }
+    return;
+  }
+  try { await ch.send({ embeds: [embed] }); } catch (_) {}
 }
 
-async function handleSpamFlood(message, reason, client) {
+async function handleSpamFlood(message, reason, client, cfg) {
   const { guild, author } = message;
   let deletedCount = 0;
   for (const [, ch] of guild.channels.cache) {
@@ -293,42 +353,43 @@ async function handleSpamFlood(message, reason, client) {
   }
   try {
     await guild.ban(author, { reason: `Spam flood: ${reason}`, deleteMessageSeconds: 86400 });
-    await sendLog(guild, client, spamBanEmbed(author, reason, deletedCount));
-    userScamTimes.delete(author.id);
-    userWarnings.delete(author.id);
+    await sendLog(guild, client, spamBanEmbed(author, reason, deletedCount), cfg);
+    userScamTimes.delete(modKey(guild.id, author.id));
+    userWarnings.delete(modKey(guild.id, author.id));
   } catch (_) {}
 }
 
-async function handleViolation(message, reason, client) {
+async function handleViolation(message, reason, client, cfg) {
   const { guild, author, channel } = message;
   try { await message.delete(); } catch (_) { return; }
 
-  const count = (userWarnings.get(author.id) || 0) + 1;
-  userWarnings.set(author.id, count);
-  await sendLog(guild, client, scamDeleteEmbed(author, reason, message.content, count, channel));
+  const key = modKey(guild.id, author.id);
+  const count = (userWarnings.get(key) || 0) + 1;
+  userWarnings.set(key, count);
+  await sendLog(guild, client, scamDeleteEmbed(author, reason, message.content, count, channel, cfg.warningsBeforeBan), cfg);
 
-  if (WARNINGS_BEFORE_BAN > 0 && count >= WARNINGS_BEFORE_BAN) {
+  if (cfg.warningsBeforeBan > 0 && count >= cfg.warningsBeforeBan) {
     try { await author.send(`🔨 **You have been banned from ${guild.name}.**\nReason: ${count} violations — ${reason}`); } catch (_) {}
     try {
       await guild.ban(author, { reason: `${count} warnings: ${reason}`, deleteMessageSeconds: 86400 });
-      await sendLog(guild, client, banEmbed(author, reason, count, channel));
-      userWarnings.delete(author.id);
-      userScamTimes.delete(author.id);
+      await sendLog(guild, client, banEmbed(author, reason, count, channel, cfg.warningsBeforeBan), cfg);
+      userWarnings.delete(key);
+      userScamTimes.delete(key);
     } catch (_) {}
     return;
   }
 
   try {
     await author.send(
-      `⚠️ **Your message in ${guild.name} was removed.**\nReason: ${reason}\nWarning **${count}/${WARNINGS_BEFORE_BAN}** — continued violations will result in a ban.`
+      `⚠️ **Your message in ${guild.name} was removed.**\nReason: ${reason}\nWarning **${count}/${cfg.warningsBeforeBan}** — continued violations will result in a ban.`
     );
   } catch (_) {}
 
-  if (count === 1 && MUTE_DURATION_MINUTES > 0) {
+  if (count === 1 && cfg.muteDurationMinutes > 0) {
     try {
-      const until = new Date(Date.now() + MUTE_DURATION_MINUTES * 60 * 1000);
+      const until = new Date(Date.now() + cfg.muteDurationMinutes * 60 * 1000);
       await message.member.timeout(until.getTime() - Date.now(), reason);
-      await sendLog(guild, client, timeoutEmbed(author, reason, MUTE_DURATION_MINUTES, channel));
+      await sendLog(guild, client, timeoutEmbed(author, reason, cfg.muteDurationMinutes, channel), cfg);
     } catch (_) {}
   }
 }
@@ -338,23 +399,24 @@ async function handleViolation(message, reason, client) {
 // subsequent one through with a DM, which is backwards — a repeat offender
 // served less time than a first-timer. Here the timeout always applies and
 // doubles with each offence, and the ban threshold still ends it.
-async function handleBannedWord(message, word, client) {
+async function handleBannedWord(message, word, client, cfg) {
   const { guild, author, channel, member } = message;
   try { await message.delete(); } catch (_) { /* already gone */ }
 
-  const count  = (userWarnings.get(author.id) || 0) + 1;
-  userWarnings.set(author.id, count);
+  const key    = modKey(guild.id, author.id);
+  const count  = (userWarnings.get(key) || 0) + 1;
+  userWarnings.set(key, count);
   const reason = `Banned word — "${word}"`;
 
-  await sendLog(guild, client, scamDeleteEmbed(author, reason, message.content, count, channel));
+  await sendLog(guild, client, scamDeleteEmbed(author, reason, message.content, count, channel, cfg.warningsBeforeBan), cfg);
 
-  if (WARNINGS_BEFORE_BAN > 0 && count >= WARNINGS_BEFORE_BAN) {
+  if (cfg.warningsBeforeBan > 0 && count >= cfg.warningsBeforeBan) {
     try { await author.send(`🔨 **You have been banned from ${guild.name}.**\nReason: ${count} violations — ${reason}`); } catch (_) {}
     try {
       await guild.ban(author, { reason: `${count} warnings: ${reason}`, deleteMessageSeconds: 86400 });
-      await sendLog(guild, client, banEmbed(author, reason, count, channel));
-      userWarnings.delete(author.id);
-      userScamTimes.delete(author.id);
+      await sendLog(guild, client, banEmbed(author, reason, count, channel, cfg.warningsBeforeBan), cfg);
+      userWarnings.delete(key);
+      userScamTimes.delete(key);
     } catch (_) {}
     return;
   }
@@ -367,7 +429,7 @@ async function handleBannedWord(message, word, client) {
     try {
       await member.timeout(mins * 60 * 1000, reason);
       timedOut = true;
-      await sendLog(guild, client, timeoutEmbed(author, reason, mins, channel));
+      await sendLog(guild, client, timeoutEmbed(author, reason, mins, channel), cfg);
     } catch (e) {
       // Missing Moderate Members, or the member outranks the bot. Say so in the
       // log instead of failing silently — a filter everyone believes is on and
@@ -380,7 +442,7 @@ async function handleBannedWord(message, word, client) {
     await author.send(
       `⚠️ **Your message in ${guild.name} was removed.**\nReason: ${reason}\n` +
       (timedOut ? `You have been timed out for **${mins} minute(s)**.\n` : '') +
-      `Warning **${count}/${WARNINGS_BEFORE_BAN}** — continued violations will result in a ban.`
+      `Warning **${count}/${cfg.warningsBeforeBan}** — continued violations will result in a ban.`
     );
   } catch (_) {}
 }
@@ -393,18 +455,23 @@ async function onMessage(message, client) {
   // Everything below scans the message with allow-listed links removed.
   const content = stripAllowedLinks(raw);
 
+  // Detection first, config second. The scanners are pure and cost nothing;
+  // resolving the config is a (cached) settings read, and the overwhelming
+  // majority of messages are clean, so paying for it up front would mean one
+  // settings lookup per message in the server.
   const { found: profane, word } = hasProfanity(content);
-  if (profane) { await handleBannedWord(message, word, client); return; }
+  if (profane) { await handleBannedWord(message, word, client, await modConfig(message.guild.id)); return; }
 
   const { found: hasLink, reason: linkReason } = hasBannedLink(content);
-  if (hasLink) { await handleViolation(message, linkReason, client); return; }
+  if (hasLink) { await handleViolation(message, linkReason, client, await modConfig(message.guild.id)); return; }
 
   if (message.attachments.size > 0 && !content.trim()) return;
 
   const { scam, reason: scamReason } = isScam(content);
   if (scam) {
-    if (isSpamFlood(message.author.id)) await handleSpamFlood(message, scamReason, client);
-    else await handleViolation(message, scamReason, client);
+    const cfg = await modConfig(message.guild.id);
+    if (isSpamFlood(message.guild.id, message.author.id, cfg)) await handleSpamFlood(message, scamReason, client, cfg);
+    else await handleViolation(message, scamReason, client, cfg);
   }
 }
 
@@ -434,11 +501,21 @@ async function handlePrefixCommand(message, client) {
   }
 
   if (cmd === 'manage' && hasManage) {
+    // THIS server's numbers. The panel shows one set per server and so must
+    // this — a management panel reporting another guild's thresholds is how you
+    // end up certain a setting saved when it did not.
+    const cfg = await modConfig(message.guild.id);
+    const logHere = cfg.logChannelId && message.guild.channels.cache.has(String(cfg.logChannelId));
     const embed = new EmbedBuilder()
       .setTitle('⚙️ Anti-Scam Bot — Management Panel').setColor(0x00008B).setTimestamp()
       .addFields(
         { name: '🔧 Current Settings', value:
-          `**Warnings before ban:** \`${WARNINGS_BEFORE_BAN}\`\n**Timeout duration:** \`${MUTE_DURATION_MINUTES} minutes\`\n**Spam limit:** \`${SPAM_MESSAGE_LIMIT} messages in ${SPAM_TIME_WINDOW}s\`\n**Log channel:** ${LOG_CHANNEL_ID ? `<#${LOG_CHANNEL_ID}>` : '`Not set`'}`,
+          `**Warnings before ban:** \`${cfg.warningsBeforeBan}\`\n`
+          + `**Timeout duration:** \`${cfg.muteDurationMinutes} minutes\`\n`
+          + `**Spam limit:** \`${cfg.spamMessageLimit} messages in ${cfg.spamTimeWindow}s\`\n`
+          + `**Log channel:** ${logHere ? `<#${cfg.logChannelId}>`
+              : cfg.logChannelId ? `\`${cfg.logChannelId}\` ⚠️ not a channel in this server`
+              : '`Not set`'}`,
           inline: false },
         { name: `🔗 Banned Links (${BANNED_LINKS.length})`,
           value: BANNED_LINKS.slice(0, 10).map(d => `\`${d}\``).join('\n') + (BANNED_LINKS.length > 10 ? `\n_...and ${BANNED_LINKS.length-10} more_` : '') || '`None`',
@@ -473,15 +550,26 @@ async function handlePrefixCommand(message, client) {
     return true;
   }
 
+  // Both of these read and write the same guild-scoped key the handlers do.
+  // While the map was keyed on the user alone, !clearwarnings run by a mod on
+  // one server also cleared the record on the other.
   if (cmd === 'clearwarnings' && hasKick) {
     const user = message.mentions.users.first();
-    if (user) { userWarnings.delete(user.id); await message.channel.send(`✅ Cleared warnings for ${user}`); }
+    if (user) {
+      userWarnings.delete(modKey(message.guild.id, user.id));
+      userScamTimes.delete(modKey(message.guild.id, user.id));
+      await message.channel.send(`✅ Cleared warnings for ${user} in **${message.guild.name}**`);
+    }
     return true;
   }
 
   if (cmd === 'warnings' && hasManage) {
     const user = message.mentions.users.first();
-    if (user) await message.channel.send(`⚠️ ${user} has **${userWarnings.get(user.id) || 0}** warning(s).`);
+    if (user) {
+      const cfg = await modConfig(message.guild.id);
+      const n = userWarnings.get(modKey(message.guild.id, user.id)) || 0;
+      await message.channel.send(`⚠️ ${user} has **${n}/${cfg.warningsBeforeBan}** warning(s) in this server.`);
+    }
     return true;
   }
 
@@ -627,8 +715,12 @@ async function handlePrefixCommand(message, client) {
 }
 
 module.exports = {
-  onMessage, handlePrefixCommand, loadModLists,
+  onMessage, handlePrefixCommand, loadModLists, setModConfigProvider,
   BANNED_LINKS, ALLOWED_LINKS, BANNED_WORDS, userWarnings,
+  // Exported for test_antiscam_perguild.js: the thresholds are per-guild now,
+  // and the resolution order (saved value beats env, null does NOT) is the part
+  // that decides whether the panel's Settings tab does anything at all.
+  _config: { modConfig, ENV_MOD_CONFIG, modKey, isSpamFlood, userScamTimes },
   // Exported for test_antiscam_lists.js — the allow-list is the one piece here
   // that can be turned inside out by a lookalike hostname, so it gets asserted.
   _internals: { stripAllowedLinks, isAllowedUrl, hasProfanity, hasBannedLink, isScam },

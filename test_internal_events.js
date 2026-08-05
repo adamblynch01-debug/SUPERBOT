@@ -335,9 +335,18 @@ const field = (embed, name) => (embed.fields || []).find(f => f.name === name);
       goods: [{ product: 'Bulk', items: many }],
     });
     ok(r.body.dm === true, 'a huge delivery still reaches the buyer');
-    const f = DMS[0].embed.fields[0];
-    ok(f.value.length <= 1024, 'the field is clipped under Discord\'s cap');
-    ok(/\(\+\d+ chars\)/.test(f.value), 'and the clip is marked, never silent');
+    const f = DMS[0].embed.fields.find(x => /Key/i.test(x.name));
+    ok(!!f && f.value.length <= 1024, 'the key field is clipped under Discord\'s cap');
+    // The invariant, not the wording: the buyer is told a number of keys is
+    // missing and where to get them. Asserting the old "(+N chars)" marker
+    // string pinned this to one implementation of clip() — the embed moved to
+    // deliveryEmbed.js and the assertion failed on a change that was correct.
+    ok(/\b\d+ more keys? (is|are) not shown/.test(f.value), 'and the omission is stated in keys, not characters');
+    ok(/uhservices\.xyz|Orders/.test(f.value), 'and the buyer is told where the rest are');
+    // Whole keys only. A key cut in half is worse than a key not sent: it looks
+    // like a product that does not work.
+    const block = f.value.slice(f.value.indexOf('```') + 3, f.value.lastIndexOf('```'));
+    ok(block.split('\n').every(k => many.includes(k)), 'no key was cut in half');
   }
 
   reset();

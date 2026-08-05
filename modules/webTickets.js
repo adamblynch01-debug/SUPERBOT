@@ -23,10 +23,18 @@ const {
   EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle,
   ModalBuilder, TextInputBuilder, TextInputStyle,
 } = require('discord.js');
-const { routeFor, isStaffFor } = require('./support');
+const { routeFor, isStaffFor, resolveLogChannel } = require('./support');
 
 const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:3000';
 const SITE_URL    = process.env.SITE_URL || 'https://uhservices.xyz';
+
+// Ticket routing is per-guild now, and a website ticket has no guild — nobody
+// pressed a button in a server to open it. There is one store, and it is the
+// original guild, so that is the guild a web ticket is routed for. Saying so
+// explicitly matters: routeFor() with no guild falls back to the env ids, which
+// happens to be the same answer TODAY and stops being the same answer the
+// moment the main server's ticket log is set from the panel instead.
+const STORE_GUILD_ID = process.env.GUILD_ID || null;
 
 // Same caps as internalEvents.js — one over and Discord rejects the WHOLE
 // message, so everything the customer typed is clipped on the way in.
@@ -148,15 +156,18 @@ function registerWebTicketRoutes(app, client, requireSecret) {
     try {
       if (!t.ticket_id) return res.status(400).json({ error: 'ticket_id is required' });
 
-      const route = routeFor(normalizeCategory(t.category));
+      const route = await routeFor(normalizeCategory(t.category), STORE_GUILD_ID);
       if (!route.channel) {
-        console.error('[WebTickets] no ticket log channel configured — set TICKET_LOG_CHANNEL');
+        console.error('[WebTickets] no ticket log channel configured — set it in the panel (Settings → Ticket log channel), or TICKET_LOG_CHANNEL');
         return res.json({ ok: true, posted: false, reason: 'no ticket log channel configured' });
       }
 
+      // resolveLogChannel rather than client.channels.fetch: the bot-wide fetch
+      // resolves a channel in ANY server it is in, so a stale id would post a
+      // customer's ticket into the wrong server rather than fail.
       let ch;
       try {
-        ch = await client.channels.fetch(String(route.channel));
+        ch = await resolveLogChannel(client, route);
       } catch (err) {
         console.error(`[WebTickets] cannot reach channel ${route.channel}: ${err.message}`);
         return res.json({ ok: true, posted: false, reason: 'ticket log channel unreachable' });
@@ -233,7 +244,11 @@ function registerWebTicketRoutes(app, client, requireSecret) {
 // tickets use, so there is one answer to "is this person staff" rather than two
 // that can drift. `null` category → the general staff branch, which is what an
 // embed with no type recorded should get.
-function canWork(member, category) {
+// Async because isStaffFor is — the route it checks is a per-guild settings
+// read now. Every call site must await it: `if (!canWork(...))` on a Promise is
+// always false, which is not a smaller bug than the one being fixed, it is
+// "everyone in the server can close any ticket".
+async function canWork(member, category) {
   return isStaffFor(member, normalizeCategory(category));
 }
 
@@ -270,7 +285,7 @@ async function handleWebTicketButton(interaction) {
   // The embed does not carry the category, so the permission check uses the
   // general staff branch. That is the safe direction: a rank-booster cannot
   // action a general ticket, and general staff can action everything.
-  if (!canWork(interaction.member, null)) {
+  if (!await canWork(interaction.member, null)) {
     await interaction.reply({ content: '❌ You are not staff.', flags: 64 });
     return true;
   }

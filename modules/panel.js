@@ -339,12 +339,23 @@ function registerPanelRoutes(app, discordClient, hooks = {}) {
     const g = discordClient.guilds.cache.get(guildId);
     if (!g) return res.status(404).json({ error: 'The bot is not in that server.' });
     const me = g.members.me;
+    const top = me ? me.roles.highest.position : Infinity;
     const roles = [...g.roles.cache.values()]
-      // @everyone cannot be granted, and a role above the bot cannot be
-      // assigned by it — offering either produces a key that fails on redeem.
-      .filter(r => r.id !== g.id && !r.managed && (!me || r.position < me.roles.highest.position))
+      // @everyone is not a role anything can be keyed on.
+      .filter(r => r.id !== g.id)
       .sort((a, b) => b.position - a.position)
-      .map(r => ({ id: r.id, name: r.name, color: r.hexColor }));
+      // `assignable` rather than a filter, because whether a role is usable
+      // depends on what it is FOR. The bot cannot grant a role above its own,
+      // nor a managed (bot/integration) one — so Verified, Gen Member and
+      // Customer must be below it. But Staff, OVERSEER, Ticket Staff and Rank
+      // Booster are only ever TESTED for (member.roles.cache.has), and those
+      // are exactly the roles an admin keeps above the bot. Filtering them out
+      // meant the panel could not offer the staff role of any well-ordered
+      // server, so the field stayed an ID people pasted by hand.
+      .map(r => ({
+        id: r.id, name: r.name, color: r.hexColor,
+        assignable: !r.managed && r.position < top,
+      }));
     res.json({ roles });
   });
 
@@ -648,10 +659,20 @@ function registerPanelRoutes(app, discordClient, hooks = {}) {
   const SETTINGS_ALLOWED = [
     'verified_role_name', 'verified_role_id', 'welcome_channel_name', 'welcome_channel_id',
     'verify_channel_name', 'verify_channel_id', 'invites_channel_name', 'invites_channel_id',
+    'invite_log_channel_name', 'invite_log_channel_id',
     'invites_needed', 'log_channel_id', 'staff_role_id',
     'ticket_log_channel', 'gen_role_id', 'overseer_role_id', 'counting_channel_id',
     'leave_vouch_channel_id', 'vouches_channel_id',
     'warnings_before_ban', 'mute_duration_minutes', 'spam_message_limit', 'spam_time_window',
+    // Round 33: these twelve were env vars only, which is one value for the
+    // whole process while the bot is in two servers. See
+    // migrations/panel_channel_coverage.sql. Adding a key here is only half the
+    // job — a column with no reader saves, shows a green toast, and does
+    // nothing, which is the exact state the previous seven were found in.
+    'orders_channel_id', 'restock_channel_id', 'vault_restock_channel_id',
+    'manual_delivery_channel_id', 'sms_gen_channel_id', 'gen_log_channel_id',
+    'alerts_channel_id', 'rank_boost_log_channel',
+    'rank_boost_role_id', 'ticket_staff_role_id', 'customer_role_id',
   ];
   const SETTINGS_NUMERIC = new Set([
     'invites_needed', 'warnings_before_ban', 'mute_duration_minutes', 'spam_message_limit', 'spam_time_window',
@@ -673,7 +694,12 @@ function registerPanelRoutes(app, discordClient, hooks = {}) {
         updates[key] = n;
         continue;
       }
-      if (key.endsWith('_id') || key === 'ticket_log_channel') {
+      // Anything naming a channel or a role is a snowflake. Matched on the
+      // suffix rather than listed by name: `ticket_log_channel` was already a
+      // special case here, `rank_boost_log_channel` would have been a second
+      // one, and a snowflake column that slips past this check is stored as
+      // free text and then silently never resolves.
+      if (key.endsWith('_id') || key.endsWith('_channel')) {
         const s = String(v).trim();
         if (!/^\d{5,25}$/.test(s)) return res.status(400).json({ error: `${key} must be a Discord ID (digits only) — copy it with Developer Mode on.` });
         updates[key] = s;
@@ -843,6 +869,17 @@ const SHARED_HEAD = `
     }
     .settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 16px}
     @media (max-width:600px){.settings-grid{grid-template-columns:1fr}}
+    /* A group heading is a row of its own, not a cell, or the fields after it
+       shuffle into the wrong column. */
+    .settings-grid .group{grid-column:1/-1;margin:22px 2px 2px;padding-top:14px;border-top:1px solid var(--border)}
+    .settings-grid .group:first-child{margin-top:6px;padding-top:0;border-top:none}
+    .settings-grid .group .g-name{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--accent-hi)}
+    .settings-grid .group .g-note{font-size:11.5px;color:var(--dim);margin-top:4px;line-height:1.5}
+    .field .help{font-size:11px;color:var(--dim);margin-top:5px;line-height:1.5}
+    .field .help.bad{color:#e2c078}
+    /* A saved id this server does not have is kept and flagged rather than
+       dropped — silently blanking it would delete the setting on the next save. */
+    select option.ghosted{color:#e2c078}
 
     .stat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px;margin:14px 2px}
     .stat{border:1px solid var(--border);border-radius:8px;padding:14px;background:var(--panel2)}
@@ -1128,7 +1165,8 @@ function renderDashboard(session, guild) {
             <div class="win">
               <div class="win-head"><span class="prompt">$</span><span class="cmd">vim guild_settings.conf</span></div>
               <div class="win-body">
-                <div class="warn">Most of these apply live within ~30s. Anti-scam thresholds and the log/staff/ticket channel IDs save here but are not re-read live yet — the bot still loads those from Railway env vars at startup.</div>
+                <div class="notice">Every field here is <b>per server</b>. Channel and role IDs are not portable — the same #orders channel has a different ID in each server, which is why the list below is read live from <b>${escapeHtml(guild.name)}</b> rather than typed in. Anything left blank falls back to the bot's Railway environment variable, so an empty field keeps the original server's behaviour instead of breaking it.</div>
+                <div class="field" style="max-width:340px"><label>Filter</label><input id="settingsFilter" placeholder="orders, ticket, spam…" oninput="filterSettings()"><div class="help">Thirty settings. Type to narrow them.</div></div>
                 <div class="settings-grid" id="settingsForm"><div class="loading">reading</div></div>
                 <div style="margin:14px 2px"><button onclick="saveSettings()">&gt; Save Settings</button></div>
               </div>
@@ -1388,7 +1426,13 @@ function renderDashboard(session, guild) {
       try {
         var d = await api('/roles');
         var sel = document.getElementById('keyRole');
-        sel.innerHTML = '<option value="">— pick a role —</option>' + d.roles.map(function(r) {
+        // A key GRANTS this role, so only the assignable ones belong here —
+        // /roles returns every role now (the settings pickers need the ones
+        // above the bot, which are only ever tested for) and marks which can
+        // actually be handed out.
+        sel.innerHTML = '<option value="">— pick a role —</option>' + d.roles.filter(function(r) {
+          return r.assignable;
+        }).map(function(r) {
           return '<option value="' + esc(r.id) + '">' + esc(r.name) + '</option>';
         }).join('');
         rolesLoaded = true;
@@ -1568,48 +1612,191 @@ function renderDashboard(session, guild) {
     }
 
     // ── Settings ────────────────────────────────────────────────────────
-    var SETTINGS_FIELDS = [
-      ['verified_role_id', 'Verified role ID'],
-      ['welcome_channel_id', 'Welcome channel ID'],
-      ['verify_channel_id', 'Verify channel ID'],
-      ['invites_channel_id', 'Invites channel ID'],
-      ['invites_needed', 'Invites needed'],
-      ['log_channel_id', 'Log channel ID'],
-      ['staff_role_id', 'Staff role ID'],
-      ['ticket_log_channel', 'Ticket log channel ID'],
-      ['gen_role_id', 'Gen Member role ID'],
-      ['overseer_role_id', 'OVERSEER role ID'],
-      ['counting_channel_id', 'Counting game channel ID'],
-      ['leave_vouch_channel_id', 'Leave-a-vouch panel channel ID'],
-      ['vouches_channel_id', 'Vouches results channel ID'],
-      ['warnings_before_ban', 'Warnings before ban'],
-      ['mute_duration_minutes', 'Mute duration (minutes)'],
-      ['spam_message_limit', 'Spam message limit'],
-      ['spam_time_window', 'Spam time window (seconds)']
+    // [key, label, kind, help]. kind is one of:
+    //   channel  — a picker of this server's text channels
+    //   role     — a picker of every role, including the ones above the bot.
+    //              These are only ever TESTED for (member.roles.cache.has), and
+    //              staff roles are exactly the ones an admin keeps above the
+    //              bot, so filtering them out left the field unusable.
+    //   grant    — a role the bot has to HAND OUT, so only assignable ones.
+    //   number   — an integer
+    //
+    // Grouped because thirty flat text boxes is what the last version was, and
+    // "invites channel" vs "invite log channel" is not a distinction anybody
+    // makes from the label alone — that pair is why the reward panel went into
+    // the join/leave log on one server.
+    var SETTINGS_GROUPS = [
+      ['Verification & welcome', '', [
+        ['verified_role_id', 'Verified role', 'grant', 'Handed out when a member verifies, so it must sit below the bot.'],
+        ['verify_channel_id', 'Verify channel', 'channel', 'Where the verify button panel lives.'],
+        ['welcome_channel_id', 'Welcome channel', 'channel', "The bot's own welcome message. Turn Discord's built-in join messages OFF in Server Settings so members are not greeted twice."]
+      ]],
+      ['Invites', 'Two different channels. Setting one value for both is what put the reward panel in the log.', [
+        ['invites_channel_id', 'Invites panel channel', 'channel', 'Where /setup-invites posts the reward panel.'],
+        ['invite_log_channel_id', 'Invite log channel', 'channel', 'The running join/leave lines. Not the panel.'],
+        ['invites_needed', 'Invites needed', 'number', 'For the invite reward. 0 turns the reward off.']
+      ]],
+      ['Orders & delivery', '', [
+        ['orders_channel_id', 'Orders channel', 'channel', 'New website orders are announced here.'],
+        ['manual_delivery_channel_id', 'Manual delivery channel', 'channel', 'Where /manual-order-delivery reports.'],
+        ['alerts_channel_id', 'Alerts channel', 'channel', 'Backend problems: failed payments, sold-out deliveries.'],
+        ['customer_role_id', 'Customer role', 'grant', 'Given after a completed order, so it must sit below the bot.']
+      ]],
+      ['Stock', '', [
+        ['restock_channel_id', 'Restock channel', 'channel', 'Storefront restock announcements.'],
+        ['vault_restock_channel_id', 'Vault restock channel', 'channel', 'The vault catalogue is separate from the storefront one.']
+      ]],
+      ['Generator', '', [
+        ['gen_role_id', 'Gen Member role', 'grant', 'Who may use the generator. Assigned by the bot.'],
+        ['gen_log_channel_id', 'Gen log channel', 'channel', 'Every generated account is logged here.'],
+        ['sms_gen_channel_id', 'SMS gen channel', 'channel', 'Where the SMS generator runs.']
+      ]],
+      ['Tickets & support', '', [
+        ['ticket_log_channel', 'Ticket log channel', 'channel', 'Transcripts and open/close lines.'],
+        ['ticket_staff_role_id', 'Ticket staff role', 'role', 'Who can Reply and Close. Deliberately NOT the same as the staff role below — the ticket rota should not also hold the till.'],
+        ['rank_boost_log_channel', 'Rank boost log channel', 'channel', 'Rank-boost tickets are a separate team in a separate channel.'],
+        ['rank_boost_role_id', 'Rank booster role', 'role', 'Checked, never assigned, so a role above the bot is fine.']
+      ]],
+      ['Staff', '', [
+        ['staff_role_id', 'Staff role', 'role', 'The money gate: /web-balance, /addstock, /clearstock, /giveaway.'],
+        ['overseer_role_id', 'OVERSEER role', 'role', '']
+      ]],
+      ['Moderation', 'Blank means the bot keeps using its Railway values.', [
+        ['log_channel_id', 'Mod log channel', 'channel', 'Warnings, mutes and bans are logged here.'],
+        ['warnings_before_ban', 'Warnings before ban', 'number', '0 means ban on the first offence.'],
+        ['mute_duration_minutes', 'Mute duration (minutes)', 'number', '0 means delete the message only, no mute.'],
+        ['spam_message_limit', 'Spam message limit', 'number', 'Messages allowed inside the window below.'],
+        ['spam_time_window', 'Spam time window (seconds)', 'number', '']
+      ]],
+      ['Community', '', [
+        ['counting_channel_id', 'Counting game channel', 'channel', ''],
+        ['leave_vouch_channel_id', 'Leave-a-vouch panel channel', 'channel', 'Where the button to write a vouch lives.'],
+        ['vouches_channel_id', 'Vouches channel', 'channel', 'Where submitted vouches are posted.']
+      ]]
     ];
+
+    var SETTINGS_FIELDS = [];
+    SETTINGS_GROUPS.forEach(function(g) {
+      g[2].forEach(function(f) { SETTINGS_FIELDS.push(f); });
+    });
+
+    function optionsFor(kind, saved, channels, roles) {
+      var out = '<option value="">— not set —</option>';
+      var found = false;
+      var i, o;
+      if (kind === 'channel') {
+        for (i = 0; i < channels.length; i++) {
+          o = channels[i];
+          if (o.id === saved) found = true;
+          out += '<option value="' + esc(o.id) + '"' + (o.id === saved ? ' selected' : '') + '>#' +
+            esc(o.name) + (o.parent ? ' (' + esc(o.parent) + ')' : '') + '</option>';
+        }
+      } else {
+        for (i = 0; i < roles.length; i++) {
+          o = roles[i];
+          // A role the bot cannot hand out is not offered for a field whose
+          // whole job is handing it out — but it is still shown if it is what
+          // is already saved, below.
+          if (kind === 'grant' && !o.assignable) continue;
+          if (o.id === saved) found = true;
+          out += '<option value="' + esc(o.id) + '"' + (o.id === saved ? ' selected' : '') + '>@' +
+            esc(o.name) + (kind === 'role' && !o.assignable ? ' (above the bot)' : '') + '</option>';
+        }
+      }
+      // The saved value is not in this server's list — a leftover from the other
+      // server, a deleted channel, or a role the bot cannot assign. Keep it and
+      // say so. Dropping it would look like "not set", and the next save would
+      // then genuinely unset it.
+      if (saved && !found) {
+        out += '<option class="ghosted" value="' + esc(saved) + '" selected>' +
+          esc(saved) + ' — not in this server</option>';
+      }
+      return out;
+    }
+
+    function settingsMarkup(s, channels, roles, note) {
+      return SETTINGS_GROUPS.map(function(g) {
+        var head = '<div class="group"><div class="g-name">' + esc(g[0]) + '</div>' +
+          (g[1] ? '<div class="g-note">' + esc(g[1]) + '</div>' : '') + '</div>';
+        return head + g[2].map(function(f) {
+          var key = f[0], label = f[1], kind = f[2], help = f[3];
+          var v = s[key];
+          var val = (v === null || v === undefined) ? '' : String(v);
+          var input;
+          if ((kind === 'channel' || kind === 'role' || kind === 'grant') && !note) {
+            input = '<select id="setting_' + esc(key) + '">' + optionsFor(kind, val, channels, roles) + '</select>';
+          } else {
+            // No picker available (the bot cannot read this server's channel
+            // list). A text box still lets an ID be pasted, which is strictly
+            // better than a tab that will not load.
+            input = '<input id="setting_' + esc(key) + '" value="' + esc(val) + '"' +
+              (kind === 'number' ? ' inputmode="numeric"' : '') + '>';
+          }
+          return '<div class="field" data-search="' + esc((key + ' ' + label + ' ' + help).toLowerCase()) + '">' +
+            '<label>' + esc(label) + '</label>' + input +
+            (help ? '<div class="help">' + esc(help) + '</div>' : '') +
+            (note && kind !== 'number' ? '<div class="help bad">' + esc(note) + '</div>' : '') +
+          '</div>';
+        }).join('');
+      }).join('');
+    }
 
     async function loadSettings() {
       try {
-        var d = await api('/settings');
-        var s = d.settings || {};
-        document.getElementById('settingsForm').innerHTML = SETTINGS_FIELDS.map(function(f) {
-          var v = s[f[0]];
-          return '<div class="field"><label>' + esc(f[1]) + '</label>' +
-            '<input id="setting_' + esc(f[0]) + '" value="' + esc(v == null ? '' : v) + '"></div>';
-        }).join('');
+        // All three at once. The pickers are the point of this tab now, so
+        // fetching them one after another would show an empty form first.
+        var results = await Promise.all([
+          api('/settings'),
+          api('/channels').catch(function(e) { return { error: e.message }; }),
+          api('/roles').catch(function(e) { return { error: e.message }; })
+        ]);
+        var s = results[0].settings || {};
+        var chErr = results[1].error, roErr = results[2].error;
+        var note = (chErr || roErr) ? ('Picker unavailable (' + (chErr || roErr) + ') — paste the ID instead.') : '';
+        document.getElementById('settingsForm').innerHTML =
+          settingsMarkup(s, results[1].channels || [], results[2].roles || [], note);
+        filterSettings();
       } catch (e) { fail('settingsForm', e); }
+    }
+
+    function filterSettings() {
+      var box = document.getElementById('settingsFilter');
+      var q = box ? box.value.trim().toLowerCase() : '';
+      var groups = document.querySelectorAll('#settingsForm .group');
+      var fields = document.querySelectorAll('#settingsForm .field');
+      var i;
+      for (i = 0; i < fields.length; i++) {
+        var hit = !q || (fields[i].getAttribute('data-search') || '').indexOf(q) !== -1;
+        fields[i].style.display = hit ? '' : 'none';
+      }
+      // A group heading with nothing under it reads as an empty section.
+      for (i = 0; i < groups.length; i++) {
+        var n = groups[i].nextElementSibling, any = false;
+        while (n && !n.classList.contains('group')) {
+          if (n.style.display !== 'none') { any = true; break; }
+          n = n.nextElementSibling;
+        }
+        groups[i].style.display = any ? '' : 'none';
+      }
     }
 
     async function saveSettings() {
       var body = {};
       for (var i = 0; i < SETTINGS_FIELDS.length; i++) {
         var el = document.getElementById('setting_' + SETTINGS_FIELDS[i][0]);
+        // A field hidden by the filter is still sent. Its value is unchanged,
+        // and skipping it would make "save while filtered" a partial save that
+        // looks like a whole one.
         if (!el) continue;
         body[SETTINGS_FIELDS[i][0]] = el.value.trim() === '' ? null : el.value.trim();
       }
       try {
         var d = await api('/settings', { method: 'POST', body: body });
         toast('Saved ' + d.saved + ' field(s) — most apply within ~30 seconds.', 'ok');
+        // Re-read rather than trust the form: the server normalises values and
+        // a picker that still shows a stale id is how a setting gets "saved"
+        // twice with two different values.
+        loadSettings();
       } catch (e) { toast(e.message, 'bad'); }
     }
 

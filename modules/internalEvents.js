@@ -23,17 +23,25 @@ const { EmbedBuilder } = require('discord.js');
 const { query } = require('../db');
 const { registerWebTicketRoutes } = require('./webTickets');
 const { getUserLang, translateEmbeds, DEFAULT_LANG } = require('./translate');
+// The buyer's DM is rendered here and nowhere else — /manual-order-delivery
+// calls the same function, which is what keeps the two deliveries identical.
+const { buildDeliveryEmbed, gameWorthShowing } = require('./deliveryEmbed');
 
 // A delivery DM in the buyer's own language, but ONLY if they have chosen one
 // with /language. No choice means no lookup hit, no network call and byte-for-
 // byte the message this has always sent — which is the right default for the
 // one path in this system that must never get slower or more fragile. The
 // license keys travel inside ``` fences, which modules/translate.js masks.
-async function localizeForBuyer(discordId, guildId, embeds) {
+//
+// `protect` carries the catalogue values themselves — product, game, tier,
+// invoice. Nothing in translate.js can recognise those as names rather than
+// words, so a buyer with Spanish set was told their order of "H8ED Privado
+// Externo — Día" was ready, naming a product that does not exist.
+async function localizeForBuyer(discordId, guildId, embeds, protect) {
   try {
     const lang = await getUserLang(guildId || process.env.GUILD_ID || 'dm', String(discordId));
     if (!lang || lang === DEFAULT_LANG) return embeds;
-    return await translateEmbeds(embeds, lang);
+    return await translateEmbeds(embeds, lang, protect);
   } catch (err) {
     console.warn('[Internal] delivery DM translation skipped:', err.message);
     return embeds;
@@ -61,26 +69,26 @@ const FAILURE_MARKERS = new Set([
   'NO_ACCOUNT_LINKED', 'ALREADY_CREDITED', 'CREDIT_FAILED',
 ]);
 
-// A delivered line, named the way the buyer bought it:
-//     GAME — PRODUCT — DURATION  ×N
+// A delivered line for the STAFF log:
+//     PRODUCT • GAME • DURATION • ×N
 // The backend's delivery.js attaches game, tier_label and qty to every entry
 // in delivered_goods; older payloads have none of them and fall back to the
 // bare product name, which is all this ever showed.
 //
-// The game leads because it is the coarsest thing and the only one the buyer
-// definitely recognises — they picked a tile before they picked a product.
-// Skipped when it would only repeat itself: an HWID spoofer's game is
-// "HWID Spoofer", and "HWID Spoofer — H8ED PERMANENT SPOOFER" reads like a
-// bug. Balance top-ups and donations have no game at all, by design.
+// The product leads and the rest qualifies it. It used to be the other way
+// round, joined with em-dashes, which read as one long welded name and wrapped
+// onto a second line — the buyer's copy has been rebuilt for that reason (see
+// deliveryEmbed.js) and this one follows so the two read alike when a staff
+// member has both on screen. The game is skipped where it would only repeat
+// itself: an HWID spoofer's game is "HWID Spoofer".
 function lineLabel(g) {
-  const game = (g && g.game) ? String(g.game).trim() : '';
-  let s = (g && g.product) || 'Item';
-  if (game && !new RegExp(`(^|\\s)${game.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\s|$)`, 'i').test(s)) {
-    s = `${game} — ${s}`;
-  }
-  if (g && g.tier_label) s += ` — ${g.tier_label}`;
-  if (g && Number(g.qty) > 1) s += ` ×${Number(g.qty)}`;
-  return s;
+  const product = (g && g.product) || 'Item';
+  return [
+    product,
+    gameWorthShowing(g && g.game, product),
+    (g && g.tier_label) || '',
+    g && Number(g.qty) > 1 ? `×${Number(g.qty)}` : '',
+  ].filter(Boolean).join(' • ');
 }
 
 const SEVERITY_COLOR = { error: 0xED4245, warn: 0xFEE75C, info: 0x5865F2 };
@@ -171,6 +179,40 @@ async function getLogChannelId(guildId) {
   }
 }
 
+// ── One column of guild_settings, for the guild that actually asked ─────────
+// Every channel below used to be an env var and nothing else. An env var is one
+// value for the whole process while the bot is in two servers, and
+// client.channels.fetch is bot-wide — it resolves a channel in ANY guild the
+// bot is in without complaint. So a second-server restock did not fail; it was
+// announced in the FIRST server's restock channel.
+//
+// This goes at the HEAD of each chain, never replacing it. Null means "the
+// panel has nothing to say about this guild", and the env fallbacks below keep
+// the original server behaving exactly as it does today.
+//
+// Cached briefly because /internal/restock can arrive with a hundred products
+// behind it and there is no sense asking Postgres the same question per batch.
+const settingsCache = new Map(); // guildId -> { row, expiresAt }
+const SETTINGS_TTL_MS = 30_000;
+
+async function guildSetting(guildId, column) {
+  if (!guildId) return null;
+  const key = String(guildId);
+  const hit = settingsCache.get(key);
+  if (hit && hit.expiresAt > Date.now()) return hit.row?.[column] || null;
+  let row = null;
+  try {
+    const { rows } = await query('SELECT * FROM guild_settings WHERE guild_id = $1', [key]);
+    row = rows[0] || null;
+  } catch (err) {
+    // Not fatal: every caller has an env fallback. Loud anyway, because a
+    // settings read that silently fails looks identical to "nothing is set".
+    console.error('[Internal] guild_settings read failed:', err.message);
+  }
+  settingsCache.set(key, { row, expiresAt: Date.now() + SETTINGS_TTL_MS });
+  return row?.[column] || null;
+}
+
 // Preserved from paymentBridge, including the original guild's known channel as
 // the last fallback.
 async function getVouchesChannelId(guildId) {
@@ -226,15 +268,29 @@ function registerInternalRoutes(app, client) {
   // alert nobody sees is worse than an alert in the wrong room, which is the
   // one place that trade-off is worth making. Orders have no such net: a
   // misdelivered order embed leaks customer emails, so it fails loudly instead.
+  //
+  // ORDER_LOG_CHANNEL_ID stays first, ahead of the panel. That is the owner's
+  // July decision — it is Railway-only, and it carries customer emails, so it
+  // gets exactly one source of truth and there is no panel field for it. The
+  // panel's orders_channel_id sits BELOW it and ABOVE the ORDERS_CHANNEL_ID env
+  // var, which is the position that matters: the env var is one value for the
+  // whole process, so on the second server it names the FIRST server's channel.
+  const orderLogEnv = () => {
+    const v = process.env.ORDER_LOG_CHANNEL_ID;
+    return v && String(v).trim() ? String(v).trim() : null;
+  };
+
   const ordersChannel = async (guildId) => firstSendable(client, [
+    orderLogEnv(),
+    await guildSetting(guildId, 'orders_channel_id'),
     await getLogChannelId(guildId),
-    process.env.ORDERS_CHANNEL_ID,
   ]);
 
   const alertsChannel = async (guildId) => firstSendable(client, [
+    await guildSetting(guildId, 'alerts_channel_id'),
     process.env.ALERTS_CHANNEL_ID,
+    orderLogEnv(),
     await getLogChannelId(guildId),
-    process.env.ORDERS_CHANNEL_ID,
   ]);
 
   // Last resort for anything a human must see. An ops alert with no channel
@@ -303,8 +359,13 @@ function registerInternalRoutes(app, client) {
   // The dedicated channel the operator created for hand-delivered orders. Kept
   // separate from #order-log on purpose: this is the short list a human is
   // accountable for, and it would be unreadable buried in the checkout feed.
-  const manualChannel = async () => firstSendable(client, [
+  const manualChannel = async (guildId) => firstSendable(client, [
+    await guildSetting(guildId, 'manual_delivery_channel_id'),
     process.env.MANUAL_DELIVERY_CHANNEL_ID,
+    // The original guild's channel, hardcoded. Harmless as a last resort for
+    // that server and unreachable for any other, since firstSendable skips an
+    // id the bot cannot post to — but the bot IS in both servers, so it is
+    // reachable from either. That is what the two entries above are for.
     '1533927608360636629',
   ]);
 
@@ -385,32 +446,32 @@ function registerInternalRoutes(app, client) {
       // because there was nothing real to hand over. DMing the buyer a wall of
       // OUT_OF_STOCK markers would be the same mistake in another channel.
       if (!needs_attention && discord_id) {
-        const embed = new EmbedBuilder()
-          .setColor(0x00ff00)
-          .setTitle('✅ Your Order is Ready!')
-          .setDescription('Thank you for your purchase. Here are your goods:')
-          .setFooter({ text: (invoice_no ? `Invoice: ${invoice_no}` : `Order ID: ${order_id ?? ''}`).trim() })
-          .setTimestamp();
+        // Built by deliveryEmbed.js, the same function /manual-order-delivery
+        // calls — so a hand-delivered order and a website one are the same
+        // message because they are the same code, not because two files were
+        // kept in agreement by hand. `protect` comes back holding exactly the
+        // catalogue strings that were written into the embed, so the translator
+        // mask cannot fall out of step with what the buyer sees.
+        const { embed, protect, delivered } = buildDeliveryEmbed({
+          items: goods.map(g => ({
+            game: g.game,
+            product: g.product,
+            tier: g.tier_label,
+            qty: g.qty,
+            // A failure marker is not a delivery. The bridge did not filter
+            // these, so a buyer whose order failed was DM'd a code block
+            // reading OUT_OF_STOCK as though it were their product.
+            values: (g.items || []).filter(v => !FAILURE_MARKERS.has(v)),
+          })),
+          invoiceNo: invoice_no,
+          orderId: order_id,
+          email,
+        });
 
-        let fieldCount = 0;
-        for (const g of goods) {
-          if (fieldCount >= LIMIT.fields - 1) break;
-          const items = (g.items || []).filter(v => !FAILURE_MARKERS.has(v));
-          if (!items.length) continue;
-          // -8 leaves room for the ``` fences. The bridge joined every key into
-          // one unclipped field; past 1024 chars Discord rejects the whole
-          // message, so a large order delivered the buyer nothing at all.
-          const body = clip(items.join('\n'), LIMIT.value - 8);
-          // "Punisher Phone External Bo7" told the buyer nothing about which
-          // term they had just been given, or how many of it.
-          embed.addFields({ name: clip(`📦 ${lineLabel(g)}`, LIMIT.name), value: '```' + body + '```' });
-          fieldCount++;
-        }
-
-        if (fieldCount > 0) {
+        if (delivered > 0) {
           try {
             const user = await client.users.fetch(String(discord_id));
-            await user.send({ embeds: await localizeForBuyer(discord_id, guild_id, [embed]) });
+            await user.send({ embeds: await localizeForBuyer(discord_id, guild_id, [embed], protect) });
             out.dm = true;
             console.log(`[Internal] Delivered goods to Discord user ${discord_id}`);
           } catch (err) {
@@ -433,7 +494,9 @@ function registerInternalRoutes(app, client) {
           const parts = [];
           if (good) parts.push(`${good} delivered`);
           if (bad.length) parts.push(`⚠️ ${bad.join(', ')}`);
-          return `• ${clip(lineLabel(g), 100)} — ${parts.join(', ') || 'nothing'}`;
+          // An arrow, not a dash: the label itself now uses • to separate its
+          // own parts, and a third separator in one line stops being readable.
+          return `• ${clip(lineLabel(g), 100)} → ${parts.join(', ') || 'nothing'}`;
         });
 
         const logEmbed = new EmbedBuilder()
@@ -458,7 +521,7 @@ function registerInternalRoutes(app, client) {
         // subset a human is answerable for, and duplicating the embed there is
         // cheaper than asking staff to filter the firehose.
         if (String(source).toLowerCase() === 'manual') {
-          const mch = await manualChannel();
+          const mch = await manualChannel(guild_id || process.env.GUILD_ID);
           if (mch && mch.id !== ch.id) {
             await mch.send({ embeds: [logEmbed] }).catch(e =>
               console.error('[Internal] manual delivery channel post failed:', e.message));
@@ -589,7 +652,8 @@ function registerInternalRoutes(app, client) {
   const VAULT_RESTOCK_FALLBACK_CHANNEL = '1533912211834146916';
   const MAX_INDIVIDUAL_EMBEDS = 4;
 
-  const restockChannel = async () => firstSendable(client, [
+  const restockChannel = async (guildId) => firstSendable(client, [
+    await guildSetting(guildId, 'restock_channel_id'),
     process.env.RESTOCK_CHANNEL_ID,
     RESTOCK_FALLBACK_CHANNEL,
   ]);
@@ -597,9 +661,11 @@ function registerInternalRoutes(app, client) {
   // Falls back to the storefront channel rather than dropping the message: a
   // vault restock in the wrong channel is a nuisance, a vault restock nobody
   // sees is a product that silently never came back.
-  const vaultRestockChannel = async () => firstSendable(client, [
+  const vaultRestockChannel = async (guildId) => firstSendable(client, [
+    await guildSetting(guildId, 'vault_restock_channel_id'),
     process.env.VAULT_RESTOCK_CHANNEL_ID,
     VAULT_RESTOCK_FALLBACK_CHANNEL,
+    await guildSetting(guildId, 'restock_channel_id'),
     process.env.RESTOCK_CHANNEL_ID,
     RESTOCK_FALLBACK_CHANNEL,
   ]);
@@ -698,6 +764,7 @@ function registerInternalRoutes(app, client) {
 
   app.post('/internal/restock', requireSecret, async (req, res) => {
     const { products = [] } = req.body || {};
+    const restockGuild = req.body?.guild_id || process.env.GUILD_ID;
     try {
       if (!Array.isArray(products) || !products.length) {
         return res.json({ ok: true, posted: false, reason: 'no products' });
@@ -715,7 +782,7 @@ function registerInternalRoutes(app, client) {
       const out = { ok: true, posted: false, store: null, vault: null };
 
       if (store.length) {
-        const ch = await restockChannel();
+        const ch = await restockChannel(restockGuild);
         if (!ch) {
           console.error('[Internal] restock DROPPED for storefront: no channel reachable. Set RESTOCK_CHANNEL_ID.');
           out.store = { posted: false, reason: 'no channel configured', products: store.length };
@@ -726,7 +793,7 @@ function registerInternalRoutes(app, client) {
       }
 
       if (vault.length) {
-        const ch = await vaultRestockChannel();
+        const ch = await vaultRestockChannel(restockGuild);
         if (!ch) {
           console.error('[Internal] restock DROPPED for vault: no channel reachable. Set VAULT_RESTOCK_CHANNEL_ID.');
           out.vault = { posted: false, reason: 'no channel configured', products: vault.length };

@@ -16,6 +16,12 @@ function check(name, ok) {
   else { failed++; console.error('  FAIL  ' + name); process.exitCode = 1; }
 }
 
+// Wrapped in an async main because routeFor reads per-guild settings now and
+// is therefore a promise. Awaited rather than fired-and-counted: an assertion
+// that escapes as an unhandled rejection is a pass on the scoreboard.
+main();
+async function main() {
+
 console.log('\nweb ticket → discord bridge');
 
 // ── The website's free-text category has to land on a real ticket type ────
@@ -33,16 +39,38 @@ check('an empty category is not undefined', normalizeCategory(null) === 'Support
 check('an unknown category passes through', normalizeCategory('Chargeback') === 'Chargeback');
 
 // ── …and then route exactly like a Discord ticket of that type ───────────
+// routeFor is async as of round 33 (it reads per-guild settings), so these are
+// resolved together up front rather than each check sprouting an await. The
+// bridge itself calls it with the store's guild; here it is called bare, which
+// exercises the env fallback these ids describe.
+const R = {};
+for (const c of ['hwid', 'rank boosting', 'boosting', 'Support', 'Chargeback']) {
+  R[c] = await routeFor(normalizeCategory(c));
+}
 check('a web HWID ticket logs to the general channel',
-  routeFor(normalizeCategory('hwid')).channel === process.env.TICKET_LOG_CHANNEL);
+  R['hwid'].channel === process.env.TICKET_LOG_CHANNEL);
 check('a web rank-boost ticket logs to the booster channel',
-  routeFor(normalizeCategory('rank boosting')).channel === RANK_BOOST_LOG_CHANNEL);
+  R['rank boosting'].channel === RANK_BOOST_LOG_CHANNEL);
 check('a web rank-boost ticket does NOT hit the general channel',
-  routeFor(normalizeCategory('boosting')).channel !== process.env.TICKET_LOG_CHANNEL);
+  R['boosting'].channel !== process.env.TICKET_LOG_CHANNEL);
 check('a plain support ticket logs to the general channel',
-  routeFor(normalizeCategory('Support')).channel === process.env.TICKET_LOG_CHANNEL);
+  R['Support'].channel === process.env.TICKET_LOG_CHANNEL);
 check('an unknown category still gets a channel',
-  !!routeFor(normalizeCategory('Chargeback')).channel);
+  !!R['Chargeback'].channel);
+
+// canWork is async too, and it is the gate on every website-ticket button. An
+// un-awaited call site would let anyone in the server close a customer's
+// ticket, and nothing about that is visible at runtime — so assert on source.
+{
+  // Comments stripped first — the module explains the bug it is avoiding by
+  // quoting the broken line, and a source scan that cannot tell an explanation
+  // from the thing it explains fails on the comment that documents the fix.
+  const src = require('fs').readFileSync('modules/webTickets.js', 'utf8')
+    .replace(/(^|[^:])\/\/.*$/gm, '$1');
+  check('no button gate tests the Promise instead of the answer',
+    !/if \(!\s*canWork\(/.test(src));
+  check('the gate is still there', /await canWork\(/.test(src));
+}
 
 // ── customId round trip ──────────────────────────────────────────────────
 // The button handler does id.split('_') and takes [1] and [2]. A ticket id is
@@ -99,3 +127,4 @@ check('an unknown priority still yields a colour',
 
 console.log(`\n  ${passed} passed, ${failed} failed\n`);
 process.exit(failed ? 1 : 0);
+}

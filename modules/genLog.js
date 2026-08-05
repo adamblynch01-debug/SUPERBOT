@@ -36,12 +36,28 @@ const KINDS = {
   key:     { emoji: '🔑', label: 'Key(s) Generated',  color: 0xfaa61a },
 };
 
-function genLogChannelId() {
+// The panel's per-guild gen log channel, installed by index.js. Both the env
+// var and the fallback above are ONE id for the whole bot, and
+// client.channels.fetch is bot-wide — so a generation on the second server was
+// logged into the first server's gen log, which reads as "the second server's
+// gen log is empty" rather than as a misconfiguration.
+let settingsFor = async () => null;
+function setGenLogSettingsProvider(fn) { if (typeof fn === 'function') settingsFor = fn; }
+
+async function genLogChannelId(guildId) {
+  if (guildId) {
+    try {
+      const s = await settingsFor(guildId);
+      if (s && s.genLogChannelId) return String(s.genLogChannelId);
+    } catch (e) {
+      console.error('[GenLog] could not read guild settings:', e.message);
+    }
+  }
   return process.env.GEN_LOG_CHANNEL_ID || GEN_LOG_FALLBACK;
 }
 
-async function resolveGenLogChannel(client) {
-  const id = genLogChannelId();
+async function resolveGenLogChannel(client, guildId) {
+  const id = await genLogChannelId(guildId);
   if (!id) return null;
   try {
     const ch = await client.channels.fetch(String(id));
@@ -50,7 +66,7 @@ async function resolveGenLogChannel(client) {
     if (!ch || typeof ch.send !== 'function') return null;
     return ch;
   } catch (e) {
-    console.error(`[GenLog] channel ${id} unreachable: ${e.message} — set GEN_LOG_CHANNEL_ID`);
+    console.error(`[GenLog] channel ${id} unreachable: ${e.message} — set it in the panel for this server, or GEN_LOG_CHANNEL_ID`);
     return null;
   }
 }
@@ -65,13 +81,16 @@ async function resolveGenLogChannel(client) {
  * @param {number} [p.remaining]     stock left afterwards, if known
  * @param {boolean} [p.delivered]    did the DM/delivery succeed
  * @param {string} [p.source]        'command' | 'panel' | 'button'
+ * @param {string} [p.guildId]       which server this happened in. Without it
+ *   the log falls back to the one bot-wide env id, which is the second
+ *   server's entries landing in the first server's channel.
  */
 async function logGeneration(client, p = {}) {
   try {
     const meta = KINDS[p.kind] || KINDS.account;
-    const ch = await resolveGenLogChannel(client);
+    const ch = await resolveGenLogChannel(client, p.guildId);
     if (!ch) {
-      console.warn(`[GenLog] ${meta.label} by ${p.user?.id} NOT logged — no reachable channel (${genLogChannelId()})`);
+      console.warn(`[GenLog] ${meta.label} by ${p.user?.id} NOT logged — no reachable channel (${await genLogChannelId(p.guildId)})`);
       return false;
     }
 
@@ -99,4 +118,7 @@ async function logGeneration(client, p = {}) {
   }
 }
 
-module.exports = { logGeneration, genLogChannelId, resolveGenLogChannel, GEN_LOG_FALLBACK };
+module.exports = {
+  logGeneration, genLogChannelId, resolveGenLogChannel, GEN_LOG_FALLBACK,
+  setGenLogSettingsProvider,
+};

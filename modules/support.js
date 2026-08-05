@@ -13,8 +13,10 @@ const db   = require('../db');
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..');
 if (DATA_DIR !== path.join(__dirname, '..') && !fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 const TICKETS_FILE     = path.join(DATA_DIR, 'tickets.json');
-// Env-overridable, so moving the support channel does not need a code change.
-const SUPPORT_CHANNEL  = process.env.SUPPORT_CHANNEL || "1502225607348715621";
+// There is deliberately no SUPPORT_CHANNEL here. /panel posts into the channel
+// it was run in, so nothing ever read the id — and a panel field for it would
+// have been a setting that saves, shows a green toast and does nothing, which is
+// the exact state seven other fields were found in this round.
 const TICKET_LOG_CHANNEL = process.env.TICKET_LOG_CHANNEL || null;
 const STAFF_ROLE_ID    = process.env.STAFF_ROLE_ID || null;
 
@@ -36,11 +38,65 @@ const RANK_BOOST_ROLE_ID     = process.env.RANK_BOOST_ROLE_ID     || '1532108479
 // Ticket type → where its log goes and who gets pinged. Anything absent here
 // falls back to the general log channel and staff role, so adding a button
 // without a route can never silently stop logging.
-const TICKET_ROUTES = {
-  'Rank Boosting': { channel: RANK_BOOST_LOG_CHANNEL, role: RANK_BOOST_ROLE_ID },
+//
+// Everything above is a single set of ids for the whole bot, and every lookup
+// below used client.channels.cache — which is bot-wide, not guild-scoped. So a
+// ticket opened on the second server was logged into the FIRST server's ticket
+// channel and pinged the first server's staff role. Not "didn't work": worked,
+// in the wrong building, with a customer's issue text in it.
+//
+// A ticket is now routed by the guild whose button was pressed. That guild is
+// recorded on the ticket when it opens (the conversation continues in DMs,
+// where there is no guild to ask), and settingsFor() is installed by index.js
+// so the panel's Ticket-log channel and Ticket-staff role fields decide it
+// per server. The env ids stay as the fallback for the original guild.
+const ENV_ROUTES = {
+  ticketLogChannel:  TICKET_LOG_CHANNEL,
+  ticketStaffRoleId: TICKET_STAFF_ROLE_ID,
+  rankBoostLogChannel: RANK_BOOST_LOG_CHANNEL,
+  rankBoostRoleId:     RANK_BOOST_ROLE_ID,
 };
-function routeFor(ticketType) {
-  return TICKET_ROUTES[ticketType] || { channel: TICKET_LOG_CHANNEL, role: TICKET_STAFF_ROLE_ID };
+
+let settingsFor = async () => null;
+function setSupportSettingsProvider(fn) { if (typeof fn === 'function') settingsFor = fn; }
+
+async function routeFor(ticketType, guildId) {
+  let s = null;
+  if (guildId) {
+    try { s = await settingsFor(guildId); }
+    catch (e) { console.error('[Tickets] could not read guild settings:', e.message); }
+  }
+  const pick = (k) => {
+    const v = s && s[k];
+    return (v === null || v === undefined || v === '') ? ENV_ROUTES[k] : v;
+  };
+  if (ticketType === 'Rank Boosting') {
+    return { channel: pick('rankBoostLogChannel'), role: pick('rankBoostRoleId'), guildId };
+  }
+  return { channel: pick('ticketLogChannel'), role: pick('ticketStaffRoleId'), guildId };
+}
+
+// A channel id that belongs to another guild resolves fine through
+// client.channels — that is exactly how the leak happened. Resolve inside the
+// ticket's own guild when we know it, and say so when the id does not live
+// there rather than posting into whichever server does own it.
+async function resolveLogChannel(client, route) {
+  if (!route.channel) return null;
+  const id = String(route.channel);
+  if (route.guildId) {
+    const g = client.guilds.cache.get(String(route.guildId));
+    if (g) {
+      const ch = g.channels.cache.get(id);
+      if (ch) return ch;
+      console.error(`[Tickets] channel ${id} is not in guild ${route.guildId} (${g.name}) — set the ticket log channel for that server in the panel. Not posting it to whichever server does own it.`);
+      return null;
+    }
+  }
+  // No guild recorded (a ticket saved by an older build). Fall back to the old
+  // bot-wide lookup so those still log somewhere.
+  let ch = client.channels.cache.get(id);
+  if (!ch) try { ch = await client.channels.fetch(id); } catch (e) { console.error('[Tickets] Failed to fetch log channel:', e.message); }
+  return ch || null;
 }
 
 const GAMES = [
@@ -107,18 +163,21 @@ function isStaff(member) {
 // without the general staff role would otherwise get "No permission" on a
 // ticket sitting in their own log. General staff keep access to everything so
 // a ticket can't get stranded if the specialist team is away.
-function isStaffFor(member, ticketType) {
+// Async because the route it checks is per-guild now. The role is looked up in
+// the member's OWN guild (member.roles), so a staff role id from another server
+// simply does not match — which is correct, and is why the general isStaff()
+// fallback still matters.
+async function isStaffFor(member, ticketType) {
   if (!member) return false;
-  const route = routeFor(ticketType);
+  const route = await routeFor(ticketType, member.guild && member.guild.id);
   if (route.role && member.roles.cache.has(String(route.role))) return true;
   return isStaff(member);
 }
 
 async function sendStaffLog(client, user, ticketData) {
-  const route = routeFor(ticketData.type);
+  const route = await routeFor(ticketData.type, ticketData.guild_id);
   if (!route.channel) { console.error('[Tickets] no log channel for type', ticketData.type); return; }
-  let logCh = client.channels.cache.get(String(route.channel));
-  if (!logCh) try { logCh = await client.channels.fetch(String(route.channel)); } catch (e) { console.error('[Tickets] Failed to fetch log channel:', e.message); }
+  const logCh = await resolveLogChannel(client, route);
   if (!logCh) { console.error('[Tickets] Log channel not found:', route.channel); return; }
   const embed = new EmbedBuilder()
     .setTitle(`🎫 New Ticket — ${ticketData.type}`)
@@ -198,9 +257,12 @@ async function handleInteraction(interaction, client) {
   // ── /clearlogs ──
   if (interaction.isChatInputCommand() && interaction.commandName === 'clearlogs') {
     await interaction.deferReply({ ephemeral: true });
-    if (!TICKET_LOG_CHANNEL) { await interaction.editReply({ content: '❌ TICKET_LOG_CHANNEL not configured.' }); return true; }
-    const logCh = client.channels.cache.get(String(TICKET_LOG_CHANNEL));
-    if (!logCh) { await interaction.editReply({ content: '❌ Could not find ticket logs channel.' }); return true; }
+    // This server's log channel — /clearlogs run in one server must never wipe
+    // another server's ticket history.
+    const clearRoute = await routeFor(null, interaction.guild && interaction.guild.id);
+    if (!clearRoute.channel) { await interaction.editReply({ content: '❌ No ticket log channel is set for this server — set it in the panel (Settings → Ticket log channel).' }); return true; }
+    const logCh = await resolveLogChannel(client, clearRoute);
+    if (!logCh) { await interaction.editReply({ content: `❌ \`${clearRoute.channel}\` is not a channel in this server. Set this server's ticket log channel in the panel.` }); return true; }
     const msgs = await logCh.messages.fetch({ limit: 200 });
     try { await logCh.bulkDelete(msgs); } catch (_) { for (const [, m] of msgs) try { await m.delete(); } catch (_) {} }
     await interaction.editReply({ content: `Cleared ${msgs.size} messages from ticket logs.` });
@@ -212,7 +274,7 @@ async function handleInteraction(interaction, client) {
     const uid = interaction.options.getString("user_id");
     const msg = interaction.options.getString('message');
     const target = activeTickets.get(uid);
-    if (!isStaffFor(interaction.member, target && target.type)) {
+    if (!await isStaffFor(interaction.member, target && target.type)) {
       await interaction.reply({ content: '❌ You don\'t have permission.', ephemeral: true }); return true;
     }
     if (!target) {
@@ -284,7 +346,14 @@ async function handleInteraction(interaction, client) {
     const issueText = interaction.fields.getTextInputValue('issue_text');
     const openedAt = new Date().toISOString().replace('T', ' ').slice(0, 16) + ' UTC';
 
-    activeTickets.set(interaction.user.id, { type: ticketType, game, issue: issueText, opened_at: openedAt });
+    // The guild the button was pressed in, recorded on the ticket. The rest of
+    // the conversation happens in DMs, where there is no guild to ask — so if it
+    // is not captured here it is gone, and every later routing decision falls
+    // back to whichever server the env vars happen to describe.
+    activeTickets.set(interaction.user.id, {
+      type: ticketType, game, issue: issueText, opened_at: openedAt,
+      guild_id: interaction.guild && interaction.guild.id,
+    });
     saveTickets(activeTickets);
 
     await interaction.deferReply({ ephemeral: true });
@@ -312,7 +381,7 @@ async function handleInteraction(interaction, client) {
     // doesn't affect the live flow below either way.
     logTicketOpened(interaction.guild.id, interaction.user.id, `${ticketType} — ${game}`);
 
-    try { await sendStaffLog(client, interaction.user, { type: ticketType, game, issue: issueText, opened_at: openedAt }); } catch (e) { console.error("[Tickets] log error:", e.message); }
+    try { await sendStaffLog(client, interaction.user, { type: ticketType, game, issue: issueText, opened_at: openedAt, guild_id: interaction.guild && interaction.guild.id }); } catch (e) { console.error("[Tickets] log error:", e.message); }
 
     const reply = await interaction.followUp({ content: '✅ I\'ve sent you a DM! Check your messages to start the support conversation.', ephemeral: true, fetchReply: true });
     setTimeout(() => reply.delete().catch(() => {}), 5000);
@@ -323,7 +392,7 @@ async function handleInteraction(interaction, client) {
   if (interaction.isButton() && interaction.customId.startsWith('ticket_reply_')) {
     const uid = interaction.customId.replace("ticket_reply_", "");
     const openTicket = activeTickets.get(uid);
-    if (!isStaffFor(interaction.member, openTicket && openTicket.type)) {
+    if (!await isStaffFor(interaction.member, openTicket && openTicket.type)) {
       await interaction.reply({ content: '❌ No permission.', ephemeral: true }); return true;
     }
     const modal = new ModalBuilder().setCustomId(`staff_reply_modal_${uid}`).setTitle('Reply to Ticket');
@@ -360,7 +429,7 @@ async function handleInteraction(interaction, client) {
   if (interaction.isButton() && interaction.customId.startsWith('ticket_close_')) {
     const uid = interaction.customId.replace("ticket_close_", "");
     const closing = activeTickets.get(uid);
-    if (!isStaffFor(interaction.member, closing && closing.type)) {
+    if (!await isStaffFor(interaction.member, closing && closing.type)) {
       await interaction.reply({ content: '❌ No permission.', ephemeral: true }); return true;
     }
     if (!closing) {
@@ -368,7 +437,10 @@ async function handleInteraction(interaction, client) {
     }
     activeTickets.delete(uid);
     saveTickets(activeTickets);
-    logTicketClosed(interaction.guild.id, uid);
+    // The row was opened against the ticket's own guild. Closing it against the
+    // guild the staff member happened to press the button in would leave the
+    // original row open forever and close nothing.
+    logTicketClosed(closing.guild_id || interaction.guild.id, uid);
     try {
       const user = client.users.cache.get(String(uid)) || await client.users.fetch(String(uid)).catch(() => null);
       if (user) {
@@ -396,10 +468,10 @@ async function handleDM(message, client) {
   const ticket = activeTickets.get(uid);
   activeTickets.delete(uid);
   saveTickets(activeTickets);
-  // DMs have no guild context — fall back to the bot's primary guild.
-  // Fine while this is a single-guild deployment; revisit once the panel's
-  // multi-guild install flow (Phase 3) is in place.
-  logTicketClosed(process.env.GUILD_ID, uid);
+  // DMs have no guild context, so the guild is the one recorded when the ticket
+  // opened. GUILD_ID stays as the fallback for tickets saved by an older build,
+  // which is the only way this can still close against the wrong server.
+  logTicketClosed(ticket.guild_id || process.env.GUILD_ID, uid);
 
   await message.channel.send({ embeds: [new EmbedBuilder()
     .setTitle('✅ Support Session Closed')
@@ -410,10 +482,12 @@ async function handleDM(message, client) {
   // Close notice follows the ticket, not the general log — a rank-boost ticket
   // opened in the booster channel must not close in a channel that team
   // cannot see.
-  const closeRoute = routeFor(ticket.type);
+  // ...and not the general log of a server this ticket was never opened in:
+  // resolveLogChannel refuses an id that does not live in the ticket's guild
+  // rather than posting a customer's ticket into whichever server does own it.
+  const closeRoute = await routeFor(ticket.type, ticket.guild_id);
   if (closeRoute.channel) {
-    let logCh = client.channels.cache.get(String(closeRoute.channel));
-    if (!logCh) try { logCh = await client.channels.fetch(String(closeRoute.channel)); } catch (_) { logCh = null; }
+    const logCh = await resolveLogChannel(client, closeRoute);
     if (logCh) await logCh.send({ embeds: [new EmbedBuilder()
       .setTitle('🔒 Ticket Closed')
       .setDescription(`Ticket for **${message.author.username}** (\`${message.author.id}\`) has been closed by the user.`)
@@ -428,6 +502,6 @@ async function handleDM(message, client) {
 // that is only worth anything if it's asserted.
 module.exports = {
   handleInteraction, handleDM, supportCommands, activeTickets,
-  routeFor, isStaffFor,
+  routeFor, isStaffFor, setSupportSettingsProvider, resolveLogChannel,
   RANK_BOOST_LOG_CHANNEL, RANK_BOOST_ROLE_ID,
 };

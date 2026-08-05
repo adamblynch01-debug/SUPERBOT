@@ -28,6 +28,11 @@ CREATE TABLE IF NOT EXISTS guild_settings (
   verify_channel_id       TEXT,
   invites_channel_name    TEXT,
   invites_channel_id      TEXT,
+  -- The reward panel and the join/leave log are two different channels. One
+  -- setting for both put the panel in the log on the main server and the log in
+  -- the panel channel on the second one.
+  invite_log_channel_name TEXT,
+  invite_log_channel_id   TEXT,
   invites_needed          INTEGER DEFAULT 0,
   log_channel_id          TEXT,
   staff_role_id           TEXT,
@@ -37,10 +42,37 @@ CREATE TABLE IF NOT EXISTS guild_settings (
   counting_channel_id     TEXT,
   leave_vouch_channel_id  TEXT,
   vouches_channel_id      TEXT,
+  -- These four are read by antiscam.js, which falls back to its own env vars
+  -- when they are null. The defaults here MUST match those env defaults
+  -- (WARNINGS_BEFORE_BAN / MUTE_DURATION_MINUTES / SPAM_MESSAGE_LIMIT /
+  -- SPAM_TIME_WINDOW), or creating a settings row silently changes a server's
+  -- moderation policy — which is exactly what migrations/mod_settings_defaults.sql
+  -- had to go and undo.
   warnings_before_ban     INTEGER DEFAULT 3,
-  mute_duration_minutes   INTEGER DEFAULT 10,
-  spam_message_limit      INTEGER DEFAULT 5,
+  mute_duration_minutes   INTEGER DEFAULT 30,
+  spam_message_limit      INTEGER DEFAULT 3,
   spam_time_window        INTEGER DEFAULT 10,
+  -- ── Per-guild versions of settings that used to be env vars only ──────────
+  -- An env var is one value for the whole process, and the bot is in two
+  -- servers: every one of these was a single id shared by both, so on the
+  -- second server the message either went to the FIRST server's channel
+  -- (client.channels.fetch is bot-wide and resolves across guilds without
+  -- complaint) or went nowhere. NULL here means "not configured for this
+  -- guild" and each consumer falls back to its env var, so an unset column
+  -- keeps the original server's behaviour exactly.
+  -- ORDER_LOG_CHANNEL_ID is deliberately absent — Railway-only, by decision.
+  orders_channel_id          TEXT,
+  restock_channel_id         TEXT,
+  vault_restock_channel_id   TEXT,
+  manual_delivery_channel_id TEXT,
+  sms_gen_channel_id         TEXT,
+  gen_log_channel_id         TEXT,
+  alerts_channel_id          TEXT,
+  rank_boost_log_channel     TEXT,
+  rank_boost_role_id         TEXT,
+  -- NOT the same as staff_role_id, which is the money gate hasAccess() reads.
+  ticket_staff_role_id       TEXT,
+  customer_role_id           TEXT,
   updated_at              TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 

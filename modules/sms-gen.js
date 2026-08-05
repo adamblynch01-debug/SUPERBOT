@@ -224,9 +224,27 @@ async function releaseSmsQuota(interaction) {
 // channel. Override order: /set-smsgen-channel → env → this default.
 const SMS_ORDER_CHANNEL_ID = '1532424953570267376';
 
+// The panel's per-guild SMS gen channel, installed by index.js. It goes ahead
+// of loadConfig() because that file, the env var and the default below are all
+// one value for the whole bot — and client.channels.fetch resolves across
+// guilds, so the second server's order cards were posted in the first server's
+// channel rather than failing.
+let settingsFor = async () => null;
+function setSmsSettingsProvider(fn) { if (typeof fn === 'function') settingsFor = fn; }
+
 async function resolveOrderChannel(client, interaction) {
   const cfg = loadConfig();
-  const id = cfg.orders_channel_id || process.env.SMS_GEN_CHANNEL_ID || SMS_ORDER_CHANNEL_ID;
+  let fromPanel = null;
+  const guildId = interaction && interaction.guild && interaction.guild.id;
+  if (guildId) {
+    try {
+      const s = await settingsFor(guildId);
+      fromPanel = (s && s.smsGenChannelId) || null;
+    } catch (e) {
+      console.error('[SMS] could not read guild settings:', e.message);
+    }
+  }
+  const id = fromPanel || cfg.orders_channel_id || process.env.SMS_GEN_CHANNEL_ID || SMS_ORDER_CHANNEL_ID;
   if (id) {
     try {
       const ch = await client.channels.fetch(String(id));
@@ -1322,6 +1340,7 @@ async function purchaseNumber(interaction, client, provider, apiKey, session, co
     what: `${serviceName} — ${country}`,
     detail: `\`${number}\`  ·  ${provider}  ·  order \`${orderId}\``,
     source: '/gennumber',
+    guildId: interaction.guild && interaction.guild.id,
   }).catch(() => {});
 
   await startPolling(client, orderId, orderData);
@@ -1330,6 +1349,7 @@ async function purchaseNumber(interaction, client, provider, apiKey, session, co
 module.exports = {
   commands, handleSMSInteraction, rehydrateOrders,
   setAccessGate, setSMSAccessGate: setAccessGate,
+  setSmsSettingsProvider,
   // Exported for test_sms_gate.js. This gate stands between a button click and
   // real provider credit, so its fail-closed behaviour is asserted, not assumed.
   _internals: { checkSmsAccess, releaseSmsQuota, SMS_COOLDOWN_HOURS, SMS_QUOTA_KEY },

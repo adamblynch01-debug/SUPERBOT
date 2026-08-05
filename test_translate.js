@@ -132,6 +132,72 @@ async function check(name, fn) {
     }
   });
 
+  // ── the caller's own list: what is a name rather than a sentence ───────────
+  //
+  // The report: "user receives order in spanish?" — a delivery DM offering
+  // "H8ED Privado Externo — Día". The keys inside the ``` fence were fine, so
+  // the mask worked; the FIELD NAME was the product, and no pattern above can
+  // tell a product name from prose. Only the caller knows, so only the caller
+  // can say.
+  await check('a product name the caller names is not translated', async () => {
+    const name = '📦 Call of Duty: Warzone — H8ED Private External — Month';
+    const out = await T.translateText(name, 'es', ['Call of Duty: Warzone — H8ED Private External — Month']);
+    assert.ok(out.includes('H8ED Private External'), out);
+    assert.ok(!/PRIVATE/.test(out), 'the stub translated it anyway: ' + out);
+  });
+
+  await check('naming it costs no call at all when it is the whole line', async () => {
+    // Nothing but a masked token is left, so there is nothing to send. Worth
+    // pinning: the delivery DM is the one path that must not get slower.
+    calls = [];
+    await T.translateText('H8ED Private External — Month', 'es', ['H8ED Private External — Month']);
+    assert.strictEqual(calls.length, 0, JSON.stringify(calls));
+  });
+
+  await check('the prose around a protected name is still translated', async () => {
+    // The point is not to switch translation off. A Spanish buyer should read
+    // Spanish; they should just read it about the product they actually bought.
+    const out = await T.translateText('Thank you for your purchase of Punisher Phone External.', 'es',
+      ['Punisher Phone External']);
+    assert.ok(out.includes('Punisher Phone External'), out);
+    assert.ok(/PURCHASE|THANK/.test(out), 'the sentence was not translated: ' + out);
+  });
+
+  await check('a longer name is masked before a shorter one inside it', async () => {
+    // 'Month' is also a tier label in its own right. Masking it first would
+    // split the product name around it and leave the halves to be translated.
+    const { kept } = T.mask('H8ED Private External — Month', ['Month', 'H8ED Private External — Month']);
+    assert.ok(kept.includes('H8ED Private External — Month'), JSON.stringify(kept));
+  });
+
+  await check('a two-letter product name is ignored rather than shredding the text', async () => {
+    const { masked } = T.mask('Go to the store and pick a plan.', ['Go']);
+    assert.ok(masked.startsWith('Go to the store'), masked);
+  });
+
+  await check('null and empty entries in the list are survivable', async () => {
+    // The caller passes data.tier_label straight through, and a one-off order
+    // has no tier.
+    const out = await T.translateText('Your order is ready.', 'es', [null, '', undefined, 'Warzone']);
+    assert.ok(typeof out === 'string' && out.length > 0, String(out));
+  });
+
+  await check('a protected name is cached separately from the same text without one', async () => {
+    // The hazard in the fix rather than in the bug: every delivery DM sent
+    // before today is already in the translations table, translated product
+    // name and all. Keyed on the source alone, the fix would serve exactly the
+    // output it was written to stop.
+    calls = [];
+    const src = 'Your Ghost TV Elite order is ready.';
+    await T.translateText(src, 'pt');
+    await T.translateText(src, 'pt', ['Ghost TV Elite']);
+    assert.strictEqual(calls.length, 2, "the second call was served from the first one's cache");
+    // And the difference is the whole point: the first went out naked, the
+    // second went out with the product name held back.
+    assert.ok(calls[0].text.includes('Ghost TV Elite'), calls[0].text);
+    assert.ok(!calls[1].text.includes('Ghost TV Elite'), calls[1].text);
+  });
+
   await check('the words around them ARE translated', async () => {
     calls = [];
     const out = await T.translateText('Perform an HWID reset for your license.', 'de');
