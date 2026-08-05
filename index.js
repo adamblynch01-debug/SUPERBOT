@@ -146,6 +146,63 @@ async function mirrorWebhookFor(route, dstChannel) {
   }
 }
 
+// The flood budget, shared by every route. See modules/mirror.js for why there
+// are two scopes; this is just where the counters live.
+const mirrorRate = mirror.makeRateWindow();
+
+// Route ids currently being paused. A flood arrives faster than one round trip
+// to Postgres and two channel sends, so without this the first burst posts the
+// same pause notice a dozen times in both servers — which is itself a flood,
+// delivered by the thing that was supposed to stop one.
+const mirrorPausing = new Set();
+
+/**
+ * Stop a route and say why, in the destination and in the source.
+ *
+ * Both ends get told because they are different people with different
+ * problems: the destination needs to know an inbound feed was cut and does not
+ * need chasing, and the source needs to know its posts stopped arriving. A
+ * pause that only one end can see is how this ends up looking like the bot
+ * quietly broke.
+ */
+async function pauseMirrorRoute(route, reason, opts = {}) {
+  if (mirrorPausing.has(route.id)) return;
+  mirrorPausing.add(route.id);
+  try {
+    await db.query(
+      `UPDATE mirror_routes SET enabled = false, paused_reason = $2, paused_at = now() WHERE id = $1`,
+      [route.id, reason.slice(0, 500)]);
+  } catch (e) {
+    console.error(`[mirror] could not record the pause of route ${route.id}:`, e.message);
+  }
+  console.warn(`[mirror] route ${route.id} PAUSED — ${reason}`);
+  await loadMirrorRoutes(true);
+  mirrorRate.clear(`r:${route.id}`);
+
+  const note = (where) => `⛔ **Mirror paused** — route \`#${route.id}\`\n` +
+    `${reason}\n\n` +
+    (where === 'dst'
+      ? `Nothing further from <#${route.src_channel_id}> will arrive here until an admin of this server runs \`/mirror resume id:${route.id}\`.\n` +
+        `If this was not something you expect, \`/mirror block guild_id:${route.src_guild_id}\` stops it being re-added at all.`
+      : `Posts from <#${route.src_channel_id}> have stopped arriving in the other server. An admin at either end can run \`/mirror resume id:${route.id}\`.`);
+
+  for (const [end, channelId] of [['dst', route.dst_channel_id], ['src', route.src_channel_id]]) {
+    if (opts.skip === end) continue;
+    try {
+      const ch = await client.channels.fetch(channelId).catch(() => null);
+      if (ch && typeof ch.send === 'function') {
+        await ch.send({ content: note(end), allowedMentions: { parse: [] } });
+      }
+    } catch (e) {
+      console.error(`[mirror] could not announce the pause in ${channelId}:`, e.message);
+    }
+  }
+  // Kept for a minute, not cleared here: the flood is still arriving, and the
+  // routes map has already been reloaded without this route, so a second pause
+  // could only come from a message that was mid-flight.
+  setTimeout(() => mirrorPausing.delete(route.id), 60000).unref?.();
+}
+
 /**
  * Relay one message down every route out of its channel.
  *
@@ -158,12 +215,28 @@ async function relayMessage(message) {
   const routes = (await loadMirrorRoutes()).get(message.channel.id);
   if (!routes || !routes.length) return;
 
-  const ctx = { mirrorWebhookIds, postedByMirror: mirrorPosted };
+  const ctx = { mirrorWebhookIds, postedByMirror: mirrorPosted, selfId: client.user && client.user.id };
   const srcGuild = message.guild;
+  const now = Date.now();
 
   for (const route of routes) {
-    const verdict = mirror.shouldMirror(message, { botOnly: route.bot_only !== false }, ctx);
+    const verdict = mirror.shouldMirror(message, {
+      botOnly: route.bot_only !== false,
+      includeOtherBots: !!route.include_other_bots,
+    }, ctx);
     if (!verdict.ok) continue;
+
+    // The budget is spent only on messages that were actually going to be
+    // relayed. Charging it before shouldMirror would let ordinary chatter in a
+    // bot-only channel trip a limit that no post ever came near.
+    const rate = mirror.checkRate(mirrorRate, route, now);
+    if (!rate.ok) {
+      // Pausing is deliberate rather than dropping the overflow. Silently
+      // discarding messages leaves a route that looks fine and is lying; a
+      // stopped route with a reason attached is something a person can act on.
+      await pauseMirrorRoute(route, rate.reason).catch(e => console.error('[mirror] pause failed:', e.message));
+      continue;
+    }
 
     try {
       const dst = await client.channels.fetch(route.dst_channel_id).catch(() => null);
@@ -2525,10 +2598,21 @@ const ownCommands = [
       .addChannelOption(o => o.setName('from').setDescription('The channel here to copy FROM').setRequired(true))
       .addStringOption(o => o.setName('to_channel_id').setDescription('Channel ID in the other server to copy INTO').setRequired(true))
       .addBooleanOption(o => o.setName('include_humans').setDescription('Also copy messages people write (default: bot posts only)').setRequired(false))
+      .addBooleanOption(o => o.setName('include_other_bots').setDescription('Also copy other bots and webhooks (default: only my own posts)').setRequired(false))
+      .addIntegerOption(o => o.setName('rate_per_min').setDescription('Pause the route above this many messages a minute (default 20)').setMinValue(1).setMaxValue(600).setRequired(false))
       .addBooleanOption(o => o.setName('allow_pings').setDescription('Let @everyone in a copied post ping the other server (default: no)').setRequired(false)))
     .addSubcommand(sub => sub.setName('list').setDescription('Show every relay set up from this server'))
     .addSubcommand(sub => sub.setName('remove').setDescription('Stop a relay')
       .addStringOption(o => o.setName('id').setDescription('Route ID (from /mirror list)').setRequired(true)))
+    .addSubcommand(sub => sub.setName('resume').setDescription('Restart a route that was paused')
+      .addStringOption(o => o.setName('id').setDescription('Route ID (from /mirror list)').setRequired(true)))
+    // The 3am command. No IDs to read off a channel that is scrolling.
+    .addSubcommand(sub => sub.setName('panic').setDescription('Stop EVERY relay arriving in this server, right now')
+      .addBooleanOption(o => o.setName('outbound_too').setDescription('Also stop everything leaving this server').setRequired(false)))
+    .addSubcommand(sub => sub.setName('block').setDescription('Refuse all mirrors from a server, now and in future')
+      .addStringOption(o => o.setName('guild_id').setDescription('The server ID to block').setRequired(true)))
+    .addSubcommand(sub => sub.setName('unblock').setDescription('Allow mirrors from a server again')
+      .addStringOption(o => o.setName('guild_id').setDescription('The server ID to unblock').setRequired(true)))
     .addSubcommand(sub => sub.setName('test').setDescription('Send a test post down every relay from a channel')
       .addChannelOption(o => o.setName('from').setDescription('The source channel to test').setRequired(true))),
 
@@ -3075,6 +3159,39 @@ client.on('messageDelete', async (message) => {
   } catch (e) { console.error('[messageDelete] mirror error:', e && e.message); }
 });
 
+// A source server changing hands is the loudest signal available that a route's
+// authorisation no longer means what it meant when it was granted. An admin of
+// the source approved the relay; a new owner did not, and neither did the
+// destination — they trusted a server that no longer exists in the form they
+// trusted. Transfers are also how a stolen server is laundered.
+//
+// So every relay LEAVING that server stops on the spot and the receiving end is
+// told why. This errs towards a false alarm: an honest handover costs one
+// `/mirror resume`, while the miss costs somebody else's server.
+client.on('guildUpdate', async (oldGuild, newGuild) => {
+  try {
+    if (!oldGuild || !newGuild || oldGuild.ownerId === newGuild.ownerId) return;
+    const reason = `the source server **${newGuild.name}** changed owner ` +
+      `(<@${oldGuild.ownerId}> → <@${newGuild.ownerId}>)`;
+    console.warn(`[mirror] guild ${newGuild.id} owner ${oldGuild.ownerId} → ${newGuild.ownerId}`);
+
+    let routes = [];
+    try {
+      ({ rows: routes } = await db.query(
+        'SELECT * FROM mirror_routes WHERE enabled AND src_guild_id = $1', [newGuild.id]));
+    } catch (e) { console.error('[mirror] owner-change lookup failed:', e.message); return; }
+    if (!routes.length) return;
+
+    for (const route of routes) {
+      // skip: 'src' — the source server is the one whose control just changed,
+      // so a notice posted there is a notice to whoever took it. The people who
+      // need to know are at the other end.
+      await pauseMirrorRoute(route, reason, { skip: 'src' })
+        .catch(e => console.error(`[mirror] owner-change pause of ${route.id} failed:`, e.message));
+    }
+  } catch (e) { console.error('[guildUpdate] mirror error:', e && e.message); }
+});
+
 // ─── Interactions ─────────────────────────────────────────────────────────────
 client.on('interactionCreate', async interaction => {
   // One line per interaction, before anything can throw or hang. When a command
@@ -3136,7 +3253,7 @@ client.on('interactionCreate', async interaction => {
             { name: '📣 Updates & Status', value: '`/postupdate` — Post a product update\n`/statusupdate` — Post a status update\n`/announce` — Send a custom announcement', inline: false },
             { name: '🌐 Server Setup', value: '`/setwebsite` — Pin website URL\n`/setupreseller` — Post reseller panel\n`/setresellerlinks` — Update reseller button links\n`/postimage` — Post an image', inline: false },
             { name: '💾 Server Snapshots', value: '`/serverbackup create` — Save the server\'s roles, channels & permissions\n`/serverbackup list|view|export` — Browse or download a snapshot\n`/serverbackup restore` — Rebuild from one (never deletes anything)', inline: false },
-            { name: '🔁 Cross-Server Mirroring', value: '`/mirror follow` — Announcement channels: let another server follow this one (Discord delivers it)\n`/mirror add` — Any channel: relay its posts into another server\n`/mirror list|remove|test` — Manage the relays', inline: false },
+            { name: '🔁 Cross-Server Mirroring', value: '`/mirror follow` — Announcement channels: let another server follow this one (Discord delivers it)\n`/mirror add` — Any channel: relay its posts into another server\n`/mirror list|remove|test` — Manage the relays\n`/mirror panic` — Stop everything arriving here, right now\n`/mirror block|unblock|resume` — Refuse a server outright, or restart a paused route', inline: false },
             { name: '🎫 Support Tickets', value: '`/panel` — Post the support panel\n`/clearlogs` — Clear ticket log channel\n`/reply` — Reply to a user\'s ticket', inline: false },
             { name: '📝 Vouches', value: '`/setupvouch` — Post the Leave a Vouch panel\n`/exportvouches` — Download a backup of all vouches\n`/importvouches` — Restore vouches from a backup file, or `source: website`', inline: false },
             { name: '🎮 Steam Stock', value: '`/gensteam [type]` — Generate a Steam account\n`/stock` — Check available stock\n`/addstock` — Staff: add accounts to stock', inline: false },
@@ -4626,6 +4743,20 @@ client.on('interactionCreate', async interaction => {
           const dest = await resolveDestination(interaction.options.getString('to_channel_id').trim());
           if (dest.error) return interaction.editReply({ content: `❌ ${dest.error}` });
 
+          // A block is the destination's standing answer, and it has to be
+          // checked here rather than at relay time: /mirror add UPSERTs and
+          // sets enabled = true, so without this, "remove" is undone by
+          // whoever still holds admin at both ends.
+          try {
+            const { rows: [blocked] } = await db.query(
+              'SELECT 1 FROM mirror_blocks WHERE guild_id = $1 AND blocked_guild_id = $2',
+              [dest.channel.guild.id, interaction.guild.id]);
+            if (blocked) {
+              return interaction.editReply({ content:
+                `❌ **${dest.channel.guild.name}** has blocked mirrors from this server. An admin there can lift it with \`/mirror unblock guild_id:${interaction.guild.id}\`.` });
+            }
+          } catch (e) { console.error('[mirror] block check failed:', e.message); }
+
           // The loop check, before the row exists. Named rather than just
           // refused: told "that would loop", an operator has to go find it.
           let existing = [];
@@ -4639,26 +4770,34 @@ client.on('interactionCreate', async interaction => {
           }
 
           const botOnly = interaction.options.getBoolean('include_humans') !== true;
+          const includeOtherBots = interaction.options.getBoolean('include_other_bots') === true;
           const allowPings = interaction.options.getBoolean('allow_pings') === true;
+          const ratePerMin = interaction.options.getInteger('rate_per_min') || null;
           let row;
           try {
             ({ rows: [row] } = await db.query(
-              `INSERT INTO mirror_routes (src_guild_id, src_channel_id, dst_guild_id, dst_channel_id, bot_only, allow_pings, created_by)
-               VALUES ($1,$2,$3,$4,$5,$6,$7)
+              `INSERT INTO mirror_routes (src_guild_id, src_channel_id, dst_guild_id, dst_channel_id, bot_only, include_other_bots, allow_pings, rate_per_min, created_by)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
                ON CONFLICT (src_channel_id, dst_channel_id) DO UPDATE
-                 SET bot_only = EXCLUDED.bot_only, allow_pings = EXCLUDED.allow_pings, enabled = true
+                 SET bot_only = EXCLUDED.bot_only, include_other_bots = EXCLUDED.include_other_bots,
+                     allow_pings = EXCLUDED.allow_pings, rate_per_min = EXCLUDED.rate_per_min,
+                     enabled = true, paused_reason = NULL, paused_at = NULL
                RETURNING *`,
-              [interaction.guild.id, from.id, dest.channel.guild.id, dest.channel.id, botOnly, allowPings, interaction.user.id]));
+              [interaction.guild.id, from.id, dest.channel.guild.id, dest.channel.id,
+               botOnly, includeOtherBots, allowPings, ratePerMin, interaction.user.id]));
           } catch (e) {
             return interaction.editReply({ content: `❌ Could not save the route: ${e.message}` });
           }
           await loadMirrorRoutes(true);
           mirrorWebhookCache.delete(dest.channel.id);
+          mirrorRate.clear(`r:${row.id}`);
 
           const notes = [];
-          notes.push(botOnly
-            ? 'Only posts **I** make are copied. Messages people write are left here.'
-            : '**Every** message in this channel is copied, including ones people write.');
+          notes.push(!botOnly
+            ? '**Every** message in this channel is copied, including ones people write.'
+            : includeOtherBots
+              ? 'Posts made by **any bot or webhook** here are copied. Messages people write are left here.'
+              : 'Only posts **I** make are copied — not other bots, not webhooks, not people. That is deliberate: a webhook counts as a bot to Discord, so "any bot" would let anyone with Manage Webhooks here relay whatever they like.');
           notes.push(allowPings
             ? '`@everyone` in a copied post **will** ping the other server.'
             : '`@everyone` in a copied post is copied as text but **will not ping** the other server.');
@@ -4667,6 +4806,7 @@ client.on('interactionCreate', async interaction => {
           }
           notes.push('Buttons that only mean something in this server are removed on the way over. The translate dropdown is kept — it works anywhere.');
           notes.push('Edits and deletions here follow into the copy. Posts made before now are not sent.');
+          notes.push(`Above **${ratePerMin || mirror.DEFAULT_RATE_PER_MIN} messages a minute** this route pauses itself and tells both ends why — so a compromised source server cannot use it as a firehose. \`/mirror resume id:${row.id}\` restarts it.`);
 
           return interaction.editReply({ embeds: [new EmbedBuilder()
             .setColor(0x2ecc71).setTitle('✅ Mirror added')
@@ -4717,6 +4857,142 @@ client.on('interactionCreate', async interaction => {
           return interaction.editReply({ content:
             `✅ Stopped route \`#${row.id}\` — <#${row.src_channel_id}> no longer copies into <#${row.dst_channel_id}>.\n` +
             'Copies already posted are left where they are; removing a mirror does not delete anything.' });
+        }
+
+        // ── resume ───────────────────────────────────────────────────────────
+        // The other half of an automatic pause. Deliberately manual: a route
+        // that paused itself because 300 messages arrived in a minute should
+        // stay off until a person has looked at the source channel and decided
+        // it was a restock and not a raid. A timer would just re-open the tap
+        // every few minutes for as long as the flood lasts.
+        if (sub === 'resume') {
+          const id = interaction.options.getString('id').replace(/^#/, '').trim();
+          if (!/^\d+$/.test(id)) return interaction.editReply({ content: '❌ That is not a route ID. `/mirror list` shows them.' });
+          let row;
+          try {
+            ({ rows: [row] } = await db.query(
+              'SELECT * FROM mirror_routes WHERE id = $1 AND (src_guild_id = $2 OR dst_guild_id = $2)',
+              [id, interaction.guild.id]));
+          } catch (e) { return interaction.editReply({ content: `❌ Could not read the route: ${e.message}` }); }
+          if (!row) return interaction.editReply({ content: '❌ No route with that ID involves this server.' });
+          if (row.enabled !== false) return interaction.editReply({ content: `ℹ️ Route \`#${row.id}\` is already running.` });
+
+          // A block belongs to the receiving server, so the sending server does
+          // not get to undo it by resuming. Without this check the source end
+          // could walk straight back through a door the destination shut.
+          try {
+            const { rows: [blocked] } = await db.query(
+              'SELECT 1 FROM mirror_blocks WHERE guild_id = $1 AND blocked_guild_id = $2',
+              [row.dst_guild_id, row.src_guild_id]);
+            if (blocked) {
+              return interaction.editReply({ content:
+                `❌ The receiving server has blocked mirrors from **${row.src_guild_id}**. An admin **there** has to run \`/mirror unblock guild_id:${row.src_guild_id}\` first.` });
+            }
+          } catch (e) { console.error('[mirror] resume block check failed:', e.message); }
+
+          try {
+            await db.query(
+              'UPDATE mirror_routes SET enabled = true, paused_reason = NULL, paused_at = NULL WHERE id = $1',
+              [row.id]);
+          } catch (e) { return interaction.editReply({ content: `❌ Could not resume it: ${e.message}` }); }
+          await loadMirrorRoutes(true);
+          // The old counts are not evidence about the next minute, and leaving
+          // them would trip the limit again on the first message through.
+          mirrorRate.clear(`r:${row.id}`);
+          mirrorRate.clear(`g:${row.dst_guild_id}`);
+          return interaction.editReply({ content:
+            `✅ Route \`#${row.id}\` is running again — <#${row.src_channel_id}> → <#${row.dst_channel_id}>.` +
+            (row.paused_reason ? `\nIt had been paused because: ${row.paused_reason}` : '') +
+            '\nMessages posted while it was paused are **not** backfilled.' });
+        }
+
+        // ── panic ────────────────────────────────────────────────────────────
+        // One command, no IDs. The situation this is for is an admin watching a
+        // channel scroll faster than they can read a route number off it, at an
+        // hour when nobody wants to reason about direction flags. Inbound is
+        // stopped by default because that is the damage being done to *this*
+        // server; outbound is opt-in because stopping it punishes the servers
+        // downstream for something happening here.
+        if (sub === 'panic') {
+          const outboundToo = interaction.options.getBoolean('outbound_too') === true;
+          const reason = `panic stop by ${interaction.user.tag} in ${interaction.guild.name}`;
+          let rows;
+          try {
+            ({ rows } = await db.query(
+              outboundToo
+                ? `UPDATE mirror_routes SET enabled = false, paused_reason = $2, paused_at = now()
+                     WHERE enabled AND (dst_guild_id = $1 OR src_guild_id = $1) RETURNING *`
+                : `UPDATE mirror_routes SET enabled = false, paused_reason = $2, paused_at = now()
+                     WHERE enabled AND dst_guild_id = $1 RETURNING *`,
+              [interaction.guild.id, reason]));
+          } catch (e) { return interaction.editReply({ content: `❌ Could not stop them: ${e.message}` }); }
+          await loadMirrorRoutes(true);
+          for (const r of rows) {
+            mirrorRate.clear(`r:${r.id}`);
+            mirrorWebhookCache.delete(r.dst_channel_id);
+          }
+          if (!rows.length) {
+            return interaction.editReply({ content:
+              `✅ Nothing was running${outboundToo ? '' : ' into this server'}. Nothing to stop.` +
+              (outboundToo ? '' : '\nRelays *leaving* this server are untouched — add `outbound_too:true` to stop those as well.') });
+          }
+          const lines = rows.map(r => `\`#${r.id}\` <#${r.src_channel_id}> → <#${r.dst_channel_id}>`);
+          const srcGuilds = [...new Set(rows.filter(r => r.src_guild_id !== interaction.guild.id).map(r => r.src_guild_id))];
+          return interaction.editReply({ embeds: [new EmbedBuilder()
+            .setColor(0xe74c3c).setTitle(`⛔ ${rows.length} relay${rows.length === 1 ? '' : 's'} stopped`)
+            .setDescription(lines.join('\n').slice(0, 3000))
+            .addFields({ name: 'This is a pause, not a removal', value:
+              'The routes still exist and `/mirror resume id:<ID>` restarts any of them.\n' +
+              (srcGuilds.length
+                ? `If a **source server** is compromised, pausing is not enough — whoever holds admin at both ends can add a new route. \`/mirror block guild_id:${srcGuilds[0]}\` refuses that server permanently.`
+                : 'Use `/mirror remove id:<ID>` to delete one outright.') })] });
+        }
+
+        // ── block ────────────────────────────────────────────────────────────
+        // Removing a route is not durable on its own: /mirror add UPSERTs and
+        // sets enabled = true, so anyone still holding admin at both ends can
+        // re-add exactly what was just removed. This is keyed on the GUILD and
+        // not the channel, because the channel is the part they can change in
+        // two clicks.
+        if (sub === 'block') {
+          const gid = interaction.options.getString('guild_id').trim();
+          if (!/^\d{5,25}$/.test(gid)) return interaction.editReply({ content: '❌ That is not a server ID. `/mirror list` shows the routes; the ID is the server the copies come from.' });
+          if (gid === interaction.guild.id) return interaction.editReply({ content: '❌ That is this server. Blocking yourself would stop your own outbound relays being accepted anywhere.' });
+          let killed = [];
+          try {
+            await db.query(
+              `INSERT INTO mirror_blocks (guild_id, blocked_guild_id, created_by) VALUES ($1,$2,$3)
+                 ON CONFLICT (guild_id, blocked_guild_id) DO NOTHING`,
+              [interaction.guild.id, gid, interaction.user.id]);
+            // A block that left the live route running would be a sign on a
+            // door that is still open.
+            ({ rows: killed } = await db.query(
+              `DELETE FROM mirror_routes WHERE dst_guild_id = $1 AND src_guild_id = $2 RETURNING *`,
+              [interaction.guild.id, gid]));
+          } catch (e) { return interaction.editReply({ content: `❌ Could not block it: ${e.message}` }); }
+          await loadMirrorRoutes(true);
+          for (const r of killed) { mirrorRate.clear(`r:${r.id}`); mirrorWebhookCache.delete(r.dst_channel_id); }
+          return interaction.editReply({ content:
+            `⛔ **${gid}** is blocked. Nothing from that server can be mirrored here, and \`/mirror add\` pointed at this server will be refused.\n` +
+            (killed.length
+              ? `${killed.length} live route${killed.length === 1 ? '' : 's'} removed: ${killed.map(r => `\`#${r.id}\``).join(', ')}.\n`
+              : 'No live routes from it existed.\n') +
+            `Lift it with \`/mirror unblock guild_id:${gid}\`.` });
+        }
+
+        // ── unblock ──────────────────────────────────────────────────────────
+        if (sub === 'unblock') {
+          const gid = interaction.options.getString('guild_id').trim();
+          if (!/^\d{5,25}$/.test(gid)) return interaction.editReply({ content: '❌ That is not a server ID.' });
+          let row;
+          try {
+            ({ rows: [row] } = await db.query(
+              'DELETE FROM mirror_blocks WHERE guild_id = $1 AND blocked_guild_id = $2 RETURNING *',
+              [interaction.guild.id, gid]));
+          } catch (e) { return interaction.editReply({ content: `❌ Could not lift it: ${e.message}` }); }
+          if (!row) return interaction.editReply({ content: `ℹ️ **${gid}** was not blocked here.` });
+          return interaction.editReply({ content:
+            `✅ **${gid}** is no longer blocked. Nothing has been re-created — an admin of that server has to run \`/mirror add\` again.` });
         }
 
         // ── test ─────────────────────────────────────────────────────────────

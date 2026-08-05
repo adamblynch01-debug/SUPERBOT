@@ -87,6 +87,14 @@ function sanitizeComponents(rows, allow = COMPONENT_ALLOW) {
  * this bot mirrors THROUGH, and `postedByMirror` is the set of message ids it
  * has posted as mirrors. A message matching either is a mirror arriving, not
  * a post being made, and relaying it again is the loop.
+ *
+ * `ctx.selfId` is this bot's own user id, and it is what makes `botOnly` mean
+ * anything. The check used to be `author.bot`, which is TRUE FOR EVERY WEBHOOK
+ * MESSAGE — so anyone with Manage Webhooks in the source channel could create
+ * a webhook and have everything they posted relayed into another server, past
+ * a flag that reads like it says otherwise. A bot-only route now carries this
+ * bot's own posts and nothing else; other bots and webhooks are an explicit
+ * opt-in per route.
  */
 function shouldMirror(message, route, ctx = {}) {
   const webhookIds = ctx.mirrorWebhookIds || new Set();
@@ -101,11 +109,25 @@ function shouldMirror(message, route, ctx = {}) {
   if (message.type != null && !MIRRORABLE_TYPES.has(message.type)) {
     return { ok: false, why: 'a system message, not a post' };
   }
-  // The default, and what was actually asked for: everything the BOT posts.
-  // A route can be widened to carry human messages too, which is a different
-  // feature (a shared channel) wearing the same plumbing.
-  if (route.botOnly !== false && !(message.author && message.author.bot)) {
-    return { ok: false, why: 'not a bot post and this route is bot-only' };
+  // The default, and what was actually asked for: everything the BOT posts —
+  // meaning THIS bot, not "anything Discord flags as a bot", which is every
+  // webhook in the channel. A route can be widened to carry other bots and
+  // webhooks, and widened again to carry human messages, which is a shared
+  // channel wearing the same plumbing.
+  if (route.botOnly !== false) {
+    const authorId = message.author && message.author.id;
+    const isSelf = ctx.selfId ? authorId === ctx.selfId : !!(message.author && message.author.bot);
+    if (route.includeOtherBots) {
+      if (!(message.author && message.author.bot)) {
+        return { ok: false, why: 'not a bot post and this route is bot-only' };
+      }
+    } else if (!isSelf) {
+      // Said plainly, because this is the one rejection an operator is likely
+      // to see and misread as the relay being broken.
+      return { ok: false, why: message.webhookId
+        ? 'posted by a webhook, and this route carries only my own posts'
+        : 'not one of my posts and this route carries only mine' };
+    }
   }
   const empty = !((message.content || '').trim())
     && !(message.embeds || []).length
@@ -227,13 +249,102 @@ function describeRoute(r, nameOf) {
   const to = nameOf ? nameOf(r.dst_channel_id) : r.dst_channel_id;
   const flags = [];
   if (r.bot_only === false) flags.push('all messages');
+  else if (r.include_other_bots) flags.push('all bots');
   if (r.allow_pings) flags.push('pings allowed');
-  if (r.enabled === false) flags.push('disabled');
+  if (r.rate_per_min) flags.push(`${r.rate_per_min}/min`);
+  if (r.enabled === false) flags.push(r.paused_reason ? `PAUSED: ${r.paused_reason}` : 'disabled');
   return `\`#${r.id}\` ${from} → ${to}${flags.length ? ` — ${flags.join(', ')}` : ''}`;
+}
+
+// ─── Flood control ───────────────────────────────────────────────────────────
+//
+// The case this exists for: the source server is taken over. The attacker does
+// not need to break anything — they inherit a live, authorised route into
+// somebody else's server, and until now nothing in the code disagreed with
+// them. One message in equals one message out, immediately, forever.
+//
+// The damage is not only the spammed channel. Every relayed message is also a
+// REST call and a database insert, and discord.js QUEUES rather than drops, so
+// a flood becomes a growing backlog that delays every other command this bot
+// runs in every other server. A raid on one server becomes an outage on all of
+// them.
+//
+// So: a budget per route, and a second budget per destination GUILD, because
+// five routes into the same server would otherwise each spend the full
+// allowance and the receiving server would still be buried.
+const RATE_WINDOW_MS = 60000;
+const DEFAULT_RATE_PER_MIN = 20;      // one route
+const DEFAULT_GUILD_PER_MIN = 45;     // everything arriving in one server
+
+/**
+ * A sliding-window counter. Not a leaky bucket: the question being answered is
+ * "how many in the last minute", and an operator reading "300 messages in 60
+ * seconds" in a pause notice can check that against the channel. A drip rate
+ * cannot be checked against anything.
+ *
+ * `now` is injected so this is testable without sleeping, and so a single
+ * relay burst is measured against one clock reading rather than several.
+ */
+function makeRateWindow(windowMs = RATE_WINDOW_MS) {
+  const hits = new Map();   // key → array of timestamps, oldest first
+
+  function prune(key, now) {
+    const arr = hits.get(key);
+    if (!arr) return [];
+    const cutoff = now - windowMs;
+    // The array is sorted, so drop the leading run rather than filtering.
+    let i = 0;
+    while (i < arr.length && arr[i] <= cutoff) i++;
+    if (i) arr.splice(0, i);
+    if (!arr.length) hits.delete(key);
+    return arr;
+  }
+
+  return {
+    /** Records a hit and returns how many are in the window, including it. */
+    hit(key, now) {
+      const arr = prune(key, now);
+      arr.push(now);
+      hits.set(key, arr);
+      return arr.length;
+    },
+    /** How many are in the window without recording one. */
+    count(key, now) { return prune(key, now).length; },
+    /** Called when a route is removed or resumed — its history is not evidence any more. */
+    clear(key) { hits.delete(key); },
+    get size() { return hits.size; },
+  };
+}
+
+/**
+ * Whether this relay is within budget, and if not, which budget it broke.
+ *
+ * Returns `{ ok }` or `{ ok: false, scope, count, limit, reason }`. The reason
+ * is written to be read by whoever finds the paused route hours later, so it
+ * names the number and the window rather than saying "rate limited".
+ */
+function checkRate(window, route, now, opts = {}) {
+  const perRoute = route.rate_per_min || opts.defaultRate || DEFAULT_RATE_PER_MIN;
+  const perGuild = opts.guildRate || DEFAULT_GUILD_PER_MIN;
+
+  const routeCount = window.hit(`r:${route.id}`, now);
+  const guildCount = window.hit(`g:${route.dst_guild_id}`, now);
+
+  if (routeCount > perRoute) {
+    return { ok: false, scope: 'route', count: routeCount, limit: perRoute,
+      reason: `${routeCount} messages in 60s down one route (limit ${perRoute})` };
+  }
+  if (guildCount > perGuild) {
+    return { ok: false, scope: 'guild', count: guildCount, limit: perGuild,
+      reason: `${guildCount} messages in 60s into this server across all routes (limit ${perGuild})` };
+  }
+  return { ok: true, routeCount, guildCount };
 }
 
 module.exports = {
   COMPONENT_ALLOW, MIRRORABLE_TYPES, MAX_EMBEDS, MAX_FILES,
+  RATE_WINDOW_MS, DEFAULT_RATE_PER_MIN, DEFAULT_GUILD_PER_MIN,
   sanitizeComponents, shouldMirror, buildMirrorPayload, toChannelPayload,
   webhookName, findCycle, makeRecentSet, describeRoute,
+  makeRateWindow, checkRate,
 };
