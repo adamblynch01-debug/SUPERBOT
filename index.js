@@ -1995,10 +1995,20 @@ async function buildRestoreConfirm(guild, row, snapId, allowOther, parts) {
   const lines = serverBackup.describePlan(rolePlan, chanPlan, snap, sel);
   const warnings = serverBackup.partWarnings(sel);
 
+  // "Nothing is ever deleted" is a promise about channels and roles still
+  // being there afterwards. It says nothing about what they can DO, and a
+  // restore rolls permissions back to the snapshot like everything else. That
+  // is the half nobody pictures, so it is counted and named here.
+  const me = guild.members.me || await guild.members.fetchMe();
+  const losses = sel.includes('roles') ? serverBackup.permissionLosses(rolePlan, me.permissions.bitfield) : [];
+
   const embed = new EmbedBuilder()
     .setColor(0xffa500)
     .setTitle('⚠️ Restore — read this first')
-    .setDescription(`Snapshot \`${snapId}\` from **${row.guild_name}**\ninto **${guild.name}**`)
+    .setDescription(`Snapshot \`${snapId}\` from **${row.guild_name}**\ninto **${guild.name}**`
+      // Same-server is the ordinary case; the other one deserves saying out
+      // loud rather than living in a command option nobody re-reads.
+      + (row.guild_id === guild.id ? '' : '\n\n🛑 **This snapshot was taken in a DIFFERENT server.**'))
     .addFields(
       { name: 'Restoring', value: sel.length
         ? sel.map(k => `${serverBackup.PART[k].emoji} ${serverBackup.PART[k].label}`).join(' · ')
@@ -2007,6 +2017,18 @@ async function buildRestoreConfirm(guild, row, snapId, allowOther, parts) {
     );
   if (warnings.length) {
     embed.addFields({ name: 'What that leaves out', value: warnings.map(w => `• ${w}`).join('\n').slice(0, 1024) });
+  }
+  if (losses.length) {
+    const shown = losses.slice(0, 12).map(l => {
+      const names = serverBackup.namePermissions(l.lost, PermissionFlagsBits);
+      const head = names.slice(0, 6).join(', ');
+      return `• **${l.name}** loses ${head}${names.length > 6 ? ` +${names.length - 6} more` : ''}`;
+    });
+    if (losses.length > shown.length) shown.push(`_…and ${losses.length - shown.length} more role(s)._`);
+    embed.addFields({
+      name: `🛑 ${losses.length} role(s) will LOSE permissions`,
+      value: `${shown.join('\n')}\n\nThe snapshot does not have these, so restoring takes them away. Untick 🎭 Roles if that is not what you meant.`.slice(0, 1024),
+    });
   }
   embed.setFooter({ text: 'Matching is by name. Existing roles and channels are updated in place — nothing is deleted.' });
 
@@ -2074,6 +2096,14 @@ async function runRestore(interaction, snapId, allowOther, parts) {
     // What the BOT can grant. Discord rejects the whole request when asked for
     // a permission the actor does not hold, so one missing bit would otherwise
     // fail an entire role rather than just that bit.
+    //
+    // Read it exactly as Discord does. A bot with ADMINISTRATOR holds every
+    // permission there is and its bitfield has ONE bit set, so the bitwise
+    // AND below zeroed every role that was not itself an administrator — the
+    // most privileged bot possible stripped the server bare and called it
+    // "permissions the bot could not grant". serverBackup.maskPermissions now
+    // treats that bit as "no mask"; this stays a plain read so there is one
+    // place that decides.
     const me = guild.members.me || await guild.members.fetchMe();
     const botPerms = me.permissions.bitfield;
 
@@ -2094,7 +2124,11 @@ async function runRestore(interaction, snapId, allowOther, parts) {
     for (const { from, to, everyone } of rolePlan.update) {
       idMap.set(from.id, to.id);
       if (!on('roles')) continue;
-      const { granted, missing } = serverBackup.maskPermissions(from.permissions, botPerms);
+      // `to.permissions` — what the role has now. Passing it is what stops a
+      // permission the bot cannot write from being CLEARED rather than left
+      // alone. Without it this loop took every permission off every role it
+      // touched.
+      const { granted, missing } = serverBackup.maskPermissions(from.permissions, botPerms, to.permissions.bitfield);
       if (BigInt(missing)) serverBackup.namePermissions(missing, PermissionFlagsBits).forEach(p => permsDropped.add(p));
       try {
         // @everyone has no colour, no hoist and no mentionable to speak of —
@@ -2142,11 +2176,20 @@ async function runRestore(interaction, snapId, allowOther, parts) {
       if (from.type === serverBackup.CH.GuildCategory) catByName.set(from.name, to.id);
     }
 
-    let chansMade = 0, chansUpdated = 0, owDropped = 0;
+    let chansMade = 0, chansUpdated = 0, owDropped = 0, owUnsafe = 0;
     const overwritesFor = (ch) => {
       const { kept, dropped } = serverBackup.remapOverwrites(ch.overwrites, idMap, memberHere);
       owDropped += dropped.length;
-      return kept.map(o => ({ id: o.id, allow: BigInt(o.allow) & botPerms, deny: BigInt(o.deny) & botPerms }));
+      const out = [];
+      for (const o of kept) {
+        // A rule the bot cannot write in full is skipped, not trimmed. Trimming
+        // an ALLOW closes a channel further; trimming a DENY OPENS one, and the
+        // result reads as a rule that was applied.
+        const m = serverBackup.maskOverwrite(o, botPerms);
+        if (m.unsafe) { owUnsafe++; continue; }
+        out.push({ id: m.id, allow: m.allow, deny: m.deny });
+      }
+      return out;
     };
 
     // Which of the two channel kinds the operator asked for. A category is a
@@ -2223,6 +2266,10 @@ async function runRestore(interaction, snapId, allowOther, parts) {
     if (owDropped) {
       out.addFields({ name: 'Permission rules dropped', value:
         `${owDropped} rule(s) pointed at a role or member that does not exist here. Applying them to whatever those ids mean in this server is how a restore locks people out, so they were skipped.` });
+    }
+    if (owUnsafe) {
+      out.addFields({ name: 'Permission rules the bot could not write in full', value:
+        `${owUnsafe} rule(s) DENY something this bot cannot deny itself. Writing the rest of the rule would have left the channel more open than the snapshot, so they were skipped whole. Give the bot those permissions and run it again.` });
     }
     if (problems.length) {
       out.addFields({ name: `Skipped (${problems.length})`, value: problems.slice(0, 8).join('\n').slice(0, 1024) });

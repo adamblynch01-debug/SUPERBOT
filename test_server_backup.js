@@ -172,6 +172,75 @@ check('masking is exact at bit widths a Number cannot hold', () => {
   assert.strictEqual(BigInt(missing), 8n);
 });
 
+// The three checks below are the live incident of 2026-08-06 written down. A
+// restore run with Roles ticked stripped five roles on the main server back to
+// zero permissions, and the mask was the whole reason: an Administrator bot's
+// bitfield is bit 3 and NOTHING ELSE, so `wanted & botPerms` was 0 for every
+// role that was not itself an administrator, and the update WROTE that 0.
+check('an Administrator bot masks nothing — its bitfield does not list what it can do', () => {
+  const wanted = (1n << 40n) | 0b1010n;
+  const { granted, missing } = B.maskPermissions(wanted, B.ADMINISTRATOR);
+  assert.strictEqual(BigInt(granted), wanted, 'an admin bot can grant anything; the mask must not think otherwise');
+  assert.strictEqual(BigInt(missing), 0n);
+});
+
+check('updating a role never clears a bit the bot could not have granted', () => {
+  // `wanted & bot` is not "grant what I can" — on an UPDATE it is "grant what I
+  // can and REVOKE everything else", because the write replaces the field. The
+  // bits outside the bot's reach have to be carried over from what is live.
+  const wanted = 0b0011n;   // the snapshot
+  const botHas = 0b0001n;   // one bit of reach
+  const live   = 0b1110n;   // what the role has right now
+  const { granted } = B.maskPermissions(wanted, botHas, live);
+  assert.strictEqual(BigInt(granted) & 0b1110n, 0b1110n,
+    'a bit the bot cannot touch was cleared — this is exactly what wiped five roles in production');
+  assert.strictEqual(BigInt(granted) & botHas, 0b0001n, 'the bit the bot CAN reach still follows the snapshot');
+});
+
+check('a create has no live permissions to preserve, so it masks plainly', () => {
+  const { granted } = B.maskPermissions(0b1111n, 0b0101n);
+  assert.strictEqual(BigInt(granted), 0b0101n, 'there is nothing to carry over on a role that does not exist yet');
+});
+
+check('a role about to lose permissions is named before anything is written', () => {
+  const rolePlan = { update: [
+    { from: { permissions: '1' }, to: { name: 'Member', permissions: { bitfield: 0b1101n } } },
+    { from: { permissions: '5' }, to: { name: 'Fine',   permissions: { bitfield: 0b0101n } } },
+  ] };
+  const losses = B.permissionLosses(rolePlan, 0b1111n);
+  assert.strictEqual(losses.length, 1, 'only the role that actually loses something should be reported');
+  assert.strictEqual(losses[0].name, 'Member');
+  assert.strictEqual(BigInt(losses[0].lost), 0b1100n);
+});
+
+check('an admin bot still reports losses — being able to write it is not the same as it being wanted', () => {
+  const rolePlan = { update: [{ from: { permissions: '1' }, to: { name: 'Member', permissions: { bitfield: 0b1111n } } }] };
+  assert.strictEqual(B.permissionLosses(rolePlan, B.ADMINISTRATOR).length, 1);
+});
+
+// ─── Overwrites the bot cannot write in full ─────────────────────────────────
+check('an overwrite whose DENY cannot be written in full is skipped whole', () => {
+  // Trimming an ALLOW closes a channel; trimming a DENY OPENS one. A half
+  // written overwrite reads like a rule that was applied, which is worse than
+  // no rule at all, so the unwritable ones are refused rather than trimmed.
+  const m = B.maskOverwrite({ id: '1', allow: '0', deny: 0b1010n }, 0b0001n);
+  assert.strictEqual(m.unsafe, true, 'a deny the bot cannot deny would have left the channel more open than the snapshot');
+});
+
+check('an overwrite the bot can fully deny is written, trimming only the allow', () => {
+  const m = B.maskOverwrite({ id: '1', allow: 0b1100n, deny: 0b0001n }, 0b0101n);
+  assert.strictEqual(m.unsafe, false);
+  assert.strictEqual(m.allow, 0b0100n, 'the allow is trimmed to the bot\'s reach — that only ever closes things');
+  assert.strictEqual(m.deny, 0b0001n, 'the deny is written in full or not at all');
+});
+
+check('an admin bot writes every overwrite untouched', () => {
+  const m = B.maskOverwrite({ id: '1', allow: (1n << 50n), deny: 0b1010n }, B.ADMINISTRATOR);
+  assert.strictEqual(m.unsafe, false);
+  assert.strictEqual(m.allow, 1n << 50n);
+  assert.strictEqual(m.deny, 0b1010n);
+});
+
 check('the dropped permissions can be named, not just counted', () => {
   const flags = { Administrator: 8n, ManageGuild: 32n, BanMembers: 4n };
   assert.deepStrictEqual(B.namePermissions(40n, flags), ['Administrator', 'ManageGuild']);
@@ -433,6 +502,27 @@ check('unticking permission rules must skip the call, never send an empty list',
   assert.ok(/on\('permissions'\)/.test(body.slice(at - 120, at)),
     'the overwrite write is not behind the permissions tick');
   assert.ok(!/permissionOverwrites\.set\(\s*\[\s*\]/.test(body), 'an empty overwrite list is being sent');
+});
+
+check('the role update tells the mask what the role already has', () => {
+  // maskPermissions with two arguments is the production bug: without the live
+  // bitfield it cannot tell "cannot grant this" from "must revoke this".
+  const src = require('fs').readFileSync('index.js', 'utf8');
+  const body = src.slice(src.indexOf('async function runRestore'), src.indexOf('function hasAccess'))
+    .replace(/^\s*\/\/.*$/gm, '');
+  const m = body.match(/maskPermissions\(([^)]*)\)/);
+  assert.ok(m, 'the role update no longer masks at all — re-point this check');
+  assert.strictEqual(m[1].split(',').length, 3,
+    'maskPermissions is being called without the live permissions, which makes an update a wipe');
+});
+
+check('the confirmation warns about permissions a restore takes away', () => {
+  const src = require('fs').readFileSync('index.js', 'utf8');
+  const body = src.slice(src.indexOf('async function buildRestoreConfirm'), src.indexOf('async function runRestore'))
+    .replace(/^\s*\/\/.*$/gm, '');
+  assert.ok(/permissionLosses\(/.test(body), 'nothing computes what the restore would revoke');
+  assert.ok(/LOSE/.test(body), 'the losses are computed but never shown to whoever clicks the button');
+  assert.ok(/row\.guild_id\s*[!=]==\s*guild\.id/.test(body), 'a snapshot from another server is not called out');
 });
 
 check('the restore honours every part it offers', () => {

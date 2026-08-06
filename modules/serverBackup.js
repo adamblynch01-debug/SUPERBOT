@@ -286,20 +286,80 @@ function remapOverwrites(overwrites, idMap, memberExists) {
   return { kept, dropped };
 }
 
+// Administrator, 1 << 3. It is not a permission like the others: it IS all of
+// them, and Discord's bitfield does not say so.
+const ADMINISTRATOR = 8n;
+
 /**
  * Discord refuses to grant a permission the actor does not hold itself, and
  * refuses the whole request when it does — so one permission the bot lacks
  * fails the entire role, not just that bit.
  *
- * Masking here turns "restore failed" into "restore succeeded, minus two
+ * Masking turns "restore failed" into "restore succeeded, minus two
  * permissions we told you about", which is the outcome someone rebuilding a
  * dead server actually wants. The caller reports what was dropped.
+ *
+ * The two rules that are not obvious, and cost a live server between them:
+ *
+ *   1. A bot with ADMINISTRATOR holds every permission and its bitfield has
+ *      exactly ONE bit set. `wanted & botPermissions` therefore comes out ZERO
+ *      for every role that is not itself an administrator — so a restore run
+ *      by the most privileged bot possible wiped the permissions off every
+ *      role it touched, and reported it as "permissions the bot could not
+ *      grant". Administrator has to be read as "no mask at all".
+ *
+ *   2. `current` is what the role has RIGHT NOW, and it is the difference
+ *      between masking and deleting. Without it, a permission the bot cannot
+ *      write is not merely left unset, it is CLEARED — a bot with half the
+ *      permissions strips the other half off every role in the server. A
+ *      restore may only fail to add; it must never silently remove.
  */
-function maskPermissions(wanted, botPermissions) {
+function maskPermissions(wanted, botPermissions, current) {
   const w = BigInt(wanted || 0);
   const b = BigInt(botPermissions || 0);
-  const granted = w & b;
-  return { granted: granted.toString(), missing: (w & ~b).toString() };
+  if (b & ADMINISTRATOR) return { granted: w.toString(), missing: '0' };
+  // Bits outside the bot's reach keep whatever they are. On a create there is
+  // no `current`, so they are simply not set.
+  const keep = current == null ? 0n : (BigInt(current) & ~b);
+  const granted = (w & b) | keep;
+  return { granted: granted.toString(), missing: (w & ~b & ~keep).toString() };
+}
+
+/**
+ * The same problem one level down, where getting it wrong is worse.
+ *
+ * An ALLOW the bot cannot write is safe to drop — the channel ends up more
+ * closed than the snapshot, which is the harmless direction. A DENY it cannot
+ * write is NOT: dropping it turns a closed channel into an open one, and a
+ * half-applied rule looks exactly like a rule that was applied. So an overwrite
+ * whose deny cannot be written in full is skipped whole and counted, the same
+ * as one naming a role that is not in this server.
+ */
+function maskOverwrite(ow, botPermissions) {
+  const b = BigInt(botPermissions || 0);
+  const allow = BigInt(ow.allow || 0);
+  const deny = BigInt(ow.deny || 0);
+  if (b & ADMINISTRATOR) return { id: ow.id, allow, deny, unsafe: false };
+  if (deny & ~b) return { id: ow.id, allow: allow & b, deny: deny & b, unsafe: true };
+  return { id: ow.id, allow: allow & b, deny, unsafe: false };
+}
+
+/**
+ * Which roles a restore would take permissions AWAY from. Removing a
+ * permission is the half of a restore nobody pictures when they read "nothing
+ * is ever deleted" — that promise is about channels and roles existing, not
+ * about what they can do — so it is counted and named before the button.
+ */
+function permissionLosses(rolePlan, botPermissions) {
+  const out = [];
+  for (const { from, to } of rolePlan.update || []) {
+    const live = BigInt((to.permissions && to.permissions.bitfield != null)
+      ? to.permissions.bitfield : (to.permissions || 0));
+    const { granted } = maskPermissions(from.permissions, botPermissions, live);
+    const lost = live & ~BigInt(granted);
+    if (lost) out.push({ name: to.name || from.name, lost: lost.toString() });
+  }
+  return out;
 }
 
 /** Names the bits in a bitfield, for telling someone what was dropped. */
@@ -482,7 +542,7 @@ module.exports = {
   snapshotGuild, snapshotGuildMeta, snapshotRole, snapshotChannel, snapshotOverwrite, snapshotCounts,
   isEveryone, isRestorableRole,
   planRoles, planChannels, orderChannelsForCreation,
-  remapOverwrites, maskPermissions, namePermissions,
+  remapOverwrites, maskPermissions, maskOverwrite, permissionLosses, namePermissions, ADMINISTRATOR,
   channelCreatePayload, describePlan,
   PART, PART_KEYS, ALL_PARTS, encodeParts, decodeParts, normalizeParts, hasPart, partWarnings,
 };
