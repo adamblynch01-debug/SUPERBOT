@@ -191,4 +191,45 @@ function buildDeliveryEmbed({ items = [], invoiceNo = null, orderId = null, emai
   };
 }
 
-module.exports = { buildDeliveryEmbed, LIMIT, clip, clipKeys, omittedNote, gameWorthShowing, contextLine };
+// ─── recovering the protect list from a message already sent ─────────────────
+// The DM goes out in English now, so the translation happens later, when the
+// buyer picks a language from the dropdown under it — by which time the caller
+// that held `product`, `game` and `tier` as separate values is long gone and
+// all that survives is the rendered embed.
+//
+// That still has the catalogue strings in it, in fields this module wrote and
+// therefore knows the shape of. Reading them back is what keeps the guarantee
+// buildDeliveryEmbed's `protect` gives on the way out: a Spanish buyer is never
+// offered "H8ED Privado Externo", a product this shop does not sell and cannot
+// look up. The keys and the invoice need no help — they are already inside code
+// fences and backticks, which translate.js protects on its own.
+//
+// Anything it does not recognise it leaves alone: this is additive protection,
+// never a filter.
+const NAMED_FACT = new Set(['🎮 Game', '📦 Product', '⏳ Duration']);
+
+function protectFromEmbed(embedJson) {
+  const d = (embedJson && embedJson.toJSON) ? embedJson.toJSON() : (embedJson || {});
+  const out = [];
+  // "Month • ×3" and "**Rust** • Week • ×2" are several facts on one line; the
+  // quantity is arithmetic, not a name, and masking it would be noise.
+  const facts = (s) => String(s || '').split('•').map(x => x.replace(/\*\*/g, '').trim())
+    .filter(x => x && !/^×\s*\d+$/.test(x));
+  for (const f of d.fields || []) {
+    const name = String(f.name || '');
+    if (NAMED_FACT.has(name)) { out.push(...facts(f.value)); continue; }
+    // The multi-product layout: the product is the field NAME, and the line
+    // above the fence carries the game and the term.
+    if (name.startsWith('📦 ')) {
+      out.push(name.slice(2).trim());
+      const first = String(f.value || '').split('\n')[0];
+      if (first && !first.startsWith('```')) out.push(...facts(first));
+    }
+  }
+  return [...new Set(out)];
+}
+
+module.exports = {
+  buildDeliveryEmbed, protectFromEmbed,
+  LIMIT, clip, clipKeys, omittedNote, gameWorthShowing, contextLine,
+};

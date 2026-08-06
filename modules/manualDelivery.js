@@ -34,7 +34,7 @@ const {
 } = require('discord.js');
 const axios = require('axios');
 const { query } = require('../db');
-const { getUserLang, translateEmbeds, languageRow, DEFAULT_LANG } = require('./translate');
+const { languageRow } = require('./translate');
 // One renderer for the buyer's DM, shared with the website delivery path.
 const { buildDeliveryEmbed } = require('./deliveryEmbed');
 
@@ -307,7 +307,7 @@ async function submitKeys(interaction, client) {
   // The buyer's DM is the one a website order produces — not by both files
   // agreeing to build the same thing, which is how the two drifted, but because
   // deliveryEmbed.js builds it and internalEvents.js calls the same function.
-  const { embed: dm, protect, lines: summaryLines, delivered } = buildDeliveryEmbed({
+  const { embed: dm, lines: summaryLines, delivered } = buildDeliveryEmbed({
     items: [{ game: data.game_name, product: data.product_name, tier: data.tier_label, qty, values }],
     invoiceNo: data.invoice_no,
     orderId: data.order_id,
@@ -324,26 +324,19 @@ async function submitKeys(interaction, client) {
   if (!delivered) dmErr = 'the backend returned no values to deliver';
   else try {
     const buyer = await client.users.fetch(String(buyerId));
-    let out = [dm];
-    // Declared outside the try so the dropdown still ships when the lookup
-    // throws — an untranslated DM the buyer can retranslate beats a correct
-    // one they are stuck with.
-    let lang = null;
-    // A hand-delivered order is scoped to the guild the command ran in, not
-    // to the module-level GUILD_ID, which is the store server and is simply
-    // the wrong key on the second server.
+    // English, always — the same rule as the website delivery, for the same
+    // reasons, written out in full at the top of modules/internalEvents.js.
+    // Short version: a stored preference from another server was arriving on
+    // receipts nobody had asked to have translated, and pre-translating made
+    // the dropdown's own "English" option a no-op, because translate.js takes
+    // its source to be English and returns it unchanged when English is asked
+    // for. The dropdown below is how the buyer reads it in their language.
+    //
+    // A hand-delivered order is scoped to the guild the command ran in, not to
+    // the module-level GUILD_ID, which is the store server and is simply the
+    // wrong key on the second server.
     const langScope = (interaction && interaction.guildId) || GUILD_ID || 'dm';
-    try {
-      lang = await getUserLang(langScope, String(buyerId));
-      // What the buyer bought is not a sentence. The prose around it is theirs
-      // to read in their own language; the product, the tier and the invoice
-      // are what they quote back to staff and what /claim-customer looks up, so
-      // they leave in the name this shop sells them under. The renderer hands
-      // back exactly the strings it wrote, so the mask cannot fall out of step
-      // with the embed.
-      if (lang && lang !== DEFAULT_LANG) out = await translateEmbeds(out, lang, protect);
-    } catch (e) { console.warn('[ManualDelivery] DM translation skipped:', e.message); }
-    await buyer.send({ embeds: out, components: [languageRow(lang, langScope)] });
+    await buyer.send({ embeds: [dm], components: [languageRow(null, langScope)] });
     dmOk = true;
   } catch (err) {
     dmErr = err.code === 50007 ? 'their DMs are closed' : err.message;

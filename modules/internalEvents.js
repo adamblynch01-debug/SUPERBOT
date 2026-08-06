@@ -22,49 +22,40 @@ const crypto = require('crypto');
 const { EmbedBuilder } = require('discord.js');
 const { query } = require('../db');
 const { registerWebTicketRoutes } = require('./webTickets');
-const { getUserLang, translateEmbeds, languageRow, DEFAULT_LANG } = require('./translate');
+const { languageRow } = require('./translate');
 // The buyer's DM is rendered here and nowhere else — /manual-order-delivery
 // calls the same function, which is what keeps the two deliveries identical.
 const { buildDeliveryEmbed, gameWorthShowing } = require('./deliveryEmbed');
 
-// A delivery DM in the buyer's own language, but ONLY if they have chosen one
-// with /language. No choice means no lookup hit, no network call and byte-for-
-// byte the message this has always sent — which is the right default for the
-// one path in this system that must never get slower or more fragile. The
-// license keys travel inside ``` fences, which modules/translate.js masks.
+// THE DELIVERY DM IS SENT IN ENGLISH. ALWAYS. The dropdown under it is how a
+// buyer reads it in anything else.
 //
-// `protect` carries the catalogue values themselves — product, game, tier,
-// invoice. Nothing in translate.js can recognise those as names rather than
-// words, so a buyer with Spanish set was told their order of "H8ED Privado
-// Externo — Día" was ready, naming a product that does not exist.
-async function localizeForBuyer(discordId, guildId, embeds, protect) {
-  try {
-    const lang = await getUserLang(guildId || process.env.GUILD_ID || 'dm', String(discordId));
-    if (!lang || lang === DEFAULT_LANG) return embeds;
-    return await translateEmbeds(embeds, lang, protect);
-  } catch (err) {
-    console.warn('[Internal] delivery DM translation skipped:', err.message);
-    return embeds;
-  }
-}
-
-// The whole DM: the embeds in the buyer's language, plus the dropdown to
-// CHANGE that language.
+// It used to be pre-translated into whatever language the buyer had once
+// picked, and that was wrong twice over:
 //
-// Until now the dropdown only ever went on server posts, so the language a
-// buyer picked once under some announcement followed them into every order DM
-// afterwards with no control anywhere to undo it. "Users still receive their
-// order in Spanish" was not a translation bug — it was a preference nobody
-// could reach. Scoped to this guild so a choice made in the DM is remembered
-// where the lookup above will find it.
-async function buyerDmPayload(discordId, guildId, embeds, protect) {
+//   1. It reached for a preference from somewhere else. A choice made under a
+//      post in the second server arrived, through the global fallback added
+//      last round, on an order DM from the store server — a buyer who had
+//      never asked this shop for Spanish got a Spanish receipt.
+//   2. It broke the one assumption everything downstream is built on: that a
+//      message this bot sends is English. translate.js takes the source as
+//      English (`sl=en`) and short-circuits when the target IS English, so on
+//      a pre-translated DM the "English" option handed the Spanish straight
+//      back — exactly what was reported: "if i translate to english it
+//      translates to spanish".
+//
+// Sending English fixes both at the root and costs the delivery path its last
+// network call before the buyer sees their keys.
+//
+// `scope` is the guild the order came from, carried in the dropdown's customId
+// so a choice made in a DM — which has no guildId — is saved where the rest of
+// the bot will find it. See languageRow() in translate.js.
+function buyerDmPayload(discordId, guildId, embeds) {
   const scope = guildId || process.env.GUILD_ID || 'dm';
-  let lang = null;
-  try { lang = await getUserLang(scope, String(discordId)); } catch (_) { /* dropdown still ships */ }
-  return {
-    embeds: await localizeForBuyer(discordId, guildId, embeds, protect),
-    components: [languageRow(lang, scope)],
-  };
+  // No `current` argument: the message really is English, and a placeholder
+  // reading "Español" over English text is a lie about what the reader is
+  // looking at.
+  return { embeds, components: [languageRow(null, scope)] };
 }
 
 // Discord's hard caps. Exceeding any one rejects the WHOLE message, so
@@ -468,10 +459,11 @@ function registerInternalRoutes(app, client) {
         // Built by deliveryEmbed.js, the same function /manual-order-delivery
         // calls — so a hand-delivered order and a website one are the same
         // message because they are the same code, not because two files were
-        // kept in agreement by hand. `protect` comes back holding exactly the
-        // catalogue strings that were written into the embed, so the translator
-        // mask cannot fall out of step with what the buyer sees.
-        const { embed, protect, delivered } = buildDeliveryEmbed({
+        // kept in agreement by hand. The `protect` list it also returns is not
+        // needed here any more: nothing on this path translates. It matters
+        // again the moment the buyer picks a language, and that call reads the
+        // message back off the interaction.
+        const { embed, delivered } = buildDeliveryEmbed({
           items: goods.map(g => ({
             game: g.game,
             product: g.product,
@@ -490,7 +482,7 @@ function registerInternalRoutes(app, client) {
         if (delivered > 0) {
           try {
             const user = await client.users.fetch(String(discord_id));
-            await user.send(await buyerDmPayload(discord_id, guild_id, [embed], protect));
+            await user.send(buyerDmPayload(discord_id, guild_id, [embed]));
             out.dm = true;
             console.log(`[Internal] Delivered goods to Discord user ${discord_id}`);
           } catch (err) {

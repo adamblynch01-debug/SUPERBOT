@@ -259,5 +259,64 @@ check('malformed input is null, never a throw', () => {
   }
 });
 
+// --- Where the count is kept ------------------------------------------------
+// Reported twice as "another reset for a CORRECT answer", and neither time was
+// the evaluator wrong. The count was stored in counting.json under DATA_DIR,
+// which defaults to the directory the bot runs from - INSIDE THE CONTAINER. A
+// deploy built a new one without the file in it, the count silently became 0,
+// and the next correct number was announced as a miscount that reset a streak
+// nobody had broken. The high score went with it, so there was not even a
+// record of what had been lost.
+//
+// These read the wiring out of index.js, because handleCountingMessage is not
+// exported. They pin the RULE and not the wording: the count is written to and
+// read back from Postgres, and the game refuses to judge before it knows.
+const fs = require('fs');
+const src = fs.readFileSync(require('path').join(__dirname, 'index.js'), 'utf8');
+
+check('the count is written to Postgres, not only to a file in the container', () => {
+  assert.ok(/COUNTING_STATE/.test(src), 'nothing persists the count outside the container');
+  const fn = src.slice(src.indexOf('function persistCounting'), src.indexOf('async function loadCountingFromDb'));
+  assert.ok(/INSERT INTO config/.test(fn), 'the count is not written to the config table');
+  assert.ok(/ON CONFLICT [(]guild_id, key[)] DO UPDATE/.test(fn),
+    'the second save of a guild would collide instead of updating');
+});
+
+check('every save names the guild it is saving', () => {
+  // saveCounting() with no argument writes the container-local file and nothing
+  // else - which is the original bug, still there, just quieter.
+  const sites = (src.match(/saveCounting[(][^)]*[)]/g) || []).filter(c => !/function/.test(c));
+  assert.ok(sites.length >= 2, `only ${sites.length} save sites found`);
+  for (const c of sites) assert.ok(/saveCounting[(]gid[)]/.test(c), `${c} does not persist`);
+});
+
+check('the saved count is read back before the bot can judge anyone', () => {
+  const ready = src.slice(src.indexOf("client.once('ready'"));
+  assert.ok(/await loadCountingFromDb[(][)]/.test(ready.slice(0, 2000)),
+    'the count is never loaded from Postgres on boot');
+  const load = src.slice(src.indexOf('async function loadCountingFromDb'));
+  assert.ok(/FROM config/.test(load.slice(0, 600)), 'it does not read the table it writes');
+});
+
+const countingHandler = () => {
+  const fn = src.slice(src.indexOf('async function handleCountingMessage'));
+  return fn.slice(0, fn.indexOf('function getGuildData'));
+};
+
+check('a count that arrives before the state is known is not punished', () => {
+  const body = countingHandler();
+  assert.ok(/countingTruthKnown/.test(body), 'the handler judges against a state it may not have');
+  assert.ok(body.indexOf('countingTruthKnown') < body.indexOf('state.count = 0'),
+    'the streak is reset before the check that the state was ever loaded');
+});
+
+check('a channel mid-game with nothing saved is adopted, not reset', () => {
+  const body = countingHandler();
+  assert.ok(/countingData.has[(]gid[)]/.test(body),
+    'the first count after a deploy is judged against 0 and announced as a miscount');
+  assert.ok(body.indexOf('countingData.has(gid)') < body.indexOf('state.count = 0'),
+    'the adoption is written after the reset, so it never runs');
+});
+
 console.log(`\n${passed} checks passed${failed ? `, ${failed} FAILED` : ''}`);
 process.exit(failed ? 1 : 0);

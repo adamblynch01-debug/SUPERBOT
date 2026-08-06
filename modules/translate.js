@@ -412,7 +412,12 @@ async function preferredLang(interaction) {
 // Ephemeral, always. The dropdown sits on a message hundreds of people can see;
 // editing it in place would rewrite the post in one reader's language for
 // everybody, and two readers picking at once would fight over it.
-async function handleLanguageSelect(interaction, { chunkEmbedsIntoMessages }) {
+//
+// `protectFor` is optional and is how a message declares which of its own words
+// are catalogue keys rather than prose. This module cannot tell "H8ED Private
+// External" from a sentence and never will — see literalRules() — so whoever
+// knows the format of the message says so. Only the delivery DM uses it today.
+async function handleLanguageSelect(interaction, { chunkEmbedsIntoMessages, protectFor }) {
   const lang = normalizeLang(interaction.values && interaction.values[0]) || DEFAULT_LANG;
   const meta = LANG_BY_CODE.get(lang);
   await interaction.deferReply({ flags: 64 });
@@ -434,10 +439,24 @@ async function handleLanguageSelect(interaction, { chunkEmbedsIntoMessages }) {
     return interaction.editReply({ content: `${meta.flag} ${t}`.slice(0, 2000) });
   }
 
-  const translated = await translateEmbeds(source, lang);
+  let protect;
+  if (typeof protectFor === 'function') {
+    try { protect = protectFor(interaction.message); }
+    catch (e) { console.warn('[translate] protect list unavailable:', e.message); }
+  }
+
+  const translated = await translateEmbeds(source, lang, protect);
   const messages = chunkEmbedsIntoMessages(translated);
 
-  await interaction.editReply({ embeds: messages[0] });
+  // English IS the original — every message this bot sends is written in it, so
+  // there is nothing to call out to a provider for. Saying so is what separates
+  // this from a dropdown that appears to do nothing, which is how it read when
+  // the delivery DM was going out pre-translated: picking English handed the
+  // Spanish back, because translate.js takes its source to be English.
+  await interaction.editReply({
+    content: lang === DEFAULT_LANG ? '🇬🇧 English — the original.' : null,
+    embeds: messages[0],
+  });
   for (const m of messages.slice(1)) await interaction.followUp({ embeds: m, flags: 64 });
 
   if (lang !== DEFAULT_LANG) {

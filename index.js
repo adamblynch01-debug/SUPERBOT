@@ -59,6 +59,10 @@ const {
   setProductInfoGate,
 } = require('./modules/productInfo');
 const translate = require('./modules/translate');
+// Only for the language dropdown: it reads a delivery DM back off the
+// interaction and names the catalogue strings in it, which the translator must
+// not touch. See the dispatch site.
+const { protectFromEmbed } = require('./modules/deliveryEmbed');
 const { offerImageUpload } = require('./modules/imageAttach');
 const { makeStaffRoleResolver } = require('./modules/staffRoles');
 const serverBackup = require('./modules/serverBackup');
@@ -558,15 +562,63 @@ const vouchDataRaw = loadJSON(VOUCHES_FILE, {});
 const vouchData    = new Map(Object.entries(vouchDataRaw).map(([gid, v]) => [gid, { count: v.count || 0, channelId: v.channelId || null, entries: v.entries || [] }]));
 
 // ─── Counting game ──────────────────────────────────────────────────────────
+// "ANOTHER RESET FOR A CORRECT ANSWER" — twice now, and not once because of the
+// evaluator. The count lived in counting.json under DATA_DIR, which defaults to
+// the directory the bot runs from: INSIDE THE CONTAINER. Every deploy built a
+// fresh one, the file was not in it, the count silently went back to 0 — and
+// the next person to type the right number was told they had "posted 419
+// instead of 1" and lost a streak nobody had broken. The high score went with
+// it, so there was not even a record of what had been lost.
+//
+// So Postgres is the truth and the file is a local cache of it. `config` is the
+// guild-scoped key/value table that already exists, which is why this needs no
+// migration; a guild with no row there is simply a channel that has not counted
+// yet.
 const COUNTING_FILE = path.join(DATA_DIR, 'counting.json');
-function saveCounting() {
-  const obj = {};
-  for (const [gid, c] of countingData) obj[gid] = c;
-  saveJSON(COUNTING_FILE, obj);
-}
 // counting: { [guildId]: { count, lastUserId, highScore } }
 const countingDataRaw = loadJSON(COUNTING_FILE, {});
 const countingData    = new Map(Object.entries(countingDataRaw));
+// False until Postgres has answered. While it is false the game does not
+// PUNISH anyone: a reset decided against a count we could not read is exactly
+// the bug above, and refusing to judge is the harmless half of being wrong.
+let countingTruthKnown = false;
+
+function saveCounting(gid) {
+  const obj = {};
+  for (const [gid_, c] of countingData) obj[gid_] = c;
+  saveJSON(COUNTING_FILE, obj);
+  if (gid) persistCounting(gid);
+}
+
+// Write-through, not awaited: the ✅ on the message must not wait for a round
+// trip, and a failed write is recoverable — the next correct count rewrites it.
+function persistCounting(gid) {
+  const c = countingData.get(String(gid));
+  if (!c) return;
+  db.query(
+    `INSERT INTO config (guild_id, key, value, updated_at) VALUES ($1, 'COUNTING_STATE', $2, now())
+     ON CONFLICT (guild_id, key) DO UPDATE SET value = $2, updated_at = now()`,
+    [String(gid), JSON.stringify(c)]
+  ).catch(e => console.warn(`[Counting] could not save the count for ${gid}:`, e.message));
+}
+
+async function loadCountingFromDb() {
+  try {
+    const { rows } = await db.query(`SELECT guild_id, value FROM config WHERE key = 'COUNTING_STATE'`);
+    for (const r of rows) {
+      try {
+        const c = JSON.parse(r.value);
+        // Postgres wins over the file. The file is whatever this container was
+        // built with, which is nothing at all after a deploy.
+        if (c && Number.isFinite(Number(c.count))) countingData.set(String(r.guild_id), c);
+      } catch (_) { /* a corrupt row is not worth taking the boot down for */ }
+    }
+    countingTruthKnown = true;
+    console.log(`[Counting] loaded ${rows.length} guild(s) from Postgres`);
+  } catch (e) {
+    console.error('[Counting] could not read the saved count — the game will not reset anyone until it can:', e.message);
+  }
+}
 
 // ─── Steam account stock — migrated to Postgres, guild-scoped ─────────────
 const STOCK_COOLDOWN_HOURS = parseInt(process.env.STOCK_COOLDOWN_HOURS || '24');
@@ -1621,7 +1673,35 @@ async function handleCountingMessage(message) {
     state.lastAt = Date.now();
     if (state.count > (state.highScore || 0)) state.highScore = state.count;
     countingData.set(gid, state);
-    saveCounting();
+    saveCounting(gid);
+    try { await message.react('✅'); } catch (_) {}
+    return;
+  }
+
+  // ── the two cases where this must not judge ────────────────────────────────
+
+  // Postgres has not answered yet, or could not be reached. The count in memory
+  // is then a guess, and a reset decided on a guess is the complaint that got
+  // this rewritten. Do nothing: the channel keeps counting, nobody is blamed,
+  // and the state comes back when the read succeeds.
+  if (!countingTruthKnown) {
+    console.warn('[Counting] a count arrived before the saved state was readable — not judging it');
+    return;
+  }
+
+  // Nothing has ever been saved for this guild and the channel is plainly
+  // mid-game: adopt the number rather than announcing that a streak somebody
+  // has been building for a week is a mistake. This can happen exactly once per
+  // guild — after it, there is a row.
+  if (!countingData.has(gid) && read.verdict === 'wrong'
+      && Number.isInteger(read.value) && read.value > 1 && read.value <= 1e6) {
+    state.count = read.value;
+    state.lastUserId = message.author.id;
+    state.lastAt = Date.now();
+    state.highScore = Math.max(state.highScore || 0, read.value);
+    countingData.set(gid, state);
+    saveCounting(gid);
+    console.log(`[Counting] adopted ${read.value} as the count in ${gid} — nothing was saved for it before`);
     try { await message.react('✅'); } catch (_) {}
     return;
   }
@@ -1645,7 +1725,7 @@ async function handleCountingMessage(message) {
   state.lastUserId = null;
   state.lastAt = 0;
   countingData.set(gid, state);
-  saveCounting();
+  saveCounting(gid);
 
   try { if (message.deletable) await message.delete(); } catch (_) {}
   try {
@@ -2987,6 +3067,11 @@ client.once('ready', async () => {
   console.log(`║  Logged in as: ${client.user.tag.padEnd(19)}║`);
   console.log(`╚════════════════════════════════════╝\n`);
 
+  // Before anything can be counted. A message arriving in the first seconds of
+  // boot is judged against whatever is in memory, and until this returns that
+  // is a container-local file — which after a deploy is empty.
+  await loadCountingFromDb();
+
   // Cache guild invites
   for (const [, guild] of client.guilds.cache) {
     try {
@@ -3831,12 +3916,12 @@ client.on('interactionCreate', async interaction => {
         // This was three hardcoded rows labelled "Page n of 3", so a fourth
         // page of products was dropped without a word and the labels lied as
         // soon as the catalog stopped being 62 items.
-        await dlCh.send({
+        await dlCh.send(withLanguageRow({
           embeds: [embed],
           components: chunks.map((chunk, i) => new ActionRowBuilder().addComponents(
             makeMenu(`dl_page_${i + 1}`, `${(chunk[0].label || chunk[0].name).charAt(0)}–${(chunk[chunk.length - 1].label || chunk[chunk.length - 1].name).charAt(0)}  (Page ${i + 1} of ${chunks.length})`, chunk)
           )),
-        });
+        }));
         await interaction.editReply({ content: `✅ Download panel posted in <#${dlCh.id}> — ${chunks.reduce((n, c) => n + c.length, 0)} products across ${chunks.length} page(s).` });
         return;
       }
@@ -4336,7 +4421,13 @@ client.on('interactionCreate', async interaction => {
           new ButtonBuilder().setCustomId('gensteam_check_stock').setLabel('Check Stock').setEmoji('📦').setStyle(ButtonStyle.Secondary)
         );
 
-        await channel.send({ embeds: [embed], components: [...genRows, utilRow] });
+        // The generator panel is a post customers READ before they press
+        // anything — the role they need and the cooldown they get are both in
+        // it — so it carries the language dropdown like every other public
+        // post. It was the one that got missed. withLanguageRow drops the row
+        // rather than the panel if the account types ever grow past four rows
+        // of buttons.
+        await channel.send(withLanguageRow({ embeds: [embed], components: [...genRows, utilRow] }));
         await interaction.reply({ content: `✅ Posted the generator panel in <#${channel.id}>.`, flags: 64 });
         return;
       }
@@ -4371,7 +4462,7 @@ client.on('interactionCreate', async interaction => {
         const embed = await buildUsefulLinksEmbed(interaction.guild.id);
         const links = await getUsefulLinks(interaction.guild.id);
 
-        await channel.send({ embeds: [embed] });
+        await channel.send(withLanguageRow({ embeds: [embed] }));
         await interaction.reply({ content: `✅ Posted **${links.length}** links in <#${channel.id}>.`, flags: 64 });
         return;
       }
@@ -6028,7 +6119,15 @@ client.on('interactionCreate', async interaction => {
       // came from (`xlate_lang::<guildId>`) so the choice is remembered where
       // the order-delivery path will look for it.
       if (interaction.customId === 'xlate_lang' || interaction.customId.startsWith('xlate_lang::')) {
-        return translate.handleLanguageSelect(interaction, { chunkEmbedsIntoMessages });
+        // The one thing it is told about the message: which of the words in it
+        // are catalogue keys. deliveryEmbed recognises its own delivery DM and
+        // hands back the product, game and term it wrote; every other post
+        // gets an empty list and translates exactly as before.
+        return translate.handleLanguageSelect(interaction, {
+          chunkEmbedsIntoMessages,
+          protectFor: (message) => (message && message.embeds || [])
+            .flatMap(e => protectFromEmbed(e.toJSON ? e.toJSON() : (e.data || e))),
+        });
       }
 
       // /product-info's category → product pair. Both live in the module so the

@@ -481,19 +481,54 @@ async function check(name, fn) {
     assert.ok(wired >= 5, `only ${wired} post sites carry the dropdown`);
   });
 
+  await check('the panels a customer reads before pressing anything carry it too', async () => {
+    // "THEY WORKING BUT YOU FORGOT /POSTGENSTEAM." The generator panel states
+    // the role you need and the cooldown you get and is read by every member of
+    // the server — the same audience as the documents that already had it. The
+    // download panel and the useful-links post were missed with it.
+    for (const [cmd, next] of [['postgensteam', 'clearstock'], ['postusefullinks', 'addusefullink']]) {
+      const block = indexSrc.slice(indexSrc.indexOf(`cmd === '${cmd}'`), indexSrc.indexOf(`cmd === '${next}'`));
+      assert.ok(/withLanguageRow\(/.test(block), `/${cmd} posts without the dropdown`);
+    }
+  });
+
   await check('a post already using five action rows keeps its buttons', async () => {
     const fn = indexSrc.slice(indexSrc.indexOf('function withLanguageRow'));
     assert.ok(/components\.length >= 5/.test(fn),
       'a sixth row rejects the WHOLE message — the post would not send at all');
   });
 
-  await check('the delivery DM is translated only for someone who asked', async () => {
+  // The rule this pinned last round was the opposite one: translate the DM for
+  // anyone with a stored preference. That was wrong twice — it reached for a
+  // choice made in another server, and it broke the assumption the whole module
+  // rests on, that a message this bot sends is English. On a pre-translated DM
+  // the dropdown's own English option handed the Spanish straight back, which
+  // is what "if i translate to english it translates to spanish" was.
+  await check('the delivery DM goes out in English, with the dropdown to change it', async () => {
     for (const f of ['modules/internalEvents.js', 'modules/manualDelivery.js']) {
       const s = strip(src(f));
-      assert.ok(/getUserLang/.test(s), `${f} never looks up a language`);
-      assert.ok(/lang !== DEFAULT_LANG|lang === DEFAULT_LANG/.test(s),
-        `${f} would translate English into English on every delivery`);
-      assert.ok(/catch/.test(s), `${f} lets a translation failure take the delivery down`);
+      assert.ok(!/translateEmbeds\(/.test(s), `${f} still pre-translates the buyer's DM`);
+      assert.ok(!/getUserLang\(/.test(s), `${f} still picks a language on the buyer's behalf`);
+      assert.ok(/languageRow\(/.test(s), `${f} sends a DM the buyer cannot translate`);
+    }
+  });
+
+  await check('the dropdown is told which words in a delivery DM are catalogue keys', async () => {
+    // Nothing in this module can tell "H8ED Private External" from a sentence,
+    // and the translation now happens after the DM was sent — so the list has
+    // to be recovered from the message. Without this the buyer is offered a
+    // product that does not exist, which is the bug the protect list was added
+    // for in the first place.
+    assert.ok(/protectFor/.test(strip(src('modules/translate.js'))), 'the handler cannot be given one');
+    assert.ok(/protectFromEmbed/.test(indexSrc), 'index.js never passes one');
+    const D = require('./modules/deliveryEmbed');
+    const { embed, protect } = D.buildDeliveryEmbed({
+      items: [{ game: 'Rust', product: 'H8ED Private External', tier: 'Month', qty: 1, values: ['K-1'] }],
+      invoiceNo: 'AAAA-BBBB',
+    });
+    const back = D.protectFromEmbed(embed.toJSON());
+    for (const s of protect.filter(x => x !== 'AAAA-BBBB')) {
+      assert.ok(back.includes(s), `${s} would be translated`);
     }
   });
 

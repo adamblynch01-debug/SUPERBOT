@@ -284,4 +284,57 @@ check('one absurdly long value still delivers something, marked', () => {
   assert.ok(/X{50,}/.test(f.value), 'nothing was delivered');
 });
 
+console.log('\nthe protect list survives the message being sent');
+
+// The DM goes out in English now and is translated later, from the dropdown
+// under it - by which time the caller that knew `product`, `game` and `tier` as
+// separate values is gone. protectFromEmbed reads them back out of the rendered
+// embed. If it ever stops agreeing with what buildDeliveryEmbed protected on
+// the way out, a Spanish buyer is offered "H8ED Privado Externo" again: a
+// product this shop does not sell, cannot look up, and did not deliver.
+
+check('what was protected on the way out is recoverable from the message', () => {
+  const { embed, protect } = buildDeliveryEmbed(ORDER);
+  const back = D.protectFromEmbed(embed.toJSON());
+  for (const s of protect) {
+    // The invoice is the exception, and it needs no help: it is written inside
+    // backticks, which translate.js protects without being told.
+    if (s === ORDER.invoiceNo) continue;
+    assert.ok(back.includes(s), `${s} is not recoverable - it would be translated`);
+  }
+});
+
+check('the same holds for a multi-product order', () => {
+  const order = {
+    items: [
+      { game: 'Rust', product: 'Fluent', tier: 'Day', qty: 1, values: ['R-1'] },
+      { game: 'Apex', product: 'Ring-1', tier: 'Week', qty: 2, values: ['A-1', 'A-2'] },
+    ],
+    invoiceNo: 'X-1',
+  };
+  const { embed } = buildDeliveryEmbed(order);
+  const back = D.protectFromEmbed(embed.toJSON());
+  for (const s of ['Rust', 'Fluent', 'Day', 'Apex', 'Ring-1', 'Week']) {
+    assert.ok(back.includes(s), `${s} is not recoverable`);
+  }
+});
+
+check('a quantity is arithmetic, not a name', () => {
+  const { embed } = buildDeliveryEmbed({
+    items: [{ product: 'Gen Key', tier: 'Week', qty: 3, values: ['a', 'b', 'c'] }], invoiceNo: 'X',
+  });
+  const back = D.protectFromEmbed(embed.toJSON());
+  assert.ok(back.includes('Week'), back.join(' | '));
+  assert.ok(!back.some(s => /^×/.test(s)), back.join(' | '));
+});
+
+check('a post that is not a delivery gets nothing back, not a guess', () => {
+  // Every other post in the bot goes through the same dropdown. Masking words
+  // out of a Terms of Service because they sat in a field would be worse than
+  // not masking at all.
+  assert.deepStrictEqual(D.protectFromEmbed({ fields: [{ name: 'Rules', value: 'Be nice to each other' }] }), []);
+  assert.deepStrictEqual(D.protectFromEmbed({}), []);
+  assert.deepStrictEqual(D.protectFromEmbed(null), []);
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
