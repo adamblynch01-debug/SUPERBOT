@@ -2531,7 +2531,11 @@ const STATUS_EMOJI = {
 // The last content we rendered, so a refresh that would change nothing costs
 // no API calls. Reset on boot, which means the first tick after a restart
 // always writes once — correct after downtime, and cheap.
-let statusPanelSignature = null;
+//
+// Keyed by guild: the panel is per server, so "unchanged since I last wrote it"
+// has to be asked per server too. A single variable meant the second server's
+// first refresh saw the first server's signature and skipped the write.
+const statusPanelSignatures = new Map();
 
 // Both /post-status and the refresher build from here, so what the timer
 // writes can never drift from what the command posted.
@@ -2583,20 +2587,38 @@ async function buildStatusPanel() {
   return { messages, signature, count: rows.length };
 }
 
-async function loadStatusPanelRef() {
+// One panel PER GUILD. It used to be one panel full stop — a single `status`
+// key holding one channel id and one message list — so running /post-status on
+// the second server found the first server's panel sitting in that key, took it
+// down as "the previous one", and overwrote the key. Two servers could never
+// hold a panel at the same time, and the one that lost it never got an error.
+//
+// `kind` is a free-form key in a JSON blob on the backend, so making it
+// `status:<guildId>` needs no route change and no migration.
+const LEGACY_STATUS_KIND = 'status';
+const statusKind = (guildId) => `${LEGACY_STATUS_KIND}:${guildId}`;
+
+async function loadStatusPanels() {
   try {
-    const r = await axios.get(`${BACKEND_URL}/api/status/panel`, { params: { secret: API_SECRET, kind: 'status' }, timeout: 10000 });
-    return (r.data && r.data.panel) || null;
+    const r = await axios.get(`${BACKEND_URL}/api/status/panel`,
+      { params: { secret: API_SECRET, kind: LEGACY_STATUS_KIND }, timeout: 10000 });
+    return (r.data && r.data.panels) || {};
   } catch (err) {
-    console.warn('[Status] could not load the panel reference:', err.message);
+    console.warn('[Status] could not load the panel references:', err.message);
     return null;
   }
 }
 
-async function saveStatusPanelRef(channelId, messageIds) {
+async function loadStatusPanelRef(guildId) {
+  const panels = await loadStatusPanels();
+  if (!panels) return null;
+  return panels[statusKind(guildId)] || null;
+}
+
+async function saveStatusPanelRef(guildId, channelId, messageIds) {
   try {
     await axios.post(`${BACKEND_URL}/api/status/panel`, {
-      secret: API_SECRET, kind: 'status',
+      secret: API_SECRET, kind: statusKind(guildId),
       channel_id: channelId || null, message_ids: messageIds || [],
     }, { timeout: 10000 });
   } catch (err) {
@@ -2604,12 +2626,49 @@ async function saveStatusPanelRef(channelId, messageIds) {
   }
 }
 
+// The panel that was posted before this was per-guild lives under the bare
+// `status` key with no record of which server it is in. The channel knows, so
+// ask it once and file the panel where it belongs. Deliberately NOT assumed to
+// be the main guild: guessing wrong would adopt one server's panel into
+// another and then edit it there forever.
+async function adoptLegacyStatusPanel(panels) {
+  const legacy = panels[LEGACY_STATUS_KIND];
+  if (!legacy || !legacy.channel_id) return;
+  let guildId = null;
+  try {
+    const ch = await client.channels.fetch(legacy.channel_id);
+    guildId = ch && ch.guildId;
+  } catch (_) { /* channel gone — drop the key below either way */ }
+
+  if (guildId && !panels[statusKind(guildId)]) {
+    panels[statusKind(guildId)] = legacy;
+    await saveStatusPanelRef(guildId, legacy.channel_id, legacy.message_ids || []);
+    console.log(`[Status] adopted the old shared panel into guild ${guildId}`);
+  }
+  delete panels[LEGACY_STATUS_KIND];
+  try {
+    await axios.post(`${BACKEND_URL}/api/status/panel`,
+      { secret: API_SECRET, kind: LEGACY_STATUS_KIND, channel_id: null, message_ids: [] }, { timeout: 10000 });
+  } catch (_) { /* it will be retried next tick */ }
+}
+
 // `force` skips the unchanged-check — used right after something writes a
 // status, where the whole point is to show the change immediately.
+//
+// Every guild that has a panel gets refreshed, and one guild failing must not
+// stop the next: they are separate servers, and a channel deleted on one says
+// nothing about the other.
 async function refreshStatusPanel({ force = false } = {}) {
   if (!API_SECRET) return;
-  const ref = await loadStatusPanelRef();
-  if (!ref || !ref.channel_id || !(ref.message_ids || []).length) return;
+  const panels = await loadStatusPanels();
+  if (!panels) return;
+  await adoptLegacyStatusPanel(panels);
+
+  const targets = Object.keys(panels)
+    .filter(k => k.startsWith(`${LEGACY_STATUS_KIND}:`))
+    .map(k => ({ guildId: k.slice(LEGACY_STATUS_KIND.length + 1), ref: panels[k] }))
+    .filter(t => t.ref && t.ref.channel_id && (t.ref.message_ids || []).length);
+  if (!targets.length) return;
 
   let built;
   try { built = await buildStatusPanel(); } catch (err) {
@@ -2620,7 +2679,18 @@ async function refreshStatusPanel({ force = false } = {}) {
   // backend being briefly unreachable, and blanking a public channel over a
   // hiccup is worse than showing a slightly stale list.
   if (!built) return;
-  if (!force && built.signature === statusPanelSignature) return;
+
+  for (const { guildId, ref } of targets) {
+    try {
+      await refreshOneStatusPanel(guildId, ref, built, force);
+    } catch (err) {
+      console.warn(`[Status] panel refresh failed for guild ${guildId}:`, err.message);
+    }
+  }
+}
+
+async function refreshOneStatusPanel(guildId, ref, built, force) {
+  if (!force && built.signature === statusPanelSignatures.get(guildId)) return;
 
   let channel;
   try {
@@ -2629,7 +2699,8 @@ async function refreshStatusPanel({ force = false } = {}) {
     // Channel deleted or no longer visible — forget the panel rather than
     // failing on a timer forever.
     console.warn('[Status] panel channel is gone, forgetting it:', err.message);
-    await saveStatusPanelRef(null, []);
+    await saveStatusPanelRef(guildId, null, []);
+    statusPanelSignatures.delete(guildId);
     return;
   }
   if (!channel || !channel.isTextBased?.()) return;
@@ -2647,8 +2718,8 @@ async function refreshStatusPanel({ force = false } = {}) {
       // can re-run /post-status.
       if (err.code === 10008) {
         console.warn('[Status] part of the panel was deleted — forgetting it');
-        await saveStatusPanelRef(null, []);
-        statusPanelSignature = null;
+        await saveStatusPanelRef(guildId, null, []);
+        statusPanelSignatures.delete(guildId);
         return;
       }
       throw err;
@@ -2667,9 +2738,9 @@ async function refreshStatusPanel({ force = false } = {}) {
   }
   const finalIds = ids.slice(0, wanted.length);
 
-  statusPanelSignature = built.signature;
+  statusPanelSignatures.set(guildId, built.signature);
   if (finalIds.length !== ref.message_ids.length || finalIds.some((id, i) => id !== ref.message_ids[i])) {
-    await saveStatusPanelRef(ref.channel_id, finalIds);
+    await saveStatusPanelRef(guildId, ref.channel_id, finalIds);
   }
 }
 
@@ -6133,7 +6204,10 @@ client.on('interactionCreate', async interaction => {
           // refreshing themselves, and only one of them is the one anybody is
           // actually looking at — the other becomes a second source of truth
           // that stays convincingly up to date.
-          const prev = await loadStatusPanelRef();
+          //
+          // THIS GUILD'S previous panel. Looking it up without the guild is
+          // what made posting here delete the other server's panel.
+          const prev = await loadStatusPanelRef(interaction.guildId);
           if (prev && prev.channel_id) {
             try {
               const ch = await client.channels.fetch(prev.channel_id);
@@ -6148,8 +6222,8 @@ client.on('interactionCreate', async interaction => {
             const sent = await targetCh.send({ embeds });
             ids.push(sent.id);
           }
-          await saveStatusPanelRef(targetCh.id, ids);
-          statusPanelSignature = built.signature;
+          await saveStatusPanelRef(interaction.guildId, targetCh.id, ids);
+          statusPanelSignatures.set(interaction.guildId, built.signature);
 
           const mins = Math.max(1, Math.round(STATUS_PANEL_REFRESH_MS / 60000));
           return interaction.editReply({
