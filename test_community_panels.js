@@ -147,7 +147,7 @@ await check('no marker is a substring of another one', () => {
   const marks = [
     C.MARK_LIVE, C.MARK_CLIPS, C.MARK_PC, C.MARK_SUGGEST, C.MARK_GIVEAWAY,
     C.MARK_LIVE_NOW, C.MARK_SUGGESTION, C.MARK_GW_ENTRY, C.MARK_GW_RESULTS,
-    C.markLiveBy('123456789012345678'),
+    C.MARK_CLIP_POST,
   ];
   for (const a of marks) for (const b of marks) {
     if (a === b) continue;
@@ -258,22 +258,24 @@ await check('the panel says what the channel is for and how to get a clip into i
   const p = C.buildClipsPanel(guild);
   const { embed } = json(p);
   assert.ok(/Post your clips/i.test(embed.title));
-  assert.ok(embed.fields.some(f => /paste/i.test(f.value)), 'nothing tells a member what to actually do');
+  assert.ok(embed.fields.some(f => /press the button/i.test(f.value)), 'nothing tells a member what to actually do');
   const b = buttons(p);
+  assert.ok(b.some(x => x.custom_id === 'clip_submit'), 'no way for a member to post a clip');
   assert.ok(b.some(x => x.custom_id === 'clips_howto'), 'no walkthrough button');
   assert.ok(b.some(x => x.style === 5 && /medal\.tv/.test(x.url || '')), 'no link to clipping software');
 });
 
 await check('every walkthrough answers only the person who pressed it', () => {
-  // Four of them now (notify, clips, pc, giveaway). One missing `flags: 64`
-  // and a member pressing a button dumps a wall of help into the channel.
+  // Five replies now: the four walkthroughs (notify, clips, pc, giveaway) and
+  // the refusal a non-staff member gets from the live-stream button. One
+  // missing `flags: 64` and a button press dumps a wall of text into a channel.
   const s = src('modules/communityPanels.js');
   const fn = s.slice(s.indexOf('async function handleCommunityButton'), s.indexOf('async function handleCommunityModal'));
   const replies = fn.match(/interaction\.reply\(\{[^}]*\}/g) || [];
-  assert.strictEqual(replies.length, 4, `expected 4 button replies, found ${replies.length}`);
+  assert.strictEqual(replies.length, 5, `expected 5 button replies, found ${replies.length}`);
   replies.forEach(r => assert.ok(/flags: 64/.test(r), `a walkthrough is posting into the channel: ${r}`));
-  // And both member-facing buttons open a modal rather than replying.
-  assert.strictEqual((fn.match(/showModal\(/g) || []).length, 2);
+  // And the three buttons that need a line of text open a modal.
+  assert.strictEqual((fn.match(/showModal\(/g) || []).length, 3);
 });
 
 await check('a button this module does not own is passed on, not swallowed', async () => {
@@ -282,14 +284,12 @@ await check('a button this module does not own is passed on, not swallowed', asy
   assert.strictEqual(await C.handleCommunityButton({ customId: 'giveaway_enter' }), false);
 });
 
-  console.log('\nthe member-facing "I\'m going live" button');
+  console.log('\nthe member-facing "Post a clip" button');
 
-await check('the panel offers it, and the button opens a form rather than eating the press', () => {
-  assert.ok(buttons(C.buildLivePanel(guild)).some(b => b.custom_id === 'live_go'),
-    'members have no way to announce a stream');
+await check('the button opens a form rather than eating the press', () => {
   const s = src('modules/communityPanels.js');
-  const fn = s.slice(s.indexOf("if (interaction.customId === 'live_go')"));
-  assert.ok(/community_golive_modal/.test(fn.slice(0, 400)));
+  const fn = s.slice(s.indexOf("if (interaction.customId === 'clip_submit')"));
+  assert.ok(/community_clip_modal/.test(fn.slice(0, 400)));
   // Three inputs, and only the link required — asking a member to fill in a
   // title before they can post is how a button stops being used.
   const modal = fn.slice(0, fn.indexOf('showModal'));
@@ -297,40 +297,158 @@ await check('the panel offers it, and the button opens a form rather than eating
   assert.strictEqual((modal.match(/setRequired\(true\)/g) || []).length, 1);
 });
 
-await check('a member\'s card is marked as THEIRS, so it never replaces anyone else\'s', () => {
-  // One marker per member. Sharing MARK_LIVE_NOW would mean the second person
-  // to go live deletes the first one's announcement — the same class of bug as
-  // /golive overwriting the panel.
-  const mine   = footerOf(C.buildLiveCard(guild, { url: 'https://twitch.tv/a', by: '111' }));
-  const theirs = footerOf(C.buildLiveCard(guild, { url: 'https://twitch.tv/b', by: '222' }));
-  const staff  = footerOf(C.buildLiveCard(guild, { url: 'https://twitch.tv/c' }));
-  assert.ok(mine.includes(C.markLiveBy('111')) && !mine.includes(C.markLiveBy('222')));
-  assert.notStrictEqual(mine, theirs);
-  assert.ok(staff.includes(C.MARK_LIVE_NOW) && !staff.includes('live-by:'),
-    'a staff announcement is filed as somebody\'s personal one');
-  // The card says who, and by mention — a username would go stale on a rename.
-  assert.ok(json2(C.buildLiveCard(guild, { url: 'https://twitch.tv/a', by: '111' })).embed.description.includes('<@111>'));
+await check('the clip PLAYS, which means the URL is in the message body and not only the embed', () => {
+  // Discord builds a player for a link it finds in `content`. A URL inside an
+  // embed never gets one — the same rule that meant no post of ours could have
+  // a preview card. Without this the clip channel is a wall of cards nobody
+  // clicks, which is the whole thing it was asked not to be.
+  const member = { id: '77', user: { globalName: 'Someone' }, displayAvatarURL: () => 'https://cdn/a.png' };
+  const p = C.buildClipCard(guild, member, { url: 'https://medal.tv/clips/xyz', title: '1v5', game: 'Siege' });
+  assert.strictEqual(p.content, 'https://medal.tv/clips/xyz',
+    'the clip link is not in the message body, so Discord will not play it');
+  const { embed } = json(p);
+  assert.ok(/1v5/.test(embed.title), embed.title);
+  assert.strictEqual(embed.url, 'https://medal.tv/clips/xyz');
+  assert.strictEqual(embed.author.name, 'Someone');
+  assert.ok(embed.description.includes('<@77>'), 'the card does not say whose clip it is');
+  assert.ok(embed.fields.some(f => /Siege/.test(f.value)), 'the game was typed in and dropped');
+  assert.ok(buttons(p).some(b => b.style === 5 && b.url === 'https://medal.tv/clips/xyz'), 'no Watch button');
+  assert.ok(buttons(p).some(b => b.custom_id === 'clip_submit'), 'no way to post one from a clip');
 });
 
-await check('a member pressing a button can never ping the server', () => {
+await check('a clip with nothing typed in it still renders', () => {
+  const member = { id: '77', user: { username: 'someone' }, displayAvatarURL: () => 'https://cdn/a.png' };
+  const p = C.buildClipCard(guild, member, { url: 'https://streamable.com/abc', title: null, game: null });
+  assert.ok(json(p).embed.title.length > 2, 'an untitled clip has no title at all');
+  assert.strictEqual(p.content, 'https://streamable.com/abc');
+});
+
+await check('a clip is never swept — the channel is meant to fill up', () => {
+  // This is the difference between #post-your-clips and #live-stream. A stream
+  // announcement is only interesting while the stream is on; a clip is worth
+  // watching next month. Nothing may retire or replace one.
   const s = src('modules/communityPanels.js');
-  const fn = s.slice(s.indexOf("if (interaction.customId === 'community_golive_modal')"));
-  const send = fn.slice(fn.indexOf('channel.send('), fn.indexOf('lastMemberGoLive.set'));
+  const fn = s.slice(s.indexOf("if (interaction.customId === 'community_clip_modal')"),
+                     s.indexOf('return false;\n}\n\nmodule.exports'));
+  assert.ok(!/retireAnnouncement|findMarked/.test(fn), 'posting a clip removes another message');
+  // The marker exists so a clip can be RECOGNISED, not so it can be found and
+  // removed. Three mentions is all there should be: the constant, the footer it
+  // is stamped into, and the export. A fourth is something looking for clips.
+  assert.strictEqual((s.match(/MARK_CLIP_POST/g) || []).length, 3,
+    'something else has started using the clip marker — check it is not a sweep');
+  assert.ok(!/MARK_CLIP_POST/.test(src('index.js')), 'index.js has started hunting for clips');
+});
+
+await check('a member pressing the clip button can never ping anybody', () => {
+  const s = src('modules/communityPanels.js');
+  const fn = s.slice(s.indexOf("if (interaction.customId === 'community_clip_modal')"));
+  const send = fn.slice(fn.indexOf('channel.send('), fn.indexOf('lastClip.set'));
   assert.ok(/allowedMentions: \{ parse: \[\] \}/.test(send),
     'the card mentions the author, so the default would notify them and any role they type');
-  // And it is rate-limited, because the button is on a public panel.
-  assert.ok(/MEMBER_GOLIVE_COOLDOWN_MS/.test(fn.slice(0, fn.indexOf('const raw'))), 'no cooldown');
+  // And it is rate-limited, because the button is on a public panel and clips
+  // accumulate rather than replacing each other.
+  assert.ok(/CLIP_COOLDOWN_MS/.test(fn.slice(0, fn.indexOf('const raw'))), 'no cooldown');
 });
 
 await check('a member cannot get the bot to vouch for a blocked domain', () => {
   const s = src('modules/communityPanels.js');
-  const fn = s.slice(s.indexOf("if (interaction.customId === 'community_golive_modal')"));
-  const guard = fn.slice(0, fn.indexOf('const live = {'));
+  const fn = s.slice(s.indexOf("if (interaction.customId === 'community_clip_modal')"));
+  const guard = fn.slice(0, fn.indexOf('const clip = {'));
   assert.ok(/hasBannedLink/.test(guard), 'any link a member types goes out under the bot\'s name unchecked');
   assert.ok(/normalizeUrl\(raw\)/.test(guard) && /if \(!url\)/.test(guard));
   // Lazily required: antiscam's start-up must not be dragged into a panel
   // render, and an unavailable list must not take the button down.
   assert.ok(/require\('\.\/antiscam'\)/.test(guard) && /catch \(_\)/.test(guard));
+});
+
+  console.log('\n"I\'m going live" is staff-only');
+
+await check('the button is still ON the panel — "we keep it just adjust it"', () => {
+  const b = buttons(C.buildLivePanel(guild));
+  assert.ok(b.some(x => x.custom_id === 'live_go'), 'the going-live button was removed rather than gated');
+  // And the panel no longer tells every reader to press it, because most of
+  // them now cannot. A button that refuses the people it invited is worse than
+  // no button.
+  const { embed } = json(C.buildLivePanel(guild));
+  const blurb = embed.description + JSON.stringify(embed.fields);
+  assert.ok(!/Streaming yourself/i.test(blurb), 'the panel still invites members to announce a stream');
+  assert.ok(/Staff/i.test(blurb), 'nothing says who the button is for');
+});
+
+await check('a member who presses it is told where to go instead, and gets no form', async () => {
+  // The button cannot be hidden from some readers and shown to others, so the
+  // refusal is the only thing standing between a member and the server's
+  // stream announcement. The default gate is closed.
+  let replied = null, modalled = false;
+  const handled = await C.handleCommunityButton({
+    customId: 'live_go',
+    reply: async (p) => { replied = p; },
+    showModal: async () => { modalled = true; },
+  });
+  assert.strictEqual(handled, true, 'the press was passed on to another handler');
+  assert.strictEqual(modalled, false, 'a member was given the announcement form');
+  assert.ok(replied && replied.flags === 64, 'the refusal was posted into the channel');
+  assert.ok(/clip/i.test(replied.content), 'the refusal does not tell them where their clip goes');
+});
+
+await check('staff get the form', async () => {
+  C.setCommunityGate({ hasAccess: () => true });
+  try {
+    let modalled = false;
+    await C.handleCommunityButton({ customId: 'live_go', showModal: async () => { modalled = true; }, reply: async () => {} });
+    assert.ok(modalled, 'staff cannot use the button either, which makes it dead furniture');
+  } finally {
+    C.setCommunityGate({ hasAccess: () => false });
+  }
+});
+
+await check('the gate is on the MODAL too, not only the button', () => {
+  // A modal is submitted by customId. Anyone who has ever legitimately opened
+  // this one can re-submit it later, and a button-only check would let a
+  // demoted admin keep posting announcements.
+  const s = src('modules/communityPanels.js');
+  const fn = s.slice(s.indexOf("if (interaction.customId === 'community_golive_modal')"));
+  assert.ok(/gate\.hasAccess\(interaction\)/.test(fn.slice(0, fn.indexOf('const raw'))),
+    'the announcement form trusts whoever submits it');
+});
+
+await check('there is ONE announcement, whichever way it was posted', () => {
+  // It used to be filed under `live-by:<id>` when a member posted it, so that a
+  // member replaced only their own. With the button staff-only that split has
+  // no user left, and keeping it would mean /golive and the button quietly
+  // failing to replace each other.
+  const withBy = footerOf(C.buildLiveCard(guild, { url: 'https://twitch.tv/a', by: '111' }));
+  const without = footerOf(C.buildLiveCard(guild, { url: 'https://twitch.tv/c' }));
+  assert.ok(withBy.includes(C.MARK_LIVE_NOW) && without.includes(C.MARK_LIVE_NOW));
+  assert.ok(!withBy.includes('live-by:'), 'a per-member marker is back');
+  assert.strictEqual(C.markLiveBy, undefined, 'the per-member marker helper is still exported');
+  // The card still says WHO, by mention — a username would go stale on a rename.
+  assert.ok(json2(C.buildLiveCard(guild, { url: 'https://twitch.tv/a', by: '111' })).embed.description.includes('<@111>'));
+});
+
+await check('the admin restrictions are gone, not merely unreachable', () => {
+  // "Remove that restriction for admins." Whoever can press this can already
+  // run /golive with any link at all, so a cooldown and a domain check on the
+  // button are theatre that only slows staff down mid-stream.
+  const s = src('modules/communityPanels.js');
+  const fn = s.slice(s.indexOf("if (interaction.customId === 'community_golive_modal')"),
+                     s.indexOf("if (interaction.customId === 'community_clip_modal')"));
+  assert.ok(!/COOLDOWN/.test(fn), 'staff are still rate-limited on their own announcement');
+  assert.ok(!/hasBannedLink/.test(fn), 'staff links are still run past the members\' blocked list');
+  // The link is still checked for being a LINK — that one is not a
+  // restriction, it is the thing that stops the message being rejected.
+  assert.ok(/normalizeUrl\(raw\)/.test(fn));
+});
+
+await check('the button replaces the standing announcement, exactly like /golive', () => {
+  const s = src('modules/communityPanels.js');
+  const fn = s.slice(s.indexOf("if (interaction.customId === 'community_golive_modal')"),
+                     s.indexOf("if (interaction.customId === 'community_clip_modal')"));
+  assert.ok(/findMarked\(channel, MARK_LIVE_NOW, me\)/.test(fn), 'it does not look for the old announcement');
+  assert.ok(/retireAnnouncement\(previous\)/.test(fn), 'the old announcement is left up');
+  // A modal cannot carry a role picker, so this path never pings — and it says
+  // so, rather than leaving staff wondering why nobody saw it.
+  assert.ok(/no ping/.test(fn) && /\/golive/.test(fn), 'nothing tells staff how to ping with it');
 });
 
   console.log('\nthe post-your-pc and suggestions panels');
