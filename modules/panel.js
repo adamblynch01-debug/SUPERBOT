@@ -1649,7 +1649,7 @@ function renderDashboard(session, guild) {
       ['Generator', '', [
         ['gen_role_id', 'Gen Member role', 'grant', 'Who may use the generator. Assigned by the bot.'],
         ['gen_log_channel_id', 'Gen log channel', 'channel', 'Every generated account is logged here.'],
-        ['sms_gen_channel_id', 'SMS gen channel', 'channel', 'Where the SMS generator runs.']
+        ['sms_gen_channel_id', 'SMS number-generated channel', 'channel', 'Where a generated number is POSTED — not where the /post-smsgen panel goes. Leave blank and the bot finds #sms-number-generated in that server by name.']
       ]],
       ['Tickets & support', '', [
         ['ticket_log_channel', 'Ticket log channel', 'channel', 'Transcripts and open/close lines.'],

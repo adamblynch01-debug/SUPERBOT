@@ -225,6 +225,12 @@ async function releaseSmsQuota(interaction) {
 // channel. Override order: /set-smsgen-channel → env → this default.
 const SMS_ORDER_CHANNEL_ID = '1532424953570267376';
 
+// What the channel is called when nobody has configured one. The panel is
+// posted in #sms-verify and the number cards belong in #sms-number-generated —
+// two channels, and the bot should find the second one by name rather than
+// dropping the card next to the panel and calling that configured.
+const SMS_ORDER_CHANNEL_NAME = 'sms-number-generated';
+
 // The panel's per-guild SMS gen channel, installed by index.js. It goes ahead
 // of loadConfig() because that file, the env var and the default below are all
 // one value for the whole bot — and client.channels.fetch resolves across
@@ -233,29 +239,69 @@ const SMS_ORDER_CHANNEL_ID = '1532424953570267376';
 let settingsFor = async () => null;
 function setSmsSettingsProvider(fn) { if (typeof fn === 'function') settingsFor = fn; }
 
+// index.js's findChannelByName — it normalizes the mathematical-bold names the
+// second server uses, which a plain toLowerCase() does not.
+let findChannel = () => null;
+function setSmsChannelFinder(fn) { if (typeof fn === 'function') findChannel = fn; }
+
+// Resolving an id to a channel is not enough: `client.channels.fetch` is
+// BOT-WIDE, so an id left over from the first server resolves perfectly well
+// while standing in the second and posts a member's number where they cannot
+// see it. A channel is only usable if it is in the guild that asked.
+async function usableIn(client, guild, id) {
+  if (!id || !guild) return null;
+  const cached = guild.channels.cache.get(String(id));
+  if (cached) return typeof cached.send === 'function' ? cached : null;
+  try {
+    const ch = await client.channels.fetch(String(id));
+    if (!ch || typeof ch.send !== 'function') return null;
+    if (ch.guildId !== guild.id) {
+      console.warn('[SMS] order channel', id, 'belongs to another server — ignoring it here');
+      return null;
+    }
+    return ch;
+  } catch (e) {
+    console.error('[SMS] order channel', id, 'unusable:', e.message);
+    return null;
+  }
+}
+
 async function resolveOrderChannel(client, interaction) {
-  const cfg = loadConfig();
+  const guild = interaction && interaction.guild;
+  if (!guild) return interaction.channel;
+
   let fromPanel = null;
-  const guildId = interaction && interaction.guild && interaction.guild.id;
-  if (guildId) {
-    try {
-      const s = await settingsFor(guildId);
-      fromPanel = (s && s.smsGenChannelId) || null;
-    } catch (e) {
-      console.error('[SMS] could not read guild settings:', e.message);
-    }
+  try {
+    const s = await settingsFor(guild.id);
+    fromPanel = (s && s.smsGenChannelId) || null;
+  } catch (e) {
+    console.error('[SMS] could not read guild settings:', e.message);
   }
-  const id = fromPanel || cfg.orders_channel_id || process.env.SMS_GEN_CHANNEL_ID || SMS_ORDER_CHANNEL_ID;
-  if (id) {
-    try {
-      const ch = await client.channels.fetch(String(id));
-      if (ch && typeof ch.send === 'function') return ch;
-    } catch (e) {
-      // Never let a bad channel id swallow a number that has already been paid
-      // for — fall back to the channel the buyer is standing in.
-      console.error('[SMS] order channel', id, 'unusable:', e.message);
-    }
+
+  // The panel setting wins — unless it points at the channel the member is
+  // standing in, which is the panel's own channel. That is not a destination,
+  // it is the setting having been read as "where the SMS generator runs".
+  if (fromPanel && String(fromPanel) !== String(interaction.channelId)) {
+    const ch = await usableIn(client, guild, fromPanel);
+    if (ch) return ch;
   }
+
+  // By name, in THIS guild. This is what makes a second server work with
+  // nothing configured at all.
+  const byName = findChannel(guild, SMS_ORDER_CHANNEL_NAME);
+  if (byName && typeof byName.send === 'function' && byName.id !== interaction.channelId) return byName;
+
+  // The old chain last, and only if it lands in this guild. All three of these
+  // are one value for the whole bot, so on any server but the first they are
+  // someone else's channel.
+  const cfg = loadConfig();
+  for (const id of [cfg.orders_channel_id, process.env.SMS_GEN_CHANNEL_ID, SMS_ORDER_CHANNEL_ID]) {
+    const ch = await usableIn(client, guild, id);
+    if (ch) return ch;
+  }
+
+  // Never let a missing channel swallow a number that has already been paid
+  // for — fall back to the channel the buyer is standing in.
   return interaction.channel;
 }
 
@@ -1350,8 +1396,12 @@ async function purchaseNumber(interaction, client, provider, apiKey, session, co
 module.exports = {
   commands, handleSMSInteraction, rehydrateOrders,
   setAccessGate, setSMSAccessGate: setAccessGate,
-  setSmsSettingsProvider,
+  setSmsSettingsProvider, setSmsChannelFinder,
   // Exported for test_sms_gate.js. This gate stands between a button click and
   // real provider credit, so its fail-closed behaviour is asserted, not assumed.
-  _internals: { checkSmsAccess, releaseSmsQuota, SMS_COOLDOWN_HOURS, SMS_QUOTA_KEY },
+  _internals: {
+    checkSmsAccess, releaseSmsQuota, SMS_COOLDOWN_HOURS, SMS_QUOTA_KEY,
+    resolveOrderChannel, usableIn, SMS_ORDER_CHANNEL_NAME,
+    setSmsSettingsProvider, setSmsChannelFinder,
+  },
 };

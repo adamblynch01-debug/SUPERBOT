@@ -44,7 +44,7 @@ const support    = require('./modules/support');
 const { startAuthServer, handle2FAInteraction } = require('./modules/auth2fa');
 const { getAllProducts, getProduct, setProductUrl, getProductChunks, getProductByName, refresh: dlRefresh } = require('./modules/downloads');
 const { handleWebTicketButton, handleWebTicketModal } = require('./modules/webTickets');
-const { commands: smsCommands, handleSMSInteraction, setSMSAccessGate, setSmsSettingsProvider } = require('./modules/sms-gen');
+const { commands: smsCommands, handleSMSInteraction, setSMSAccessGate, setSmsSettingsProvider, setSmsChannelFinder } = require('./modules/sms-gen');
 const { logGeneration, setGenLogSettingsProvider } = require('./modules/genLog');
 const {
   commands: manualCommands, handleManualInteraction, setManualAccessGate,
@@ -1427,6 +1427,12 @@ setSmsSettingsProvider(async (guildId) => {
   const s = await getGuildSettings(guildId);
   return { smsGenChannelId: s.smsGenChannelId };
 });
+
+// So a server that has configured nothing still gets its number cards in
+// #sms-number-generated rather than next to the panel in #sms-verify. Handed in
+// rather than re-implemented in the module, because this is the version that
+// normalizes the mathematical-bold channel names the second server uses.
+setSmsChannelFinder((guild, name) => findChannelByName(guild, name));
 
 async function canAccessStock(member) {
   if (member.permissions.has('Administrator')) return true;
