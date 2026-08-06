@@ -58,6 +58,10 @@ const {
   commands: productInfoCommands, handleProductInfoCommand, handleProductInfoSelect,
   handleProductInfoButton, setProductInfoGate,
 } = require('./modules/productInfo');
+const {
+  commands: communityCommands, handleCommunityCommand, handleCommunityButton,
+  setCommunityGate,
+} = require('./modules/communityPanels');
 const translate = require('./modules/translate');
 // Only for the language dropdown: it reads a delivery DM back off the
 // interaction and names the catalogue strings in it, which the translator must
@@ -416,6 +420,16 @@ const INVITES_NEEDED_ENV = parseInt(process.env.INVITES_NEEDED || '10');
 // Updates module
 const BOT_NAME  = process.env.BOT_NAME  || 'UH Services';
 const SITE_URL  = process.env.SITE_URL  || '';
+// The store address, guaranteed non-empty and scheme-qualified. SITE_URL is
+// allowed to be blank above (the footer just prints nothing), but a Link button
+// with a blank URL REJECTS THE WHOLE MESSAGE, so anything that becomes a button
+// goes through this one instead.
+const STORE_URL = (process.env.SITE_URL || 'https://uhservices.xyz').replace(/\/+$/, '');
+const DOWNLOADS_URL = `${STORE_URL}/downloads`;
+// #downloads held two bot posts — a bare @everyone link, and the product
+// dropdowns — and the ask was to make them one. The marker is what lets the
+// command find and EDIT the merged panel instead of adding a third.
+const MARK_DOWNLOADS = 'panel:downloads';
 
 // Vouch module — env-overridable, same reasoning as the channels above.
 const LEAVE_VOUCH_CHANNEL_ID = process.env.LEAVE_VOUCH_CHANNEL_ID || '1522983274417360896'; // #leave-vouch — panel lives here
@@ -705,6 +719,10 @@ setManualAccessGate({ hasAccess: (i) => hasAccess(i) });
 // Same gate for the storefront panels. Posting one rewrites a channel every
 // member reads, so it is staff-only for the same reason /post-tos is.
 setStorefrontGate({ hasAccess: (i) => hasAccess(i) });
+// And the #live-stream / #post-your-clips panels, for the same reason —
+// /golive posts an @everyone announcement, which is not a thing a member gets
+// to do.
+setCommunityGate({ hasAccess: (i) => hasAccess(i) });
 // /product-info is public — looking a price up is what customers are here for.
 // The gate covers only its `channel:` option, which posts a panel into a room
 // everybody reads.
@@ -3242,6 +3260,7 @@ const allCommands = [
   ...manualCommands.map(c => c.toJSON()),
   ...storefrontCommands.map(c => c.toJSON()),
   ...productInfoCommands.map(c => c.toJSON()),
+  ...communityCommands.map(c => c.toJSON()),
 ];
 
 // ─── Command lockdown ─────────────────────────────────────────────────────────
@@ -3822,6 +3841,10 @@ client.on('interactionCreate', async interaction => {
       && await handleStorefrontCommand(interaction, { findChannel: findChannelByName })) return;
     // /product-info — owns its command and its two dropdowns.
     if (interaction.isChatInputCommand() && await handleProductInfoCommand(interaction)) return;
+    // #live-stream and #post-your-clips. Same findChannelByName for the same
+    // reason: "🔴︱𝐋𝐢𝐯𝐞-𝐒𝐭𝐫𝐞𝐚𝐦" has to resolve.
+    if (interaction.isChatInputCommand()
+      && await handleCommunityCommand(interaction, { findChannel: findChannelByName })) return;
     // Autocomplete
     if (interaction.isAutocomplete() && interaction.commandName === 'setdownload') {
       const focused = interaction.options.getFocused().toLowerCase();
@@ -3850,7 +3873,7 @@ client.on('interactionCreate', async interaction => {
             { name: '🔐 Verification & Invites', value: '`/setup-verify` — Set up verification channel\n`/setup-invites` — Set up invite reward channel\n`/show-voucher-stats` — Invite leaderboard / one member\'s stats', inline: false },
             { name: '📦 Products & Downloads', value: '`/product-info` — Look up any product: price, plans, stock, features\n`/downloads` — Browse & download products\n`/setupdownloads` — Post download panel to #downloads\n`/setdownload` — Set a product download link', inline: false },
             { name: '📣 Updates & Status', value: '`/postupdate` — Post a product update\n`/statusupdate` — Post a status update\n`/announce` — Send a custom announcement', inline: false },
-            { name: '🌐 Server Setup', value: '`/setup-website` — Post the website panel\n`/setup-payments` — Post the payment methods panel (live fees)\n`/setupreseller` — Post reseller panel\n`/setresellerlinks` — Update reseller button links\n`/postimage` — Post an image', inline: false },
+            { name: '🌐 Server Setup', value: '`/setup-website` — Post the website panel\n`/setup-payments` — Post the payment methods panel (live fees)\n`/setup-livestream` — Post the live-stream panel\n`/golive` — Announce a stream with its link (blank link = ended)\n`/setup-clips` — Post the post-your-clips panel\n`/setupreseller` — Post reseller panel\n`/setresellerlinks` — Update reseller button links\n`/postimage` — Post an image', inline: false },
             { name: '💾 Server Snapshots', value: '`/serverbackup create` — Save the server\'s roles, channels & permissions\n`/serverbackup list|view|export` — Browse or download a snapshot\n`/serverbackup restore` — Rebuild from one: tick roles / categories / channels / permissions / emojis (never deletes anything)', inline: false },
             { name: '🔁 Cross-Server Mirroring', value: '`/mirror follow` — Announcement channels: let another server follow this one (Discord delivers it)\n`/mirror add` — Any channel: relay its posts into another server\n`/mirror list|remove|test` — Manage the relays\n`/mirror panic` — Stop everything arriving here, right now\n`/mirror block|unblock|resume` — Refuse a server outright, or restart a paused route', inline: false },
             { name: '🎫 Support Tickets', value: '`/panel` — Post the support panel\n`/clearlogs` — Clear ticket log channel\n`/reply` — Reply to a user\'s ticket', inline: false },
@@ -4140,21 +4163,90 @@ client.on('interactionCreate', async interaction => {
             const text = p.label || p.name;
             return { label: text.length > 100 ? text.slice(0, 97) + '...' : text, value: p.id, description: p.url ? 'Download available' : 'Coming soon' };
           }));
+        const listed = chunks.reduce((n, c) => n + c.length, 0);
         const embed = new EmbedBuilder().setTitle('📦  PRODUCT DOWNLOADS').setColor(0x5865F2)
-          .setDescription('> Select your product from the dropdown below and click **DOWNLOAD** to get your file.')
-          .setFooter({ text: `${BOT_NAME} | ${SITE_URL}`, iconURL: client.user.displayAvatarURL() }).setTimestamp();
+          .setURL(DOWNLOADS_URL)
+          // The bare `@everyone https://uhservices.xyz/downloads` post that used
+          // to sit above this one is now this paragraph and the button under
+          // it. Two posts saying "downloads are over here" in the downloads
+          // channel is one post too many, and the bare one said nothing about
+          // what to do when you got there.
+          .setDescription(
+            `**Every file you have bought, in two places.**\n`
+            + `Pick your product from a dropdown below and hit **DOWNLOAD**, or open the full library on the site — `
+            + `same files, and your order history is next to them.\n\n`
+            + `🌐 ${DOWNLOADS_URL}`
+          )
+          .addFields(
+            { name: '📥 Here in Discord', value: `${listed} product${listed === 1 ? '' : 's'} across ${chunks.length} page${chunks.length === 1 ? '' : 's'} below.`, inline: true },
+            { name: '🌐 On the site', value: 'Sign in with Discord — no password — for the full list and your keys.', inline: true },
+            { name: '🆕 Updates', value: 'Links are replaced in place, so this panel always points at the current build.', inline: true },
+          )
+          .setFooter({ text: `${BOT_NAME}${SITE_URL ? ` | ${SITE_URL}` : ''} • ${MARK_DOWNLOADS}`, iconURL: client.user.displayAvatarURL() }).setTimestamp();
+
+        const linkRow = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setLabel('Open downloads on the site').setEmoji('🌐').setStyle(ButtonStyle.Link).setURL(DOWNLOADS_URL),
+          new ButtonBuilder().setLabel('My orders').setEmoji('📦').setStyle(ButtonStyle.Link).setURL(`${STORE_URL}/account`),
+        );
 
         // One row per page, built from however many pages there actually are.
         // This was three hardcoded rows labelled "Page n of 3", so a fourth
         // page of products was dropped without a word and the labels lied as
         // soon as the catalog stopped being 62 items.
-        await dlCh.send(withLanguageRow({
+        //
+        // Five action rows is a hard cap and a sixth REJECTS the whole message.
+        // The link row is now one of the five, so the dropdowns get four — and
+        // if that ever costs a page, the count that did not fit is REPORTED
+        // rather than quietly dropped. downloads.js already caps at 5 pages, so
+        // the two limits are stated together below.
+        const MENU_ROWS = 4;
+        const shownChunks = chunks.slice(0, MENU_ROWS);
+        const notShown = listed - shownChunks.reduce((n, c) => n + c.length, 0);
+        if (notShown > 0) console.warn(`[Downloads] ${notShown} products past page ${MENU_ROWS} are not on the panel`);
+
+        const payload = withLanguageRow({
           embeds: [embed],
-          components: chunks.map((chunk, i) => new ActionRowBuilder().addComponents(
-            makeMenu(`dl_page_${i + 1}`, `${(chunk[0].label || chunk[0].name).charAt(0)}–${(chunk[chunk.length - 1].label || chunk[chunk.length - 1].name).charAt(0)}  (Page ${i + 1} of ${chunks.length})`, chunk)
-          )),
-        }));
-        await interaction.editReply({ content: `✅ Download panel posted in <#${dlCh.id}> — ${chunks.reduce((n, c) => n + c.length, 0)} products across ${chunks.length} page(s).` });
+          components: [linkRow, ...shownChunks.map((chunk, i) => new ActionRowBuilder().addComponents(
+            makeMenu(`dl_page_${i + 1}`, `${(chunk[0].label || chunk[0].name).charAt(0)}–${(chunk[chunk.length - 1].label || chunk[chunk.length - 1].name).charAt(0)}  (Page ${i + 1} of ${shownChunks.length})`, chunk)
+          ))],
+        });
+
+        // Edit the panel already in the channel rather than stacking another
+        // one under it — same marker-in-the-footer trick /setup-website uses,
+        // and the reason this command stopped being a duplicate machine.
+        const { edited } = await upsertPanel(dlCh, MARK_DOWNLOADS, payload, client.user);
+
+        // The old bare-link post, if it is still sitting there. Matched as
+        // narrowly as it can be — authored by this bot, carrying NO panel
+        // marker, and containing nothing but the downloads URL (plus an
+        // @everyone) once the markdown is stripped. Anything with a sentence in
+        // it fails that test and is left alone, and whatever does go is named
+        // in the reply rather than vanishing quietly.
+        const superseded = [];
+        try {
+          const recent = await dlCh.messages.fetch({ limit: 50 });
+          for (const m of recent.values()) {
+            if (m.author.id !== client.user.id) continue;
+            if (m.embeds.some(e => /panel:/.test((e.footer && e.footer.text) || ''))) continue;
+            if (m.embeds.length > 1 || m.attachments.size) continue;
+            const e = m.embeds[0];
+            const body = [m.content, e && e.title, e && e.description, e && (e.footer && e.footer.text)]
+              .filter(Boolean).join(' ')
+              .replace(/\[([^\]]*)\]\(([^)]*)\)/g, '$1 $2')   // markdown links → their two halves
+              .replace(/@everyone|@here|<@&?\d+>/g, '')
+              .replace(/https?:\/\/\S*?\/downloads\/?/gi, '')
+              .replace(/[>*_`~\s]/g, '');
+            if (body) continue;                        // it says something else — not ours to delete
+            if (e && (e.fields || []).length) continue;
+            try { await m.delete(); superseded.push(m.id); } catch (err) { console.warn('[Downloads] could not remove the old link post:', err.message); }
+          }
+        } catch (err) { console.warn('[Downloads] could not scan for the old link post:', err.message); }
+
+        await interaction.editReply({
+          content: `${edited ? '♻️ Refreshed' : '📌 Posted'} the download panel in <#${dlCh.id}> — ${listed} product${listed === 1 ? '' : 's'} across ${shownChunks.length} page(s), with the site link on it.`
+            + (superseded.length ? `\n🧹 Removed ${superseded.length} old bare-link post(s) (\`${superseded.join('`, `')}\`) — the link lives on this panel now.` : '')
+            + (notShown > 0 ? `\n⚠️ ${notShown} product(s) did not fit: the link row takes one of Discord's five rows, leaving ${MENU_ROWS} pages of 25. They are still on the site.` : ''),
+        });
         return;
       }
 
@@ -6439,6 +6531,10 @@ client.on('interactionCreate', async interaction => {
       // 📢 Show everyone, on a private product card. Reads the catalogue, not
       // this guild's settings.
       if (await handleProductInfoButton(interaction)) return;
+
+      // "How do I get notified?" / "How do I record a clip?" — both answer from
+      // static text and need nothing from this guild's settings row.
+      if (await handleCommunityButton(interaction)) return;
 
       // Server-snapshot restore. Answered before getGuildSettings for the same
       // reason: it does not need it, and this is a long job that should not
