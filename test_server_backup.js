@@ -277,4 +277,174 @@ check('the counts shown in /serverbackup list exclude what will never restore', 
   assert.strictEqual(c.emojis, 1);
 });
 
+// ─── Restoring only part of a snapshot ───────────────────────────────────────
+//
+// "What if I want to restore just the roles?" A restore that is all-or-nothing
+// is the wrong shape for the commonest repair, and the parts are not
+// independent — permission rules are written in terms of roles, channels live
+// under categories — so most of what is pinned here is that leaving one out
+// degrades honestly instead of silently.
+
+check('nothing selected is a different answer from nothing said', () => {
+  // null is what an old button with no parts segment means, and it meant
+  // everything when that button was posted. An empty LIST is a real choice.
+  assert.deepStrictEqual(B.normalizeParts(null), B.ALL_PARTS);
+  assert.deepStrictEqual(B.normalizeParts(undefined), B.ALL_PARTS);
+  assert.deepStrictEqual(B.normalizeParts([]), []);
+});
+
+check('a selection survives a round trip through a customId', () => {
+  for (const parts of [['roles'], ['roles', 'emojis'], B.ALL_PARTS, ['permissions', 'channels']]) {
+    assert.deepStrictEqual(B.normalizeParts(B.encodeParts(parts)), B.normalizeParts(parts));
+  }
+  // Discord allows 100 characters for the whole id; the snapshot id and the
+  // cross-guild flag share it.
+  assert.ok(B.encodeParts(B.ALL_PARTS).length <= 8, B.encodeParts(B.ALL_PARTS));
+});
+
+check('an unknown code is ignored rather than throwing away the rest', () => {
+  // A button posted before a sixth part existed still restores the five it
+  // names.
+  assert.deepStrictEqual(B.decodeParts('R?E'), ['roles', 'emojis']);
+  assert.deepStrictEqual(B.decodeParts(''), []);
+  assert.deepStrictEqual(B.decodeParts('RR'), ['roles']);
+});
+
+check('the order is the order things must happen in, whatever order they were ticked', () => {
+  // Roles before channels because a permission rule names a role; categories
+  // before channels because a channel needs its parent to exist.
+  assert.deepStrictEqual(B.normalizeParts(['emojis', 'channels', 'roles']), ['roles', 'channels', 'emojis']);
+  assert.strictEqual(B.PART_KEYS.indexOf('roles'), 0);
+  assert.ok(B.PART_KEYS.indexOf('categories') < B.PART_KEYS.indexOf('channels'));
+});
+
+const ROLE_PLAN = { create: [1, 2], update: [1], skipped: [1] };
+const CHAN_PLAN = {
+  create: [{ type: CH.GuildCategory }, { type: CH.GuildText }, { type: CH.GuildVoice }],
+  update: [{ from: { type: CH.GuildCategory } }, { from: { type: CH.GuildText } }],
+};
+const SNAP = { emojis: [{ name: 'a' }, { name: 'b' }] };
+const plan = (parts) => B.describePlan(ROLE_PLAN, CHAN_PLAN, SNAP, parts).join('\n');
+
+check('the plan describes only what was ticked', () => {
+  const roles = plan(['roles']);
+  assert.ok(/Create 2 role/.test(roles), roles);
+  assert.ok(!/channel/i.test(roles), `a roles-only restore promised channels:\n${roles}`);
+  assert.ok(!/emoji/i.test(roles), roles);
+
+  const emojis = plan(['emojis']);
+  assert.ok(/Re-upload up to 2 emoji/.test(emojis), emojis);
+  assert.ok(!/role/i.test(emojis), emojis);
+});
+
+check('categories and channels are counted apart, because they are ticked apart', () => {
+  const cats = plan(['categories']);
+  assert.ok(/Create 1 category/.test(cats), cats);
+  assert.ok(!/Create 2 channel/.test(cats), `unticking channels still promised them:\n${cats}`);
+
+  const chans = plan(['channels']);
+  assert.ok(/Create 2 channel/.test(chans), chans);
+  assert.ok(!/categor/i.test(chans), chans);
+});
+
+check('without permission rules, an existing channel is not claimed to be updated', () => {
+  // It is not. With the rules unticked the only thing left to write is a
+  // topic, and a category has not even got that.
+  const chans = plan(['channels']);
+  assert.ok(/Update the topic on 1 existing channel/.test(chans), chans);
+  assert.ok(!/permission rule/i.test(chans), chans);
+
+  const cats = plan(['categories']);
+  assert.ok(!/Update .* existing categor/.test(cats), `a category with no topic and no rules had nothing to update:\n${cats}`);
+});
+
+check('everything ticked still reads like the old plan', () => {
+  const all = plan(B.ALL_PARTS);
+  for (const re of [/Create 2 role/, /Update 1 existing role/, /Skip 1 bot/, /Create 1 category/,
+                    /Update 1 existing category/, /Create 2 channel/, /Update 1 existing channel/,
+                    /permission rules onto 5 channel/, /Re-upload up to 2 emoji/]) {
+    assert.ok(re.test(all), `${re} missing from:\n${all}`);
+  }
+  assert.ok(/Nothing is ever deleted/.test(all));
+});
+
+check('an empty selection says so rather than "already matches"', () => {
+  const none = plan([]);
+  assert.ok(/Nothing selected/.test(none), none);
+  assert.ok(!/already matches/.test(none), none);
+});
+
+check('leaving a part out is explained before the button, not after', () => {
+  const noRoles = B.partWarnings(['permissions', 'channels']).join('\n');
+  assert.ok(/matched by name/i.test(noRoles), noRoles);
+
+  const noCats = B.partWarnings(['channels']).join('\n');
+  assert.ok(/top level/i.test(noCats), noCats);
+
+  // The important one: unticking permission rules is the SAFE direction, and
+  // someone needs to know their channels keep the permissions they have.
+  const noPerms = B.partWarnings(['channels']).join('\n');
+  assert.ok(/keep the permissions they have/i.test(noPerms), noPerms);
+
+  assert.deepStrictEqual(B.partWarnings(B.ALL_PARTS), [], 'everything ticked warns about nothing');
+});
+
+check('permission rules with nothing to write them onto is called out', () => {
+  assert.ok(/nothing to write them onto/i.test(B.partWarnings(['roles', 'permissions']).join('\n')));
+});
+
+// ─── The two ways a partial restore could quietly destroy something ──────────
+
+check('the id table is built from the plan, not from what was restored', () => {
+  // Restoring "permission rules but not roles" has to find the roles that are
+  // already here — planRoles.update pairs them by name. If the caller only
+  // built the map from roles it CREATED, every rule in the snapshot would be
+  // dropped and the restore would report success.
+  const snap = {
+    sourceGuildId: GUILD,
+    roles: [B.snapshotRole(role('old1', 'Staff')), B.snapshotRole(role('old2', 'Nowhere'))],
+    channels: [],
+  };
+  const p = B.planRoles(snap, [role('new1', 'Staff')]);
+  assert.strictEqual(p.update.length, 1);
+  assert.strictEqual(p.update[0].from.id, 'old1');
+  assert.strictEqual(p.update[0].to.id, 'new1');
+
+  const idMap = new Map(p.update.map(u => [u.from.id, u.to.id]));
+  const { kept, dropped } = B.remapOverwrites(
+    [{ id: 'old1', type: 0, allow: '8', deny: '0' }, { id: 'old2', type: 0, allow: '8', deny: '0' }],
+    idMap, () => false);
+  assert.strictEqual(kept.length, 1);
+  assert.strictEqual(kept[0].id, 'new1');
+  assert.strictEqual(dropped.length, 1, 'a rule for a role that was never created was applied anyway');
+});
+
+check('unticking permission rules must skip the call, never send an empty list', () => {
+  // permissionOverwrites.set REPLACES what is on the channel. Passing [] to
+  // "leave it alone" would clear every permission on every channel in the
+  // snapshot — the one way this feature could delete something.
+  const src = require('fs').readFileSync('index.js', 'utf8');
+  // Comments in here quote the rule they are explaining, so they would satisfy
+  // this check while the code broke it.
+  const body = src.slice(src.indexOf('async function runRestore'), src.indexOf('function hasAccess'))
+    .replace(/^\s*\/\/.*$/gm, '');
+  const at = body.indexOf('await to.permissionOverwrites.set(');
+  assert.ok(at > 0, 'the overwrite write moved — re-point this check at it');
+  assert.ok(/on\('permissions'\)/.test(body.slice(at - 120, at)),
+    'the overwrite write is not behind the permissions tick');
+  assert.ok(!/permissionOverwrites\.set\(\s*\[\s*\]/.test(body), 'an empty overwrite list is being sent');
+});
+
+check('the restore honours every part it offers', () => {
+  const src = require('fs').readFileSync('index.js', 'utf8');
+  const body = src.slice(src.indexOf('async function runRestore'), src.indexOf('function hasAccess'));
+  for (const k of B.PART_KEYS) {
+    assert.ok(body.includes(`on('${k}')`), `runRestore never checks ${k} — the option would do nothing`);
+  }
+  // And the dropdown is what feeds it.
+  assert.ok(/sbparts::/.test(src), 'no what-to-restore dropdown is posted');
+  assert.ok(/sbrestore::\$\{tag\}::\$\{serverBackup\.encodeParts/.test(src),
+    'the confirm button does not carry the selection');
+});
+
 console.log(`\n${passed} checks passed`);

@@ -338,26 +338,143 @@ function channelCreatePayload(ch, parentId, overwrites) {
   return base;
 }
 
+// ─── Which parts to restore ──────────────────────────────────────────────────
+//
+// A restore used to be all of it or nothing, and the most common ask is not
+// either of those: "put the ROLES back, leave my channels alone." A snapshot
+// already counts five separate things on the way in, so those five are what it
+// can put back one at a time.
+//
+// They are not independent, though, and the dependencies are the reason this is
+// one selector with warnings attached rather than five separate commands:
+//
+//   • Permission rules are written in terms of ROLES. Restoring them without
+//     the roles is legal and sometimes exactly right — the roles are already
+//     here, only the channel permissions were wrecked — but any rule naming a
+//     role this server does not have is dropped, because an id from the old
+//     guild is not a hint, it is a number that means something else here.
+//
+//   • A channel's parent is a CATEGORY. Restore channels without categories and
+//     anything whose category is missing is created at the top level.
+//
+//   • Leaving permission rules OUT is the safe direction, not the risky one:
+//     `permissionOverwrites.set` is the single call in this whole feature that
+//     removes anything. Unticking it means existing channels keep exactly the
+//     permissions they have now.
+const PART = {
+  roles:       { code: 'R', label: 'Roles',            emoji: '🎭', hint: 'Names, colours, permissions. Bot roles are skipped.' },
+  categories:  { code: 'C', label: 'Categories',       emoji: '📂', hint: 'The category headers channels live under.' },
+  channels:    { code: 'H', label: 'Channels',         emoji: '💬', hint: 'Text, voice, forum. Never any messages.' },
+  permissions: { code: 'P', label: 'Permission rules', emoji: '🔒', hint: 'Who can see and do what, per channel.' },
+  emojis:      { code: 'E', label: 'Emojis',           emoji: '😀', hint: 'Re-uploaded by name; existing ones are left alone.' },
+};
+const PART_KEYS = Object.keys(PART);
+const ALL_PARTS = PART_KEYS.slice();
+const CODE_TO_PART = new Map(PART_KEYS.map(k => [PART[k].code, k]));
+
+// Packed into a button's customId — there is no session store here on purpose,
+// so the choice has to survive in the 100 characters Discord allows.
+const encodeParts = (parts) => normalizeParts(parts).map(k => PART[k].code).join('');
+
+// Unknown codes are ignored rather than throwing: a button from a message
+// posted before a part existed should still restore the parts it does name.
+const decodeParts = (s) => {
+  const out = [];
+  for (const ch of String(s || '')) {
+    const k = CODE_TO_PART.get(ch);
+    if (k && !out.includes(k)) out.push(k);
+  }
+  return out;
+};
+
+// null/undefined means "everything" — that is what a restore was before this
+// existed, and what an old button with no parts segment still means. An empty
+// LIST is a real, different answer (nothing selected) and stays empty.
+function normalizeParts(parts) {
+  if (parts == null) return ALL_PARTS.slice();
+  const want = new Set(Array.isArray(parts) ? parts : decodeParts(parts));
+  return PART_KEYS.filter(k => want.has(k));
+}
+
+const hasPart = (parts, key) => normalizeParts(parts).includes(key);
+
 /**
  * A snapshot restored into a server that is not empty can be a big change, and
  * the person clicking it deserves the number before it happens rather than a
  * progress log afterwards.
+ *
+ * Every line is filtered by what was actually ticked — a plan that promises to
+ * create 66 channels when only "Roles" is selected is worse than no plan.
  */
-function describePlan(rolePlan, channelPlan, snap) {
+function describePlan(rolePlan, channelPlan, snap, parts) {
+  const sel = normalizeParts(parts);
+  const on = (k) => sel.includes(k);
   const lines = [];
   const n = (x) => String(x);
-  if (rolePlan.create.length) lines.push(`Create ${n(rolePlan.create.length)} role(s)`);
-  if (rolePlan.update.length) lines.push(`Update ${n(rolePlan.update.length)} existing role(s)`);
-  if (rolePlan.skipped.length) lines.push(`Skip ${n(rolePlan.skipped.length)} bot/integration role(s)`);
-  const newCats = channelPlan.create.filter(c => c.type === CH.GuildCategory).length;
+  const isCat = (c) => c.type === CH.GuildCategory;
+
+  if (on('roles')) {
+    if (rolePlan.create.length) lines.push(`Create ${n(rolePlan.create.length)} role(s)`);
+    if (rolePlan.update.length) lines.push(`Update ${n(rolePlan.update.length)} existing role(s)`);
+    if (rolePlan.skipped.length) lines.push(`Skip ${n(rolePlan.skipped.length)} bot/integration role(s)`);
+  }
+
+  const newCats = channelPlan.create.filter(isCat).length;
   const newChs = channelPlan.create.length - newCats;
-  if (newCats) lines.push(`Create ${n(newCats)} categor(y/ies)`);
-  if (newChs) lines.push(`Create ${n(newChs)} channel(s)`);
-  if (channelPlan.update.length) lines.push(`Update ${n(channelPlan.update.length)} existing channel(s)`);
-  if ((snap.emojis || []).length) lines.push(`Re-upload up to ${n(snap.emojis.length)} emoji(s)`);
-  if (!lines.length) lines.push('Nothing to do — this server already matches the snapshot.');
+  const oldCats = channelPlan.update.filter(u => isCat(u.from)).length;
+  const oldChs = channelPlan.update.length - oldCats;
+
+  if (on('categories')) {
+    if (newCats) lines.push(`Create ${n(newCats)} categor${newCats === 1 ? 'y' : 'ies'}`);
+    // A category has no topic. With the permission rules unticked there is
+    // nothing left for an existing one to be updated WITH, so saying it would
+    // be updated would be a lie.
+    if (oldCats && on('permissions')) lines.push(`Update ${n(oldCats)} existing categor${oldCats === 1 ? 'y' : 'ies'}`);
+  }
+  if (on('channels')) {
+    if (newChs) lines.push(`Create ${n(newChs)} channel(s)`);
+    if (oldChs) {
+      lines.push(on('permissions')
+        ? `Update ${n(oldChs)} existing channel(s)`
+        : `Update the topic on ${n(oldChs)} existing channel(s)`);
+    }
+  }
+  if (on('permissions')) {
+    const touched = (on('categories') ? newCats + oldCats : 0) + (on('channels') ? newChs + oldChs : 0);
+    if (touched) lines.push(`Write the snapshot's permission rules onto ${n(touched)} channel(s)`);
+  }
+  if (on('emojis') && (snap.emojis || []).length) lines.push(`Re-upload up to ${n(snap.emojis.length)} emoji(s)`);
+
+  if (!lines.length) {
+    lines.push(sel.length
+      ? 'Nothing to do — this server already matches the snapshot.'
+      : 'Nothing selected — tick at least one thing to restore.');
+  }
   lines.push('Nothing is ever deleted.');
   return lines;
+}
+
+/**
+ * What the parts left UNTICKED will do to the parts that were ticked. Said
+ * before the button, because every one of these reads as a bug afterwards.
+ */
+function partWarnings(parts) {
+  const sel = normalizeParts(parts);
+  const on = (k) => sel.includes(k);
+  const out = [];
+  if (on('permissions') && !on('roles')) {
+    out.push('**Permission rules** without **Roles**: a rule naming a role this server does not already have is dropped. Ids are meaningless across servers, so roles are matched by name.');
+  }
+  if (on('channels') && !on('categories')) {
+    out.push('**Channels** without **Categories**: a new channel whose category is missing here is created at the top level.');
+  }
+  if (!on('permissions') && (on('channels') || on('categories'))) {
+    out.push('**Permission rules** left out: existing channels keep the permissions they have right now — only topics are written. New channels inherit from their category.');
+  }
+  if (on('permissions') && !on('channels') && !on('categories')) {
+    out.push('**Permission rules** with no channels selected: there is nothing to write them onto.');
+  }
+  return out;
 }
 
 module.exports = {
@@ -367,4 +484,5 @@ module.exports = {
   planRoles, planChannels, orderChannelsForCreation,
   remapOverwrites, maskPermissions, namePermissions,
   channelCreatePayload, describePlan,
+  PART, PART_KEYS, ALL_PARTS, encodeParts, decodeParts, normalizeParts, hasPart, partWarnings,
 };

@@ -1968,11 +1968,88 @@ function getProductColor(name) {
 // Someone running this is usually rebuilding a server that is already gone,
 // and "12 of 40 channels, then an error" is the worst outcome available. Every
 // step is caught individually and the failures are reported at the end.
-async function runRestore(interaction, snapId, allowOther) {
+//
+// The confirmation screen, built in one place because it is rendered twice:
+// once by `/serverbackup restore`, and again every time the what-to-restore
+// dropdown is touched. Re-planning against the live guild on each change costs
+// a fetch and buys the numbers being true for the CURRENT selection — a plan
+// that still says "create 66 channels" after unticking channels is worse than
+// no plan at all.
+//
+// Nothing is remembered between the two: the choice rides in the button's
+// customId, so a confirmation left open across a restart still works.
+async function buildRestoreConfirm(guild, row, snapId, allowOther, parts) {
+  const sel = serverBackup.normalizeParts(parts);
+  const snap = row.data;
+
+  await guild.roles.fetch();
+  await guild.channels.fetch();
+  const liveRoles = [...guild.roles.cache.values()];
+  const liveChannels = [...guild.channels.cache.values()].filter(c => !serverBackup.THREAD_TYPES.has(c.type));
+  const catNameOf = (c) => {
+    const p = c.parentId ? guild.channels.cache.get(c.parentId) : null;
+    return p ? p.name : null;
+  };
+  const rolePlan = serverBackup.planRoles(snap, liveRoles);
+  const chanPlan = serverBackup.planChannels(snap, liveChannels, catNameOf);
+  const lines = serverBackup.describePlan(rolePlan, chanPlan, snap, sel);
+  const warnings = serverBackup.partWarnings(sel);
+
+  const embed = new EmbedBuilder()
+    .setColor(0xffa500)
+    .setTitle('⚠️ Restore — read this first')
+    .setDescription(`Snapshot \`${snapId}\` from **${row.guild_name}**\ninto **${guild.name}**`)
+    .addFields(
+      { name: 'Restoring', value: sel.length
+        ? sel.map(k => `${serverBackup.PART[k].emoji} ${serverBackup.PART[k].label}`).join(' · ')
+        : '_nothing selected_' },
+      { name: 'What will happen', value: lines.map(l => `• ${l}`).join('\n').slice(0, 1024) },
+    );
+  if (warnings.length) {
+    embed.addFields({ name: 'What that leaves out', value: warnings.map(w => `• ${w}`).join('\n').slice(0, 1024) });
+  }
+  embed.setFooter({ text: 'Matching is by name. Existing roles and channels are updated in place — nothing is deleted.' });
+
+  const tag = `${snapId}::${allowOther ? '1' : '0'}`;
+  return {
+    embeds: [embed],
+    components: [
+      new ActionRowBuilder().addComponents(new StringSelectMenuBuilder()
+        .setCustomId(`sbparts::${tag}`)
+        .setPlaceholder('What do you want to restore?')
+        .setMinValues(1)
+        .setMaxValues(serverBackup.PART_KEYS.length)
+        .addOptions(serverBackup.PART_KEYS.map(k => ({
+          label: serverBackup.PART[k].label,
+          value: k,
+          emoji: serverBackup.PART[k].emoji,
+          description: serverBackup.PART[k].hint.slice(0, 100),
+          default: sel.includes(k),
+        })))),
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`sbrestore::${tag}::${serverBackup.encodeParts(sel)}`)
+          .setLabel(sel.length === serverBackup.PART_KEYS.length ? 'Restore everything' : `Restore ${sel.length} selected`)
+          .setStyle(ButtonStyle.Danger).setDisabled(!sel.length),
+        new ButtonBuilder().setCustomId('sbrestore_cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+      ),
+    ],
+  };
+}
+
+//
+// `parts` is which of the five things the operator ticked — roles, categories,
+// channels, permission rules, emojis. Null means all of them, which is what a
+// restore was before the selector existed and what an old button still means.
+async function runRestore(interaction, snapId, allowOther, parts) {
   const guild = interaction.guild;
+  const sel = serverBackup.normalizeParts(parts);
+  const on = (k) => sel.includes(k);
+  if (!sel.length) {
+    return interaction.update({ embeds: [], components: [], content: 'Nothing was selected, so nothing was changed.' });
+  }
   await interaction.update({
     embeds: [new EmbedBuilder().setColor(0x5865F2).setTitle('⏳ Restoring…')
-      .setDescription('Creating roles first, then categories, then channels. This can take a minute.')],
+      .setDescription(`Restoring **${sel.map(k => serverBackup.PART[k].label.toLowerCase()).join('**, **')}**. This can take a minute.`)],
     components: [],
   });
 
@@ -2003,6 +2080,12 @@ async function runRestore(interaction, snapId, allowOther) {
     // ── Roles ──
     // Highest first, so Discord's own clamping (nothing above the bot's top
     // role) at least preserves the relative order of what it can place.
+    //
+    // The PLAN is built whether or not roles were ticked, and that is the
+    // point: it is also the old-id → new-id table every permission rule is
+    // remapped through. Restoring "permissions but not roles" still has to
+    // find the roles that are already here, by name — the alternative is
+    // dropping every rule in the snapshot and calling it a success.
     const rolePlan = serverBackup.planRoles(snap, [...guild.roles.cache.values()]);
     const idMap = new Map();
     let rolesMade = 0, rolesUpdated = 0;
@@ -2010,6 +2093,7 @@ async function runRestore(interaction, snapId, allowOther) {
 
     for (const { from, to, everyone } of rolePlan.update) {
       idMap.set(from.id, to.id);
+      if (!on('roles')) continue;
       const { granted, missing } = serverBackup.maskPermissions(from.permissions, botPerms);
       if (BigInt(missing)) serverBackup.namePermissions(missing, PermissionFlagsBits).forEach(p => permsDropped.add(p));
       try {
@@ -2022,7 +2106,10 @@ async function runRestore(interaction, snapId, allowOther) {
       } catch (err) { note(`role "${from.name}"`, err); }
     }
 
-    for (const from of rolePlan.create) {
+    // A role that is not here and is not being created stays out of the id
+    // table, so the rules naming it are dropped and counted rather than aimed
+    // at whatever that id means in this server.
+    for (const from of (on('roles') ? rolePlan.create : [])) {
       const { granted, missing } = serverBackup.maskPermissions(from.permissions, botPerms);
       if (BigInt(missing)) serverBackup.namePermissions(missing, PermissionFlagsBits).forEach(p => permsDropped.add(p));
       try {
@@ -2062,22 +2149,34 @@ async function runRestore(interaction, snapId, allowOther) {
       return kept.map(o => ({ id: o.id, allow: BigInt(o.allow) & botPerms, deny: BigInt(o.deny) & botPerms }));
     };
 
+    // Which of the two channel kinds the operator asked for. A category is a
+    // channel to Discord and a heading to everyone else, and they are ticked
+    // separately because "put my categories back" and "put my 66 channels
+    // back" are different sizes of decision.
+    const wanted = (c) => (c.type === serverBackup.CH.GuildCategory ? on('categories') : on('channels'));
+
     for (const { from, to } of chanPlan.update) {
+      if (!wanted(from)) continue;
       try {
         // permissionOverwrites.set REPLACES the channel's overwrites with this
         // list. That is intended — the snapshot IS the intended permission
-        // state — but it is also the one place a restore removes something, so
-        // it is confined to channels the snapshot actually describes.
-        await to.permissionOverwrites.set(overwritesFor(from), `Snapshot ${snapId} restore`);
+        // state — but it is also the one place in this whole feature that
+        // removes anything, which is exactly why it is its own tick box. With
+        // permission rules unticked the call is not made at all: passing the
+        // empty list would clear the channel instead of leaving it alone.
+        if (on('permissions')) {
+          await to.permissionOverwrites.set(overwritesFor(from), `Snapshot ${snapId} restore`);
+        }
         if (from.topic != null && 'setTopic' in to) { try { await to.setTopic(from.topic); } catch (_) {} }
         chansUpdated++;
       } catch (err) { note(`channel "#${from.name}"`, err); }
     }
 
     for (const ch of chanPlan.create) {
+      if (!wanted(ch)) continue;
       try {
         const parentId = ch.parentName ? (catByName.get(ch.parentName) || null) : null;
-        const payload = serverBackup.channelCreatePayload(ch, parentId, overwritesFor(ch));
+        const payload = serverBackup.channelCreatePayload(ch, parentId, on('permissions') ? overwritesFor(ch) : []);
         payload.reason = `Snapshot ${snapId} restore by ${interaction.user.tag}`;
         const made = await guild.channels.create(payload);
         if (ch.type === serverBackup.CH.GuildCategory) catByName.set(ch.name, made.id);
@@ -2091,7 +2190,7 @@ async function runRestore(interaction, snapId, allowOther) {
     // slot list is a limit, not an error worth stopping for.
     let emojisMade = 0;
     const haveEmoji = new Set([...guild.emojis.cache.values()].map(e => e.name));
-    for (const e of (snap.emojis || [])) {
+    for (const e of (on('emojis') ? (snap.emojis || []) : [])) {
       if (haveEmoji.has(e.name)) continue;
       try { await guild.emojis.create({ attachment: e.url, name: e.name }); emojisMade++; }
       catch (err) { note(`emoji :${e.name}:`, err); break; }   // out of slots — the rest will fail the same way
@@ -2100,12 +2199,21 @@ async function runRestore(interaction, snapId, allowOther) {
     const out = new EmbedBuilder()
       .setColor(problems.length ? 0xffa500 : 0x00d26a)
       .setTitle(problems.length ? '⚠️ Restore finished with some skips' : '✅ Restore finished')
-      .setDescription(`Snapshot \`${snapId}\` → **${guild.name}**`)
-      .addFields(
-        { name: 'Roles', value: `${rolesMade} created · ${rolesUpdated} updated`, inline: true },
-        { name: 'Channels', value: `${chansMade} created · ${chansUpdated} updated`, inline: true },
-        { name: 'Emojis', value: `${emojisMade} added`, inline: true },
-      );
+      .setDescription(`Snapshot \`${snapId}\` → **${guild.name}**`);
+    // Only what was asked for. A "Roles: 0 created · 0 updated" line under a
+    // channels-only restore reads as a failure rather than as a choice.
+    if (on('roles')) out.addFields({ name: '🎭 Roles', value: `${rolesMade} created · ${rolesUpdated} updated`, inline: true });
+    if (on('categories') || on('channels')) {
+      out.addFields({ name: '💬 Channels', value: `${chansMade} created · ${chansUpdated} updated`, inline: true });
+    }
+    if (on('emojis')) out.addFields({ name: '😀 Emojis', value: `${emojisMade} added`, inline: true });
+    // Named, so a restore run twice with different ticks is readable after the
+    // fact — the embed is the only record of which one this was.
+    out.addFields({ name: 'Restored', value: sel.map(k => serverBackup.PART[k].label).join(' · ') });
+    if (!on('permissions') && (on('channels') || on('categories'))) {
+      out.addFields({ name: 'Permission rules were not restored',
+        value: 'Every channel kept the permissions it already had — this run only created what was missing and wrote topics.' });
+    }
     if (permsDropped.size) {
       // Named, not counted. "Two permissions were dropped" sends someone
       // hunting; the list tells them whether it mattered.
@@ -2866,7 +2974,7 @@ const ownCommands = [
     .addSubcommand(sub => sub.setName('list').setDescription('List saved snapshots'))
     .addSubcommand(sub => sub.setName('view').setDescription('Show exactly what is inside a snapshot')
       .addStringOption(o => o.setName('id').setDescription('Snapshot ID (from /serverbackup list)').setRequired(true)))
-    .addSubcommand(sub => sub.setName('restore').setDescription('Rebuild this server from a snapshot — never deletes anything')
+    .addSubcommand(sub => sub.setName('restore').setDescription('Rebuild this server from a snapshot — pick what to put back, never deletes anything')
       .addStringOption(o => o.setName('id').setDescription('Snapshot ID (from /serverbackup list)').setRequired(true))
       // Cross-guild restore is the disaster case: the snapshot was taken in
       // the server that is now gone, and is being poured into a fresh one.
@@ -3619,7 +3727,7 @@ client.on('interactionCreate', async interaction => {
             { name: '📦 Products & Downloads', value: '`/product-info` — Look up any product: price, plans, stock, features\n`/downloads` — Browse & download products\n`/setupdownloads` — Post download panel to #downloads\n`/setdownload` — Set a product download link', inline: false },
             { name: '📣 Updates & Status', value: '`/postupdate` — Post a product update\n`/statusupdate` — Post a status update\n`/announce` — Send a custom announcement', inline: false },
             { name: '🌐 Server Setup', value: '`/setup-website` — Post the website panel\n`/setup-payments` — Post the payment methods panel (live fees)\n`/setupreseller` — Post reseller panel\n`/setresellerlinks` — Update reseller button links\n`/postimage` — Post an image', inline: false },
-            { name: '💾 Server Snapshots', value: '`/serverbackup create` — Save the server\'s roles, channels & permissions\n`/serverbackup list|view|export` — Browse or download a snapshot\n`/serverbackup restore` — Rebuild from one (never deletes anything)', inline: false },
+            { name: '💾 Server Snapshots', value: '`/serverbackup create` — Save the server\'s roles, channels & permissions\n`/serverbackup list|view|export` — Browse or download a snapshot\n`/serverbackup restore` — Rebuild from one: tick roles / categories / channels / permissions / emojis (never deletes anything)', inline: false },
             { name: '🔁 Cross-Server Mirroring', value: '`/mirror follow` — Announcement channels: let another server follow this one (Discord delivers it)\n`/mirror add` — Any channel: relay its posts into another server\n`/mirror list|remove|test` — Manage the relays\n`/mirror panic` — Stop everything arriving here, right now\n`/mirror block|unblock|resume` — Refuse a server outright, or restart a paused route', inline: false },
             { name: '🎫 Support Tickets', value: '`/panel` — Post the support panel\n`/clearlogs` — Clear ticket log channel\n`/reply` — Reply to a user\'s ticket', inline: false },
             { name: '📝 Vouches', value: '`/setupvouch` — Post the Leave a Vouch panel\n`/exportvouches` — Download a backup of all vouches\n`/importvouches` — Restore vouches from a backup file, or `source: website`', inline: false },
@@ -5027,34 +5135,10 @@ client.on('interactionCreate', async interaction => {
             });
           }
 
-          const snap = row.data;
-          await interaction.guild.roles.fetch();
-          await interaction.guild.channels.fetch();
-
-          const liveRoles = [...interaction.guild.roles.cache.values()];
-          const liveChannels = [...interaction.guild.channels.cache.values()]
-            .filter(c => !serverBackup.THREAD_TYPES.has(c.type));
-          const catNameOf = (c) => {
-            const p = c.parentId ? interaction.guild.channels.cache.get(c.parentId) : null;
-            return p ? p.name : null;
-          };
-          const rolePlan = serverBackup.planRoles(snap, liveRoles);
-          const chanPlan = serverBackup.planChannels(snap, liveChannels, catNameOf);
-          const lines = serverBackup.describePlan(rolePlan, chanPlan, snap);
-
-          const confirmId = `sbrestore::${snapId}::${allowOther ? '1' : '0'}`;
-          return interaction.editReply({
-            embeds: [new EmbedBuilder()
-              .setColor(0xffa500)
-              .setTitle('⚠️ Restore — read this first')
-              .setDescription(`Snapshot \`${snapId}\` from **${row.guild_name}**\ninto **${interaction.guild.name}**`)
-              .addFields({ name: 'What will happen', value: lines.map(l => `• ${l}`).join('\n').slice(0, 1024) })
-              .setFooter({ text: 'Matching is by name. Existing roles and channels are updated in place.' })],
-            components: [new ActionRowBuilder().addComponents(
-              new ButtonBuilder().setCustomId(confirmId).setLabel('Restore now').setStyle(ButtonStyle.Danger),
-              new ButtonBuilder().setCustomId('sbrestore_cancel').setLabel('Cancel').setStyle(ButtonStyle.Secondary),
-            )],
-          });
+          // Everything ticked to begin with — the old behaviour is still the
+          // default, and untick is a deliberate act.
+          return interaction.editReply(
+            await buildRestoreConfirm(interaction.guild, row, snapId, allowOther, serverBackup.ALL_PARTS));
         }
 
         return interaction.editReply({ content: '❌ Unknown subcommand.' });
@@ -6130,6 +6214,22 @@ client.on('interactionCreate', async interaction => {
         });
       }
 
+      // What to restore from a snapshot. Re-renders the confirmation with the
+      // new selection: the numbers in it are re-planned against the live guild
+      // so they describe what the button under them will actually do, and the
+      // choice is carried in that button's customId rather than in a Map here.
+      if (interaction.customId.startsWith('sbparts::')) {
+        if (!interaction.member || !interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
+          return interaction.reply({ content: '❌ Administrator only.', flags: 64 });
+        }
+        const [, snapId, allowOther] = interaction.customId.split('::');
+        await interaction.deferUpdate();
+        const { rows } = await db.query('SELECT * FROM guild_snapshots WHERE id = $1', [snapId]);
+        if (!rows[0]) return interaction.editReply({ embeds: [], components: [], content: `❌ Snapshot \`${snapId}\` is gone.` });
+        return interaction.editReply(
+          await buildRestoreConfirm(interaction.guild, rows[0], snapId, allowOther === '1', interaction.values));
+      }
+
       // /product-info's category → product pair. Both live in the module so the
       // browse panel posted into a channel keeps working across restarts with
       // no state here at all.
@@ -6216,8 +6316,11 @@ client.on('interactionCreate', async interaction => {
         if (!member.permissions.has(PermissionFlagsBits.Administrator)) {
           return interaction.reply({ content: '❌ Administrator only.', flags: 64 });
         }
-        const [, snapId, allowOther] = customId.split('::');
-        return runRestore(interaction, snapId, allowOther === '1');
+        // A fourth segment is what to restore. A button from before the
+        // selector existed has three, and `null` there means everything —
+        // which is exactly what that button promised when it was posted.
+        const [, snapId, allowOther, parts] = customId.split('::');
+        return runRestore(interaction, snapId, allowOther === '1', parts == null ? null : serverBackup.decodeParts(parts));
       }
 
       const btnSettings = await getGuildSettings(guild.id);
