@@ -26,6 +26,7 @@ const {
   ButtonStyle, PermissionFlagsBits,
 } = require('discord.js');
 const axios = require('axios');
+const { languageRow } = require('./translate');
 
 const BACKEND_URL = (process.env.BACKEND_URL || process.env.API_URL || 'http://localhost:3000').replace(/\/+$/, '');
 const SITE_URL    = (process.env.SITE_URL || 'https://uhservices.xyz').replace(/\/+$/, '');
@@ -316,9 +317,19 @@ async function handleStorefrontCommand(interaction, { findChannel }) {
   const url = isSite ? (interaction.options.getString('url') || '').trim() : '';
   const site = url && !/^https?:\/\//.test(url) ? `https://${url}` : url;
 
-  const payload = isSite
+  const built = isSite
     ? buildWebsitePanel(interaction.guild, cfg, site)
     : buildPaymentPanel(interaction.guild, cfg, site);
+
+  // The language dropdown, same as /announce and the TOS posts carry. These two
+  // were the panels a non-English customer is most likely to be standing in
+  // front of — how to pay, and where the shop is — and they were the two with
+  // no way to read them. Each builds one action row, so the second is free;
+  // guarded anyway, because five is a hard cap and exceeding it rejects the
+  // whole message rather than dropping the extra row.
+  const payload = built.components && built.components.length >= 5
+    ? built
+    : { ...built, components: [...(built.components || []), languageRow()] };
 
   try {
     const { edited } = await upsertPanel(channel, isSite ? MARK_SITE : MARK_PAY, payload, interaction.client.user);

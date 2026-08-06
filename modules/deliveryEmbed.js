@@ -130,7 +130,14 @@ function buildDeliveryEmbed({ items = [], invoiceNo = null, orderId = null, emai
     embed.addFields({ name: '📦 Product', value: clip(it.product, LIMIT.value), inline: true });
     if (it.tier || it.qty > 1) {
       embed.addFields({
-        name: '⏳ Plan',
+        // "Plan" not "Duration" was the obvious label and the wrong one. This
+        // embed gets machine-translated for buyers who picked another
+        // language, and a translator handed the single word "Plan" with no
+        // sentence around it reads it as the VERB: the Spanish DM came out
+        // "⏳ Planificar" — "to make plans". "Duration" has no verb sense to
+        // fall into and comes back "Duración". The cheapest fix for a bad
+        // translation is usually a less ambiguous source string.
+        name: '⏳ Duration',
         value: clip(it.tier ? (it.qty > 1 ? `${it.tier} • ×${it.qty}` : it.tier) : `×${it.qty}`, LIMIT.value),
         inline: true,
       });

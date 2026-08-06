@@ -9,6 +9,9 @@ const {
 const fs   = require('fs');
 const path = require('path');
 const db   = require('../db');
+// The language dropdown, appended to the support panel so a member who does
+// not read English can at least read the button labels' explanation.
+const { languageRow } = require('./translate');
 
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..');
 if (DATA_DIR !== path.join(__dirname, '..') && !fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -249,7 +252,7 @@ async function handleInteraction(interaction, client) {
       new ButtonBuilder().setCustomId('support_rankboost').setLabel('⚡ Rank Boosting').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('support_general').setLabel('🎮 Support').setStyle(ButtonStyle.Primary),
     );
-    await interaction.channel.send({ embeds: [embed], components: [row] });
+    await interaction.channel.send({ embeds: [embed], components: [row, languageRow()] });
     await interaction.editReply({ content: '✅ Panel posted!' });
     return true;
   }

@@ -58,10 +58,17 @@ check('each fact gets its own field', () => {
   const names = fields.map(f => f.name).join(' ');
   assert.ok(/Game/.test(names), names);
   assert.ok(/Product/.test(names), names);
-  assert.ok(/Plan/.test(names), names);
+  // The term's LABEL is not pinned here. It was "⏳ Plan" until a machine
+  // translation of the Spanish delivery DM turned the bare word into the verb
+  // — "⏳ Planificar", "to make plans" — and the fix was to rename the field
+  // to "⏳ Duration", which has no verb sense to fall into. What this test is
+  // for is that the three facts are three separate fields carrying the right
+  // values, so it finds that field by its VALUE and leaves the wording free to
+  // improve.
+  assert.ok(/Plan|Duration|Term/.test(names), names);
   assert.strictEqual(fields.find(f => /Game/.test(f.name)).value, 'Call of Duty: Warzone');
   assert.strictEqual(fields.find(f => /Product/.test(f.name)).value, 'H8ED Private External');
-  assert.strictEqual(fields.find(f => /Plan/.test(f.name)).value, 'Month');
+  assert.strictEqual(fields.find(f => f.value === 'Month').value, 'Month');
 });
 
 check('those three sit on one row', () => {

@@ -21,6 +21,7 @@ const fs   = require('fs');
 const path = require('path');
 const db   = require('../db');
 const { logGeneration } = require('./genLog');
+const { languageRow } = require('./translate');
 
 // ─── Order persistence ────────────────────────────────────────────────────────
 // Buying a number spends REAL provider credit. Orders used to live only in the
@@ -822,7 +823,7 @@ async function handleSMSInteraction(interaction, client) {
   if (interaction.commandName === 'post-smsgen') {
     await interaction.deferReply({ ephemeral: true });
     const target = interaction.options.getChannel('channel') || interaction.channel;
-    await target.send({ embeds: [buildPanelEmbed()], components: [buildPanelButton()] });
+    await target.send({ embeds: [buildPanelEmbed()], components: [buildPanelButton(), languageRow()] });
     return interaction.editReply({ content: `✅ SMS Gen panel posted in <#${target.id}>` });
   }
 

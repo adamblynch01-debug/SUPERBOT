@@ -22,7 +22,7 @@ const crypto = require('crypto');
 const { EmbedBuilder } = require('discord.js');
 const { query } = require('../db');
 const { registerWebTicketRoutes } = require('./webTickets');
-const { getUserLang, translateEmbeds, DEFAULT_LANG } = require('./translate');
+const { getUserLang, translateEmbeds, languageRow, DEFAULT_LANG } = require('./translate');
 // The buyer's DM is rendered here and nowhere else — /manual-order-delivery
 // calls the same function, which is what keeps the two deliveries identical.
 const { buildDeliveryEmbed, gameWorthShowing } = require('./deliveryEmbed');
@@ -46,6 +46,25 @@ async function localizeForBuyer(discordId, guildId, embeds, protect) {
     console.warn('[Internal] delivery DM translation skipped:', err.message);
     return embeds;
   }
+}
+
+// The whole DM: the embeds in the buyer's language, plus the dropdown to
+// CHANGE that language.
+//
+// Until now the dropdown only ever went on server posts, so the language a
+// buyer picked once under some announcement followed them into every order DM
+// afterwards with no control anywhere to undo it. "Users still receive their
+// order in Spanish" was not a translation bug — it was a preference nobody
+// could reach. Scoped to this guild so a choice made in the DM is remembered
+// where the lookup above will find it.
+async function buyerDmPayload(discordId, guildId, embeds, protect) {
+  const scope = guildId || process.env.GUILD_ID || 'dm';
+  let lang = null;
+  try { lang = await getUserLang(scope, String(discordId)); } catch (_) { /* dropdown still ships */ }
+  return {
+    embeds: await localizeForBuyer(discordId, guildId, embeds, protect),
+    components: [languageRow(lang, scope)],
+  };
 }
 
 // Discord's hard caps. Exceeding any one rejects the WHOLE message, so
@@ -471,7 +490,7 @@ function registerInternalRoutes(app, client) {
         if (delivered > 0) {
           try {
             const user = await client.users.fetch(String(discord_id));
-            await user.send({ embeds: await localizeForBuyer(discord_id, guild_id, [embed], protect) });
+            await user.send(await buyerDmPayload(discord_id, guild_id, [embed], protect));
             out.dm = true;
             console.log(`[Internal] Delivered goods to Discord user ${discord_id}`);
           } catch (err) {

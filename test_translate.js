@@ -47,9 +47,21 @@ require.cache[dbPath] = {
         store.translations.set(`${p[0]}:${p[1]}`, p[3]);
         return { rows: [] };
       }
-      if (/SELECT lang FROM user_locales/.test(t)) {
-        const v = store.locales.get(`${p[0]}:${p[1]}`);
-        return { rows: v === undefined ? [] : [{ lang: v }] };
+      // Matched on the TABLE, not on the select list. Pinning the list is what
+      // broke this stub the moment the read grew a guild_id column and a
+      // fallback scope: the regex stopped matching, every lookup fell through
+      // to `{ rows: [] }`, and three tests failed reading "a saved choice is
+      // not remembered" — which is a real bug's symptom, produced by a stale
+      // stub. It answers the scopes the query actually asks for instead.
+      if (/FROM user_locales/.test(t)) {
+        const [scope, userId, alt] = p;
+        const scopes = alt === undefined ? [scope] : [scope, alt];
+        const rows = [];
+        for (const g of scopes) {
+          const v = store.locales.get(`${g}:${userId}`);
+          if (v !== undefined) rows.push({ guild_id: g, lang: v });
+        }
+        return { rows };
       }
       if (/INSERT INTO user_locales/.test(t)) {
         store.locales.set(`${p[0]}:${p[1]}`, p[2]);
@@ -288,6 +300,24 @@ async function check(name, fn) {
     assert.strictEqual(await T.getUserLang('g1', 'u1'), 'pt');
     assert.strictEqual(await T.setUserLang('g1', 'u2', 'klingon'), false);
     assert.strictEqual(await T.getUserLang('g1', 'u2'), null);
+  });
+
+  // The bug the user reported as "users still receive their order in Spanish":
+  // a language is a property of the PERSON, and the table was keyed by guild.
+  // A choice made under a post in one server was invisible to the delivery DM
+  // that looked it up by another — so the preference existed, applied
+  // somewhere, and could not be reached from where it hurt.
+  await check('a language chosen in one place is read in every other', async () => {
+    assert.strictEqual(await T.setUserLang('g1', 'traveller', 'de'), true);
+    assert.strictEqual(await T.getUserLang('g2', 'traveller'), 'de', 'another guild must see it');
+    assert.strictEqual(await T.getUserLang('dm', 'traveller'), 'de', 'a DM must see it');
+  });
+
+  await check('the guild a choice was made in still wins where it was made', async () => {
+    await T.setUserLang('g1', 'local', 'de');
+    await T.setUserLang('g2', 'local', 'fr');
+    assert.strictEqual(await T.getUserLang('g1', 'local'), 'de', 'the older scoped row stands');
+    assert.strictEqual(await T.getUserLang('g3', 'local'), 'fr', 'elsewhere, the newest choice');
   });
 
   await check('someone who has never chosen gets their Discord client language', async () => {

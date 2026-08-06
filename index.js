@@ -54,6 +54,10 @@ const {
   commands: storefrontCommands, handleStorefrontCommand, handleStorefrontButton, setStorefrontGate,
   buildWebsitePanel, storeConfig: storefrontConfig, upsertPanel, MARK_SITE,
 } = require('./modules/storefrontPanels');
+const {
+  commands: productInfoCommands, handleProductInfoCommand, handleProductInfoSelect,
+  setProductInfoGate,
+} = require('./modules/productInfo');
 const translate = require('./modules/translate');
 const { offerImageUpload } = require('./modules/imageAttach');
 const { makeStaffRoleResolver } = require('./modules/staffRoles');
@@ -649,6 +653,10 @@ setManualAccessGate({ hasAccess: (i) => hasAccess(i) });
 // Same gate for the storefront panels. Posting one rewrites a channel every
 // member reads, so it is staff-only for the same reason /post-tos is.
 setStorefrontGate({ hasAccess: (i) => hasAccess(i) });
+// /product-info is public — looking a price up is what customers are here for.
+// The gate covers only its `channel:` option, which posts a panel into a room
+// everybody reads.
+setProductInfoGate({ hasAccess: (i) => hasAccess(i) });
 
 setSMSAccessGate({
   canAccess:     canAccessStock,
@@ -1084,11 +1092,12 @@ async function redeemKey(interaction, rawKeyInput) {
     return interaction.reply({ content: '❌ The role tied to this key no longer exists — contact staff.', flags: 64 });
   }
 
-  try {
-    await interaction.member.roles.add(role);
-  } catch (e) {
-    console.error('[keys] redeem role add error:', e);
-    return interaction.reply({ content: '❌ Could not assign the role — contact staff.', flags: 64 });
+  // Same helper the verify button and the claim panel use: "contact staff" is
+  // not an answer when the cause is a role order only an admin can fix, and
+  // the person being told to contact staff is often the admin.
+  const roleWhy = await assignRole(interaction.member, role, 'Key redeemed');
+  if (roleWhy) {
+    return interaction.reply({ content: `❌ Could not assign **${role.name}** — ${roleWhy}`, flags: 64 });
   }
 
   const now = Date.now();
@@ -2100,28 +2109,56 @@ async function resolveCustomerRole(guild) {
 
 // Returns null on success, or a human-readable reason on failure.
 //
-// Adding a role fails for reasons the person claiming needs to hear, and the
+// Adding a role fails for reasons the person clicking needs to hear, and the
 // loudest one is hierarchy: Discord requires the bot's own highest role to sit
 // strictly ABOVE the role it hands out, and Administrator does not exempt it.
-// In this server the bot's role sits at the bottom while the customer role is
-// near the top, so the add throws — and the old code swallowed it with
-// `.catch(() => {})` and posted "✅ Role Added" regardless. A claim that
-// granted nothing was indistinguishable from one that worked.
-async function grantCustomerRole(member, role) {
+// The old code swallowed the throw with `.catch(() => {})` and posted "✅ Role
+// Added" regardless — a claim that granted nothing was indistinguishable from
+// one that worked.
+//
+// There are TWO hierarchy rules, not one, and only the first was ever checked:
+//
+//   1. the bot's highest role must be above THE ROLE being handed out, and
+//   2. the bot's highest role must be above THE MEMBER'S OWN highest role.
+//
+// Rule 2 is the one that broke verification on the second server. `ONTOP AIO`
+// sits at position 6 there, while the server's older 𝑽𝑬𝑹𝑰𝑭𝑰𝑬𝑫 role — which
+// nearly every human already holds — sits at 7. Handing out a role at
+// position 2 passes rule 1 and still fails, because Discord will not let a bot
+// touch a member who outranks it at all. The role is low, the member is high,
+// and the error text ("Missing Permissions") names neither. Nobody was ever
+// going to guess that from "❌ Something went wrong."
+//
+// The guild OWNER is unmanageable by anyone, bot or not, at any position.
+async function assignRole(member, role, reason) {
   const me = member.guild.members.me || await member.guild.members.fetchMe().catch(() => null);
   if (!me) return 'I could not read my own permissions in this server.';
   if (!me.permissions.has(PermissionFlagsBits.ManageRoles)) return 'I do not have the **Manage Roles** permission.';
   if (role.managed) return `**${role.name}** is managed by an integration, so Discord will not let anyone assign it.`;
+  if (member.roles.cache.has(role.id)) return null; // already held — nothing to do
   if (me.roles.highest.comparePositionTo(role) <= 0) {
     return `my highest role (**${me.roles.highest.name}**) is below **${role.name}** in the role list, so Discord refuses the assignment. An admin needs to drag my role above it in Server Settings → Roles.`;
   }
-  if (member.roles.cache.has(role.id)) return null; // already held — nothing to do
+  if (member.id === member.guild.ownerId) {
+    return 'you own this server, and Discord does not let a bot change the owner\'s roles. Add it to yourself by hand.';
+  }
+  if (me.roles.highest.comparePositionTo(member.roles.highest) <= 0) {
+    return `your highest role (**${member.roles.highest.name}**) is above mine (**${me.roles.highest.name}**), and Discord will not let a bot change the roles of anyone who outranks it — even with Administrator. An admin needs to drag **${me.roles.highest.name}** above **${member.roles.highest.name}** in Server Settings → Roles.`;
+  }
   try {
-    await member.roles.add(role, 'Verified paid order');
+    await member.roles.add(role, reason || 'Automated role grant');
     return null;
   } catch (err) {
+    // The five checks above cover every cause we can name. Anything reaching
+    // here is worth a stack in the log, because the next person debugging it
+    // has nothing else to go on.
+    console.error(`[roles] add failed in ${member.guild.id}: ${role.name} -> ${member.user?.tag || member.id}:`, err.stack || err);
     return err.message || 'Discord refused the role assignment.';
   }
+}
+
+function grantCustomerRole(member, role) {
+  return assignRole(member, role, 'Verified paid order');
 }
 
 // Round 29 item 6: "If user has not made an account and no email found. Have it
@@ -2892,6 +2929,7 @@ const allCommands = [
   ...smsCommands.map(c => c.toJSON()),
   ...manualCommands.map(c => c.toJSON()),
   ...storefrontCommands.map(c => c.toJSON()),
+  ...productInfoCommands.map(c => c.toJSON()),
 ];
 
 // ─── Command lockdown ─────────────────────────────────────────────────────────
@@ -2925,6 +2963,7 @@ const PUBLIC_COMMANDS = new Set([
   'gensteam',            // the generator members are here for
   'gennumber',           // ditto, SMS
   'show-voucher-stats',  // invite leaderboard; the `public:` flag is staff-gated inside
+  'product-info',        // the catalogue is the shop window; `channel:` is staff-gated inside
 ]);
 
 let _lockedCount = 0;
@@ -3464,6 +3503,8 @@ client.on('interactionCreate', async interaction => {
     // which is the only reason "#💰︱𝐏𝐚𝐲𝐦𝐞𝐧𝐭-𝐦𝐞𝐭𝐡𝐨𝐝𝐬" resolves at all.
     if (interaction.isChatInputCommand()
       && await handleStorefrontCommand(interaction, { findChannel: findChannelByName })) return;
+    // /product-info — owns its command and its two dropdowns.
+    if (interaction.isChatInputCommand() && await handleProductInfoCommand(interaction)) return;
     // Autocomplete
     if (interaction.isAutocomplete() && interaction.commandName === 'setdownload') {
       const focused = interaction.options.getFocused().toLowerCase();
@@ -3490,7 +3531,7 @@ client.on('interactionCreate', async interaction => {
           .setTitle('🤖 UH Super Bot — All Commands').setColor(0x5865F2)
           .addFields(
             { name: '🔐 Verification & Invites', value: '`/setup-verify` — Set up verification channel\n`/setup-invites` — Set up invite reward channel\n`/show-voucher-stats` — Invite leaderboard / one member\'s stats', inline: false },
-            { name: '📦 Products & Downloads', value: '`/downloads` — Browse & download products\n`/setupdownloads` — Post download panel to #downloads\n`/setdownload` — Set a product download link', inline: false },
+            { name: '📦 Products & Downloads', value: '`/product-info` — Look up any product: price, plans, stock, features\n`/downloads` — Browse & download products\n`/setupdownloads` — Post download panel to #downloads\n`/setdownload` — Set a product download link', inline: false },
             { name: '📣 Updates & Status', value: '`/postupdate` — Post a product update\n`/statusupdate` — Post a status update\n`/announce` — Send a custom announcement', inline: false },
             { name: '🌐 Server Setup', value: '`/setup-website` — Post the website panel\n`/setup-payments` — Post the payment methods panel (live fees)\n`/setupreseller` — Post reseller panel\n`/setresellerlinks` — Update reseller button links\n`/postimage` — Post an image', inline: false },
             { name: '💾 Server Snapshots', value: '`/serverbackup create` — Save the server\'s roles, channels & permissions\n`/serverbackup list|view|export` — Browse or download a snapshot\n`/serverbackup restore` — Rebuild from one (never deletes anything)', inline: false },
@@ -3521,14 +3562,19 @@ client.on('interactionCreate', async interaction => {
         const everyoneRole = guild.roles.everyone;
         const botRole = guild.members.me.roles.highest;
         await guild.channels.fetch();
-        // Channel IDs that Verified role is allowed to see (besides get-verify)
-        // NOTE: still hardcoded to your original server's specific channels —
-        // a genuine per-guild "which channels are public" setting is a
-        // reasonable next addition, but out of scope for this pass.
-        const VERIFIED_ALLOWED_IDS = [
-          '1481172050801463367', // support channel
-          '1242139449320804393', // Support 1 voice
-        ];
+        // Which channels a verified member is allowed to see, besides
+        // get-verify. This used to be two hardcoded IDs from the original
+        // server, which meant running /setup-verify anywhere else hid EVERY
+        // channel from @everyone and then hid every channel from Verified as
+        // well — the command's whole purpose, inverted, on any server but one.
+        //
+        // The set is read off the server instead: whatever @everyone can see
+        // RIGHT NOW is what the public was already meant to have, so that is
+        // what Verified keeps once @everyone loses it. Snapshotted before the
+        // loop, because the loop is what takes the permission away.
+        const VERIFIED_ALLOWED_IDS = [...guild.channels.cache.values()]
+          .filter(ch => ch.permissionsFor(everyoneRole)?.has(PermissionFlagsBits.ViewChannel))
+          .map(ch => ch.id);
         let verifyCh = (settings.verifyChannelId && guild.channels.cache.get(settings.verifyChannelId))
           || findChannelByName(guild, settings.verifyChannelName);
         if (!verifyCh) verifyCh = await guild.channels.create({ name: settings.verifyChannelName, type: ChannelType.GuildText });
@@ -3554,7 +3600,7 @@ client.on('interactionCreate', async interaction => {
         const row = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('verify_button').setLabel('✅ Verify Me').setStyle(ButtonStyle.Primary)
         );
-        await verifyCh.send({ embeds: [embed], components: [row] });
+        await verifyCh.send(withLanguageRow({ embeds: [embed], components: [row] }));
         await interaction.editReply('✅ Done!'); autoDelete(interaction, 5000);
         return;
       }
@@ -3653,7 +3699,7 @@ client.on('interactionCreate', async interaction => {
           new ButtonBuilder().setCustomId('check_invites').setLabel('📊 Check Your Invites').setStyle(ButtonStyle.Secondary),
           new ButtonBuilder().setCustomId('redeem_key').setLabel('🎁 Redeem Your Key').setStyle(ButtonStyle.Success),
         );
-        await invCh.send({ embeds: [embed], components: [row] });
+        await invCh.send(withLanguageRow({ embeds: [embed], components: [row] }));
         // Naming the channel, because the failure this fixes was silent: the
         // command said "set up!" while the panel went into the log. If the
         // answer below is not the channel the operator meant, they can see so
@@ -3887,11 +3933,11 @@ client.on('interactionCreate', async interaction => {
           try {
             const ch = await client.channels.fetch(existing.channelId);
             const msg = await ch.messages.fetch(existing.messageId);
-            await msg.edit({ embeds: [embed], components: [row] });
+            await msg.edit(withLanguageRow({ embeds: [embed], components: [row] }));
             await interaction.editReply({ content: `✅ Reseller panel updated in <#${existing.channelId}>` }); autoDelete(interaction, 5000); return;
           } catch (_) {}
         }
-        const msg = await resCh.send({ embeds: [embed], components: [row] });
+        const msg = await resCh.send(withLanguageRow({ embeds: [embed], components: [row] }));
         resellerMessages[gKey] = { channelId: resCh.id, messageId: msg.id };
         await interaction.editReply({ content: `✅ Reseller panel posted in <#${resCh.id}>` }); autoDelete(interaction, 5000);
         return;
@@ -4049,7 +4095,7 @@ client.on('interactionCreate', async interaction => {
         const row = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('leave_vouch').setLabel('📝 Leave a Vouch').setStyle(ButtonStyle.Primary),
         );
-        await targetCh.send({ embeds: [embed], components: [row] });
+        await targetCh.send(withLanguageRow({ embeds: [embed], components: [row] }));
         // Store which channel to post received vouches into
         const existing = vouchData.get(interaction.guild.id) || { count: 0, channelId: resultsCh.id, entries: [] };
         existing.channelId = resultsCh.id;
@@ -4571,7 +4617,7 @@ client.on('interactionCreate', async interaction => {
           new ButtonBuilder().setCustomId('redeem_open_modal').setLabel('Redeem Key').setEmoji('🔑').setStyle(ButtonStyle.Primary)
         );
 
-        await channel.send({ embeds: [embed], components: [row] });
+        await channel.send(withLanguageRow({ embeds: [embed], components: [row] }));
         await interaction.reply({ content: `✅ Posted the redeem panel in <#${channel.id}>.`, flags: 64 });
         return;
       }
@@ -4599,7 +4645,7 @@ client.on('interactionCreate', async interaction => {
           new ButtonBuilder().setCustomId('claim_customer_open').setLabel('Claim').setEmoji('🎫').setStyle(ButtonStyle.Success)
         );
 
-        await channel.send({ embeds: [embed], components: [row] });
+        await channel.send(withLanguageRow({ embeds: [embed], components: [row] }));
         await interaction.reply({ content: `✅ Posted the claim panel in <#${channel.id}>.`, flags: 64 });
         return;
       }
@@ -5978,9 +6024,17 @@ client.on('interactionCreate', async interaction => {
       // post it is on. It translates the embeds of the message it was clicked
       // from, which is what makes it work on posts written long before it
       // existed and on posts nobody has thought of yet.
-      if (interaction.customId === 'xlate_lang') {
+      // `startsWith`, not `===`: a dropdown sent into a DM appends the guild it
+      // came from (`xlate_lang::<guildId>`) so the choice is remembered where
+      // the order-delivery path will look for it.
+      if (interaction.customId === 'xlate_lang' || interaction.customId.startsWith('xlate_lang::')) {
         return translate.handleLanguageSelect(interaction, { chunkEmbedsIntoMessages });
       }
+
+      // /product-info's category → product pair. Both live in the module so the
+      // browse panel posted into a channel keeps working across restarts with
+      // no state here at all.
+      if (await handleProductInfoSelect(interaction)) return;
 
       // Steam stock — type chosen from the postgensteam panel dropdown
       if (interaction.customId === 'gensteam_select_type') {
@@ -6195,8 +6249,12 @@ client.on('interactionCreate', async interaction => {
           || guild.roles.cache.find(r => r.name === btnSettings.verifiedRoleName);
         if (!verifiedRole) { await interaction.reply({ content: '⚠️ Verified role not found.', ephemeral: true }); autoDelete(interaction, 5000); return; }
         if (member.roles.cache.has(verifiedRole.id)) { await interaction.reply({ content: '✅ You are already verified!', ephemeral: true }); autoDelete(interaction, 5000); return; }
-        try { await member.roles.add(verifiedRole); await interaction.reply({ content: '🎉 You have been verified! Welcome!', ephemeral: true }); autoDelete(interaction, 5000); }
-        catch (_) { await interaction.reply({ content: '❌ Something went wrong.', ephemeral: true }); autoDelete(interaction, 5000); }
+        // Was `catch (_) { reply('❌ Something went wrong.') }` — the one thing
+        // a member could not act on and staff could not diagnose. assignRole
+        // names the cause instead; see its comment for the two hierarchy rules.
+        const why = await assignRole(member, verifiedRole, 'Verify button');
+        if (why) { await interaction.reply({ content: `❌ I could not verify you — ${why}`, flags: 64 }); return; }
+        await interaction.reply({ content: '🎉 You have been verified! Welcome!', ephemeral: true }); autoDelete(interaction, 5000);
         return;
       }
 

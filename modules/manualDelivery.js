@@ -34,7 +34,7 @@ const {
 } = require('discord.js');
 const axios = require('axios');
 const { query } = require('../db');
-const { getUserLang, translateEmbeds, DEFAULT_LANG } = require('./translate');
+const { getUserLang, translateEmbeds, languageRow, DEFAULT_LANG } = require('./translate');
 // One renderer for the buyer's DM, shared with the website delivery path.
 const { buildDeliveryEmbed } = require('./deliveryEmbed');
 
@@ -325,8 +325,16 @@ async function submitKeys(interaction, client) {
   else try {
     const buyer = await client.users.fetch(String(buyerId));
     let out = [dm];
+    // Declared outside the try so the dropdown still ships when the lookup
+    // throws — an untranslated DM the buyer can retranslate beats a correct
+    // one they are stuck with.
+    let lang = null;
+    // A hand-delivered order is scoped to the guild the command ran in, not
+    // to the module-level GUILD_ID, which is the store server and is simply
+    // the wrong key on the second server.
+    const langScope = (interaction && interaction.guildId) || GUILD_ID || 'dm';
     try {
-      const lang = await getUserLang(GUILD_ID, String(buyerId));
+      lang = await getUserLang(langScope, String(buyerId));
       // What the buyer bought is not a sentence. The prose around it is theirs
       // to read in their own language; the product, the tier and the invoice
       // are what they quote back to staff and what /claim-customer looks up, so
@@ -335,7 +343,7 @@ async function submitKeys(interaction, client) {
       // with the embed.
       if (lang && lang !== DEFAULT_LANG) out = await translateEmbeds(out, lang, protect);
     } catch (e) { console.warn('[ManualDelivery] DM translation skipped:', e.message); }
-    await buyer.send({ embeds: out });
+    await buyer.send({ embeds: out, components: [languageRow(lang, langScope)] });
     dmOk = true;
   } catch (err) {
     dmErr = err.code === 50007 ? 'their DMs are closed' : err.message;

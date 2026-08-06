@@ -332,11 +332,16 @@ async function translateEmbeds(embeds, lang, protect) {
 // One row, appended to any post that should be translatable. `current` only
 // changes the placeholder — the row is on a SHARED message read by everyone, so
 // it cannot show one reader's choice as if it were the post's language.
-function languageRow(current) {
+//
+// `scope` is for DMs. A DM has no guildId, so a choice made there would be
+// remembered under 'dm' while the order-delivery path looks the buyer up under
+// the store's guild id — the choice would appear to save and change nothing.
+// The delivery DM therefore carries the guild it came from in the customId.
+function languageRow(current, scope) {
   const cur = LANG_BY_CODE.get(normalizeLang(current) || DEFAULT_LANG) || LANGS[0];
   return new ActionRowBuilder().addComponents(
     new StringSelectMenuBuilder()
-      .setCustomId('xlate_lang')
+      .setCustomId(scope ? `xlate_lang::${scope}` : 'xlate_lang')
       .setPlaceholder(`${cur.flag} ${cur.native}`)
       .addOptions(LANGS.map(l => ({
         label: l.native,
@@ -348,22 +353,47 @@ function languageRow(current) {
 }
 
 // ─── remembered choice ───────────────────────────────────────────────────────
+// The table is keyed (guild_id, user_id), which was over-keyed from the start:
+// what language someone reads is a property of the PERSON, not of the server
+// they happened to be standing in when they picked. Being asked twice is a
+// nuisance; the real damage was that a choice made in one place silently did
+// not apply in another — a buyer who picked Spanish under a server post got
+// Spanish order DMs and had no way to undo it, because the DM carried no
+// dropdown and /language in a DM writes under 'dm', which the delivery path
+// never reads.
+//
+// So every save now writes a second, guild-independent row under GLOBAL_SCOPE,
+// and every read falls back to it. The per-guild row still wins where it
+// exists, so nothing anyone already chose changes meaning.
+const GLOBAL_SCOPE = '*';
+
 async function getUserLang(guildId, userId) {
   try {
     const { rows } = await db.query(
-      'SELECT lang FROM user_locales WHERE guild_id = $1 AND user_id = $2', [guildId, userId]);
-    return rows[0] ? normalizeLang(rows[0].lang) : null;
+      `SELECT guild_id, lang FROM user_locales
+        WHERE user_id = $2 AND guild_id IN ($1, $3)`,
+      [String(guildId), userId, GLOBAL_SCOPE]);
+    const exact = rows.find(r => r.guild_id === String(guildId));
+    const global_ = rows.find(r => r.guild_id === GLOBAL_SCOPE);
+    const hit = exact || global_;
+    return hit ? normalizeLang(hit.lang) : null;
   } catch (e) { return null; }
 }
 
 async function setUserLang(guildId, userId, lang) {
   const code = normalizeLang(lang);
   if (!code) return false;
+  // Both rows, or neither: a global row written without the scoped one would
+  // be shadowed by whatever stale scoped row is already there, which is the
+  // exact failure this is meant to end.
+  const scopes = [...new Set([String(guildId), GLOBAL_SCOPE])];
   try {
-    await db.query(
-      `INSERT INTO user_locales (guild_id, user_id, lang, updated_at) VALUES ($1,$2,$3, now())
-       ON CONFLICT (guild_id, user_id) DO UPDATE SET lang = $3, updated_at = now()`,
-      [guildId, userId, code]);
+    for (const scope of scopes) {
+      await db.query(
+        `INSERT INTO user_locales (guild_id, user_id, lang, updated_at) VALUES ($1,$2,$3, now())
+         ON CONFLICT (guild_id, user_id) DO UPDATE SET lang = $3, updated_at = now()`,
+        [scope, userId, code]);
+    }
     return true;
   } catch (e) {
     console.warn('[translate] could not remember the language choice:', e.message);
@@ -387,7 +417,12 @@ async function handleLanguageSelect(interaction, { chunkEmbedsIntoMessages }) {
   const meta = LANG_BY_CODE.get(lang);
   await interaction.deferReply({ flags: 64 });
 
-  await setUserLang(interaction.guildId || 'dm', interaction.user.id, lang);
+  // A dropdown posted into a DM carries the guild it belongs to — see
+  // languageRow(). Without it the choice lands under 'dm' and the order
+  // deliveries, which look the buyer up by guild, keep speaking the old
+  // language at someone who just asked them not to.
+  const scope = (interaction.customId || '').split('::')[1] || interaction.guildId || 'dm';
+  await setUserLang(scope, interaction.user.id, lang);
 
   const source = interaction.message ? interaction.message.embeds : [];
   if (!source.length) {
