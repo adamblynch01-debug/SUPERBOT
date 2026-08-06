@@ -56,7 +56,7 @@ const {
 } = require('./modules/storefrontPanels');
 const {
   commands: productInfoCommands, handleProductInfoCommand, handleProductInfoSelect,
-  setProductInfoGate,
+  handleProductInfoButton, setProductInfoGate,
 } = require('./modules/productInfo');
 const translate = require('./modules/translate');
 // Only for the language dropdown: it reads a delivery DM back off the
@@ -3381,12 +3381,12 @@ client.once('ready', async () => {
           const disabledRow = new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId('giveaway_enter').setLabel(`🎉 Participate (${participants.length})`).setStyle(ButtonStyle.Primary).setDisabled(true),
           );
-          await gwMsg.edit({ embeds: [endedEmbed], components: [disabledRow] });
+          await gwMsg.edit(withLanguageRow({ embeds: [endedEmbed], components: [disabledRow] }));
           const resultsEmbed = new EmbedBuilder().setColor(0x2ECC71).setTitle(`🎁 ${gw.prize} [RESULTS]`)
             .setDescription(`The ${winners.length > 1 ? 'winners are' : 'winner is'} tagged above! Congratulations 🎉`)
             .addFields({ name: 'Prize', value: gw.prize }, { name: 'Participants', value: `${participants.length}` }, { name: 'Winners', value: `${winners.length}` })
             .setFooter({ text: `${BOT_NAME} | ${SITE_URL}`, iconURL: client.user.displayAvatarURL() }).setTimestamp();
-          await gwCh.send({ content: winnersText || '❌ No participants — no winner.', embeds: [resultsEmbed] });
+          await gwCh.send(withLanguageRow({ content: winnersText || '❌ No participants — no winner.', embeds: [resultsEmbed] }));
         } catch (e) { console.error('Giveaway restart-end error:', e); }
       })();
     } else {
@@ -3409,12 +3409,12 @@ client.once('ready', async () => {
           const disabledRow = new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId('giveaway_enter').setLabel(`🎉 Participate (${participants.length})`).setStyle(ButtonStyle.Primary).setDisabled(true),
           );
-          await gwMsg.edit({ embeds: [endedEmbed], components: [disabledRow] });
+          await gwMsg.edit(withLanguageRow({ embeds: [endedEmbed], components: [disabledRow] }));
           const resultsEmbed = new EmbedBuilder().setColor(0x2ECC71).setTitle(`🎁 ${g.prize} [RESULTS]`)
             .setDescription(`The ${winners.length > 1 ? 'winners are' : 'winner is'} tagged above! Congratulations 🎉`)
             .addFields({ name: 'Prize', value: g.prize }, { name: 'Participants', value: `${participants.length}` }, { name: 'Winners', value: `${winners.length}` })
             .setFooter({ text: `${BOT_NAME} | ${SITE_URL}`, iconURL: client.user.displayAvatarURL() }).setTimestamp();
-          await gwCh.send({ content: winnersText || '❌ No participants — no winner.', embeds: [resultsEmbed] });
+          await gwCh.send(withLanguageRow({ content: winnersText || '❌ No participants — no winner.', embeds: [resultsEmbed] }));
         } catch (e) { console.error('Giveaway rescheduled-end error:', e); }
       }, remaining);
       console.log(`⏰ Rescheduled giveaway ${msgId} (${gw.prize}) — ${Math.round(remaining / 60000)}m remaining`);
@@ -4336,7 +4336,10 @@ client.on('interactionCreate', async interaction => {
         );
 
         await interaction.deferReply({ ephemeral: true });
-        const msg = await targetCh.send({ content: '@everyone', embeds: [embed], components: [row] });
+        // A giveaway is one of the few posts that pings the whole server, so it
+        // is read by more people who do not read English than almost anything
+        // else the bot writes.
+        const msg = await targetCh.send(withLanguageRow({ content: '@everyone', embeds: [embed], components: [row] }));
 
         giveaways.set(msg.id, { prize, channelId: targetCh.id, guildId: interaction.guild.id, endsAt: endsAt.toISOString(), participants: new Set(), ended: false, winnerCount });
         saveGiveaways();
@@ -4367,7 +4370,7 @@ client.on('interactionCreate', async interaction => {
             );
             const gwCh = await client.channels.fetch(gw.channelId);
             const gwMsg = await gwCh.messages.fetch(msg.id);
-            await gwMsg.edit({ embeds: [endedEmbed], components: [disabledRow] });
+            await gwMsg.edit(withLanguageRow({ embeds: [endedEmbed], components: [disabledRow] }));
 
             // Post results embed
             const resultsEmbed = new EmbedBuilder()
@@ -4381,7 +4384,7 @@ client.on('interactionCreate', async interaction => {
               )
               .setFooter({ text: `${BOT_NAME} | ${SITE_URL}`, iconURL: client.user.displayAvatarURL() })
               .setTimestamp();
-            await gwCh.send({ content: winnersText || '❌ No participants — no winner.', embeds: [resultsEmbed] });
+            await gwCh.send(withLanguageRow({ content: winnersText || '❌ No participants — no winner.', embeds: [resultsEmbed] }));
           } catch (e) { console.error('Giveaway end error:', e); }
         }, durMs);
 
@@ -6433,6 +6436,10 @@ client.on('interactionCreate', async interaction => {
       // it answers from /api/config and needs nothing from this guild's row.
       if (await handleStorefrontButton(interaction)) return;
 
+      // 📢 Show everyone, on a private product card. Reads the catalogue, not
+      // this guild's settings.
+      if (await handleProductInfoButton(interaction)) return;
+
       // Server-snapshot restore. Answered before getGuildSettings for the same
       // reason: it does not need it, and this is a long job that should not
       // start with an avoidable DB round trip.
@@ -6553,11 +6560,13 @@ client.on('interactionCreate', async interaction => {
         if (gw.participants.has(member.id)) { await interaction.reply({ content: '✅ You are already entered!', ephemeral: true }); return; }
         gw.participants.add(member.id);
         saveGiveaways();
-        // Update button label with new count
+        // Update button label with new count. update() REPLACES the component
+        // list, so the language row has to be sent again or the first person to
+        // enter takes the translator away from everyone after them.
         const updatedRow = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('giveaway_enter').setLabel(`🎉 Participate (${gw.participants.size})`).setStyle(ButtonStyle.Primary),
         );
-        await interaction.update({ components: [updatedRow] });
+        await interaction.update(withLanguageRow({ components: [updatedRow] }));
         return;
       }
 

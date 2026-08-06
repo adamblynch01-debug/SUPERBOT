@@ -217,12 +217,58 @@ await check('the buy button points at the half the product is actually on', () =
   assert.ok(/#vault$/.test(url), url);
 });
 
+  console.log('\nshowing a customer the card you are looking at');
+
+const catalog = () => P.groupCatalog([row({ product_id: '1' })]);
+const shareArgs = (cat, canShare) => {
+  const p = cat.products.get('main::1');
+  return { category: cat.categories[0], product: p, embed: P.buildProductEmbed(p, {}), ...(canShare == null ? {} : { canShare }) };
+};
+const customIds = (payload) =>
+  payload.components.flatMap(r => r.toJSON().components).map(c => c.custom_id).filter(Boolean);
+
+// "what if admin wants to show user? SAYS ONLY YOU CAN SEE AT THIS MOMENT."
+// The private reply is deliberate — a price lookup is nobody else's business,
+// and a public panel that rewrote itself on every click was the thing this
+// whole layout was built to avoid. So the way to show somebody is a button on
+// the card, not a mode picked before you know which product you want.
+await check('staff get a share button on the card, everyone else does not', () => {
+  const cat = catalog();
+  const shared = (canShare) => customIds(P.browserPayload(cat, shareArgs(cat, canShare)));
+
+  assert.ok(shared(true).some(i => i.startsWith('pinfo_share::')),
+    'staff cannot post the card they are looking at');
+  assert.ok(!shared(false).some(i => i.startsWith('pinfo_share::')),
+    'a customer is being offered a button that will refuse them');
+  assert.ok(!shared(null).some(i => i.startsWith('pinfo_share::')),
+    'the button defaults to on — a public panel would carry it for everyone');
+});
+
+await check('the share button still leaves room for the language row', () => {
+  // Five action rows is a hard limit and exceeding it rejects the whole
+  // message. The button joins the Buy row rather than taking a sixth.
+  const cat = catalog();
+  const payload = P.browserPayload(cat, shareArgs(cat, true));
+  assert.ok(payload.components.length <= 5, `${payload.components.length} rows`);
+  assert.ok(customIds(payload).includes('xlate_lang'), 'the share button pushed the translator off the card');
+});
+
+await check('the share id survives a key that contains the separator', () => {
+  // The product key is `<half>::<id>` and carries its own `::`, so a naive
+  // split('::')[1] would hand back "main" and find no product.
+  const cat = catalog();
+  const id = customIds(P.browserPayload(cat, shareArgs(cat, true))).find(i => i.startsWith('pinfo_share::'));
+  assert.strictEqual(id.slice('pinfo_share::'.length), 'main::1');
+  assert.ok(id.length <= 100, 'customId is over Discord\'s limit');
+});
+
   console.log('\nand it is wired in');
 
-await check('index.js dispatches both dropdowns and registers the command', () => {
+await check('index.js dispatches both dropdowns, the button, and registers the command', () => {
   const src = require('fs').readFileSync(require('path').join(__dirname, 'index.js'), 'utf8');
   assert.ok(/handleProductInfoSelect\(interaction\)/.test(src), 'the dropdowns are dispatched');
   assert.ok(/handleProductInfoCommand\(interaction\)/.test(src), 'the command is dispatched');
+  assert.ok(/handleProductInfoButton\(interaction\)/.test(src), 'the share button is dispatched');
   assert.ok(/productInfoCommands\.map/.test(src), 'the command is registered');
   // Public on purpose: a locked /product-info is a shop window with the
   // shutters down. The `channel:` option is gated inside the module instead.

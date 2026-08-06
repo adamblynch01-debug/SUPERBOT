@@ -492,6 +492,36 @@ async function check(name, fn) {
     }
   });
 
+  await check('a giveaway carries the dropdown from start to results', async () => {
+    // "/GIVEAWAY DOESNT HAVE TRANSLATION." It pings @everyone, so it is read by
+    // more people who do not read English than almost anything else the bot
+    // writes — and it is three separate posts: the entry card, the [ENDED] edit
+    // and the [RESULTS] announcement. Missing one leaves the winner unable to
+    // read that they won.
+    const block = indexSrc.slice(indexSrc.indexOf("cmd === 'giveaway'"), indexSrc.indexOf("cmd === 'endgiveaway'") + 1 || undefined);
+    for (const [what, re] of [
+      ['the entry card', /targetCh\.send\(withLanguageRow\(\{ content: '@everyone'/],
+      ['the ENDED edit', /gwMsg\.edit\(withLanguageRow\(/],
+      ['the RESULTS post', /gwCh\.send\(withLanguageRow\(/],
+    ]) assert.ok(re.test(block), `${what} posts without the dropdown`);
+
+    // Every edit REPLACES the component list, so each one has to send the row
+    // again. The count button is the easy one to miss: the first person to
+    // enter would take the translator away from everyone after them.
+    const at = indexSrc.indexOf("customId === 'giveaway_enter'");
+    assert.ok(at > 0, 'the enter handler moved — re-point this check');
+    const enter = indexSrc.slice(at, indexSrc.indexOf("customId === 'leave_vouch'"));
+    assert.ok(/interaction\.update\(withLanguageRow\(/.test(enter),
+      'entering a giveaway strips the dropdown off it for everyone else');
+
+    // The restart path rebuilds the same two posts from disk. It is a separate
+    // copy of the code, so it is a separate place to forget.
+    const restart = indexSrc.slice(indexSrc.indexOf('Giveaway restart-end error') - 3000,
+      indexSrc.indexOf('Giveaway rescheduled-end error'));
+    assert.strictEqual((restart.match(/withLanguageRow\(/g) || []).length, 4,
+      'a giveaway that ended while the bot was restarting posts without the dropdown');
+  });
+
   await check('a post already using five action rows keeps its buttons', async () => {
     const fn = indexSrc.slice(indexSrc.indexOf('function withLanguageRow'));
     assert.ok(/components\.length >= 5/.test(fn),

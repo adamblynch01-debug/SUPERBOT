@@ -335,7 +335,7 @@ function isEphemeral(message) {
   return (Number(f) & (1 << 6)) === (1 << 6);
 }
 
-function browserPayload(catalog, { category = null, product = null, embed = null } = {}) {
+function browserPayload(catalog, { category = null, product = null, embed = null, canShare = false } = {}) {
   const rows = categoryRows(catalog.categories, category ? category.key : null);
   if (category) rows.push(productRow(category, product ? product.key : null));
 
@@ -345,6 +345,15 @@ function browserPayload(catalog, { category = null, product = null, embed = null
       new ButtonBuilder().setStyle(ButtonStyle.Link).setLabel('🛒 Buy on the site')
         .setURL(product.half === 'vault' ? `${SITE_URL}/#vault` : `${SITE_URL}/#products`)
     );
+    // "What if admin wants to show a user?" — the whole point of this view is
+    // that it is private, so the answer cannot be a flag chosen before you know
+    // which product you want. It is a button on the card you are already
+    // looking at. Staff only, and it shares into the same channel.
+    if (canShare) {
+      buttons.addComponents(new ButtonBuilder()
+        .setStyle(ButtonStyle.Secondary).setLabel('📢 Show everyone')
+        .setCustomId(`pinfo_share::${product.key}`));
+    }
     if (components.length < MAX_ROWS) components.push(buttons);
   }
   if (components.length < MAX_ROWS) components.push(languageRow());
@@ -411,6 +420,10 @@ async function handleProductInfoCommand(interaction) {
   return true;
 }
 
+// Everyone can run /product-info — see the command list in index.js. The reply
+// is private because a price lookup is nobody else's business, and staff who
+// want it public have the 📢 button on the card.
+
 async function handleProductInfoSelect(interaction) {
   const id = interaction.customId || '';
   if (!id.startsWith('pinfo_cat') && id !== 'pinfo_prod') return false;
@@ -453,12 +466,57 @@ async function handleProductInfoSelect(interaction) {
   const embed = buildProductEmbed(product, stock);
   // Same call either way — deferUpdate() edits the private browser in place,
   // deferReply() edits the private copy that a public panel just opened.
-  await interaction.editReply(browserPayload(catalog, { category, product, embed }));
+  await interaction.editReply(browserPayload(catalog, {
+    category, product, embed, canShare: gate.hasAccess(interaction),
+  }));
+  return true;
+}
+
+// ─── Showing a customer the card you are looking at ──────────────────────────
+// The private view is the whole design: a click on a public panel opens a
+// private copy so one person browsing does not rewrite the panel under
+// everyone else. That leaves staff with no way to answer "what does this one
+// cost?" out loud, which is this button.
+//
+// It posts a fresh copy into the channel rather than revealing the ephemeral
+// one, because an ephemeral message cannot be made public — and rebuilding it
+// re-reads stock, so what the customer sees is current rather than whatever
+// was true when the staff member opened it.
+const SHARE_PREFIX = 'pinfo_share::';
+
+async function handleProductInfoButton(interaction) {
+  const id = interaction.customId || '';
+  if (!id.startsWith(SHARE_PREFIX)) return false;
+
+  if (!gate.hasAccess(interaction)) {
+    await interaction.reply({ content: '❌ Only staff can post a product card into the channel.', flags: 64 });
+    return true;
+  }
+
+  await interaction.deferReply({ flags: 64 });
+  const catalog = await fetchCatalog();
+  // The key is `<half>::<id>` and carries its own `::`, so take everything
+  // after the prefix rather than splitting.
+  const product = catalog && catalog.products.get(id.slice(SHARE_PREFIX.length));
+  if (!product) {
+    await interaction.editReply({ content: '❌ That product is not in the catalogue any more.' });
+    return true;
+  }
+
+  const stock = await tierStock(product.tiers);
+  const embed = buildProductEmbed(product, stock);
+  try {
+    await interaction.channel.send({ embeds: [embed], components: [languageRow()] });
+  } catch (e) {
+    await interaction.editReply({ content: `❌ Could not post it here: ${e.message}` });
+    return true;
+  }
+  await interaction.editReply({ content: `✅ Posted **${product.name}** in this channel for everyone to see.` });
   return true;
 }
 
 module.exports = {
-  commands, handleProductInfoCommand, handleProductInfoSelect, setProductInfoGate,
+  commands, handleProductInfoCommand, handleProductInfoSelect, handleProductInfoButton, setProductInfoGate,
   // Exported for the tests, which build the whole flow with no Discord connection.
   groupCatalog, buildProductEmbed, browserPayload, categoryRows, productRow,
   tierLines, packLines, priceHint, isEphemeral, fetchCatalog, STATUS,
