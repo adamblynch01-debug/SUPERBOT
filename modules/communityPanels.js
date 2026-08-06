@@ -118,6 +118,13 @@ const PLATFORMS = [
   { name: 'TikTok',  emoji: '🎵', color: 0x69C9D0, test: /(^|\.)tiktok\.com$/i },
   { name: 'Rumble',  emoji: '🟩', color: 0x85C742, test: /(^|\.)rumble\.com$/i },
   { name: 'X',       emoji: '✖️', color: 0x1D9BF0, test: /(^|\.)(x\.com|twitter\.com)$/i },
+  // Clip hosts rather than places you stream. They are here because the clips
+  // panel tells people to use Medal, Streamable and Outplayed by name, and a
+  // Medal link — the commonest one in that channel by far — was coming back
+  // "unknown" from a list that had only ever been written for /golive.
+  { name: 'Medal',      emoji: '🎥', color: 0xFFCF00, test: /(^|\.)medal\.tv$/i },
+  { name: 'Streamable', emoji: '🎞️', color: 0x0F90FA, test: /(^|\.)streamable\.com$/i },
+  { name: 'Outplayed',  emoji: '🎞️', color: 0xE8563F, test: /(^|\.)outplayed\.tv$/i },
 ];
 
 function platformOf(url) {
@@ -271,41 +278,76 @@ function buildClipsPanel(guild) {
   return { embeds: [embed], components: [row] };
 }
 
+// Free text a member typed, on its way into plain message content rather than
+// into an embed field. Two things have to come out of it.
+//
+// A SECOND URL is the one that matters: the clip link is checked against the
+// blocked-domain list, and a link smuggled into the title would ride along
+// unchecked — and, being in the content, could even be the one Discord decides
+// to unfurl. There is no legitimate reason for a URL in "what happens in it".
+//
+// The rest is markdown. In an embed field a stray `**` was cosmetic; in content
+// it can restyle everything after it, so the handful of characters that do that
+// are escaped rather than stripped, and the member still sees what they typed.
+function plainText(s, max) {
+  return String(s || '')
+    .replace(/https?:\/\/\S+/gi, '')      // no second link
+    .replace(/[<>]/g, '')                 // no <@id> / <#id> / <@&id> smuggling
+    .replace(/([*_~`|\\])/g, '\\$1')      // markdown, escaped not deleted
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, max);
+}
+
 // A member's clip, posted by the bot on their behalf.
 //
-// The URL is in plain `content` and NOT only in the embed, and that is the
-// whole difference between a clip that plays and a clip nobody clicks:
-// **Discord only builds a player for a link it finds in the message body.** A
-// URL inside an embed never gets one — the same rule that meant none of our
-// posts could ever have a link preview card (round 38). So the embed does the
-// framing and the bare URL underneath it does the playing.
+// ─── why this has NO EMBED ────────────────────────────────────────────────────
+// "NO VIDEO PLAYER FOR POST YOUR CLIPS." It had one, and this is why it did not
+// work: **Discord will not auto-embed a link in a message that already carries
+// an embed of its own.** The two screenshots are the proof — the identical
+// medal.tv link posted by a member unfurls into a player, and posted by the bot
+// with our card attached does not, even though the URL was right there in the
+// content.
+//
+// So the pretty card WAS the problem. It was competing with, and suppressing, a
+// far better one that Medal/YouTube/Streamable/Twitch supply themselves: title,
+// uploader, thumbnail and an inline player. This posts plain content and lets
+// Discord build that. What we add is the one thing the platform's card cannot
+// know — who in this server posted it, and what game it is.
+//
+// Anything added here that is an `embeds:` entry takes the player away again.
 //
 // Unlike a stream announcement this is NOT replaced by the next one. The
 // channel is a gallery; filling up is the desired outcome.
 function buildClipCard(guild, member, clip) {
   const p = platformOf(clip.url);
-  const name = member.user ? (member.user.globalName || member.user.username) : String(member.id);
-  const embed = new EmbedBuilder()
-    .setColor(p ? p.color : 0xFAA61A)
-    .setAuthor({
-      name,
-      iconURL: (member.displayAvatarURL && member.displayAvatarURL({ size: 128 })) || undefined,
-    })
-    .setTitle(`🎬  ${clip.title || 'Clip'}`.slice(0, 250))
-    .setURL(clip.url)
-    .setDescription(`<@${member.id}> posted a clip${p ? ` from **${p.name}**` : ''}.`);
+  const title = plainText(clip.title, 120);
+  const game  = plainText(clip.game, 80);
 
-  if (clip.game) embed.addFields({ name: '🎮 Game', value: clip.game.slice(0, 1024), inline: true });
-  if (p) embed.addFields({ name: '📺 Where', value: `${p.emoji} ${p.name}`, inline: true });
-  embed.setFooter({ text: `${SITE_URL.replace(/^https?:\/\//, '')} • ${MARK_CLIP_POST}` }).setTimestamp();
+  // `-#` is Discord's subtext: small and grey, which is what a footer looked
+  // like before, and it lives in the content because there is no embed to put a
+  // footer in. It also carries the marker, so a clip is still recognisable.
+  const head = title
+    ? `🎬 **${title}** — <@${member.id}>`
+    : `🎬 <@${member.id}> posted a clip`;
+  const bits = [game ? `🎮 ${game}` : null, p ? `${p.emoji} ${p.name}` : null].filter(Boolean);
+
+  const content = [
+    bits.length ? `${head}\n-# ${bits.join('  •  ')}` : head,
+    clip.url,   // on its own line, and the only URL in here. This is the player.
+    `-# ${SITE_URL.replace(/^https?:\/\//, '')} • ${MARK_CLIP_POST}`,
+  ].join('\n');
 
   const row = new ActionRowBuilder().addComponents(
+    // Kept even though the unfurled card is clickable: an unfurl can fail (an
+    // unsupported host, a private clip, a Discord hiccup) and the button is the
+    // one part of this that cannot.
     new ButtonBuilder().setLabel('Watch the clip').setEmoji('▶️').setStyle(ButtonStyle.Link).setURL(clip.url),
     // The next person's clip is usually prompted by seeing one. Making them
     // scroll back up to the panel to post it is where that goes to die.
     new ButtonBuilder().setCustomId('clip_submit').setLabel('Post yours').setEmoji('🎬').setStyle(ButtonStyle.Secondary),
   );
-  return { content: clip.url, embeds: [embed], components: [row] };
+  return { content, components: [row] };
 }
 
 // ─── the post-your-pc panel ───────────────────────────────────────────────────
@@ -836,8 +878,15 @@ async function handleCommunityModal(interaction) {
       // No ping, ever. A member pressing a button must not be able to notify
       // anybody, and allowedMentions is pinned rather than left to the default
       // because the card carries their own mention.
+      //
+      // No `withLanguage` either. The translatable content of a clip post is a
+      // title somebody typed and a game name, and the price of a dropdown here
+      // is the whole player: translating rewrites the message, and a rewrite
+      // with our text in it is a message with an app-supplied body Discord
+      // re-scans — the unfurl is not guaranteed to survive it. The clip is
+      // worth more than the dropdown.
       const card = await channel.send({
-        ...withLanguage(buildClipCard(interaction.guild, interaction.member || interaction.user, clip)),
+        ...buildClipCard(interaction.guild, interaction.member || interaction.user, clip),
         allowedMentions: { parse: [] },
       });
       lastClip.set(key, Date.now());

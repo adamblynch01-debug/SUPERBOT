@@ -35,7 +35,10 @@ const json2 = (payload) => ({
   embed: payload.embeds[0].toJSON(),
   rows: (payload.components || []).map(r => r.toJSON()),
 });
-const buttons = (payload) => json(payload).rows.flatMap(r => r.components);
+// Rows only. Since round 38 a clip post deliberately has no embed at all — the
+// embed was what suppressed Discord's video player — so this cannot go through
+// `json`, which insists on one.
+const buttons = (payload) => (payload.components || []).flatMap(r => r.toJSON().components);
 const footerOf = (payload) => json2(payload).embed.footer.text;
 
 // Source, with the comments taken out. Every anchor below is a fact about the
@@ -297,21 +300,27 @@ await check('the button opens a form rather than eating the press', () => {
   assert.strictEqual((modal.match(/setRequired\(true\)/g) || []).length, 1);
 });
 
-await check('the clip PLAYS, which means the URL is in the message body and not only the embed', () => {
-  // Discord builds a player for a link it finds in `content`. A URL inside an
-  // embed never gets one — the same rule that meant no post of ours could have
-  // a preview card. Without this the clip channel is a wall of cards nobody
-  // clicks, which is the whole thing it was asked not to be.
+await check('the clip PLAYS, which means the post carries NO embed of its own', () => {
+  // "NO VIDEO PLAYER FOR POST YOUR CLIPS." The URL was already in `content` and
+  // it still did not play, because **Discord will not auto-embed a link in a
+  // message that already has an app-supplied embed** — our own card was
+  // suppressing Medal's. So the assertion is not "the link is in the body", it
+  // is "there is nothing else in the message competing with it".
   const member = { id: '77', user: { globalName: 'Someone' }, displayAvatarURL: () => 'https://cdn/a.png' };
   const p = C.buildClipCard(guild, member, { url: 'https://medal.tv/clips/xyz', title: '1v5', game: 'Siege' });
-  assert.strictEqual(p.content, 'https://medal.tv/clips/xyz',
-    'the clip link is not in the message body, so Discord will not play it');
-  const { embed } = json(p);
-  assert.ok(/1v5/.test(embed.title), embed.title);
-  assert.strictEqual(embed.url, 'https://medal.tv/clips/xyz');
-  assert.strictEqual(embed.author.name, 'Someone');
-  assert.ok(embed.description.includes('<@77>'), 'the card does not say whose clip it is');
-  assert.ok(embed.fields.some(f => /Siege/.test(f.value)), 'the game was typed in and dropped');
+  assert.ok(!p.embeds || p.embeds.length === 0,
+    'the clip post has an embed again — that is exactly what takes the player away');
+  const lines = p.content.split('\n');
+  assert.ok(lines.includes('https://medal.tv/clips/xyz'),
+    'the link is not on a line of its own in the body, so Discord may not unfurl it');
+  // Exactly one URL in the whole message: a second one and Discord picks.
+  assert.strictEqual((p.content.match(/https?:\/\//g) || []).length, 1, p.content);
+  assert.ok(p.content.includes('<@77>'), 'the post does not say whose clip it is');
+  assert.ok(/1v5/.test(p.content), 'the title was typed in and dropped');
+  assert.ok(/Siege/.test(p.content), 'the game was typed in and dropped');
+  // The footer became `-#` subtext, which is where the marker now lives too.
+  assert.ok(p.content.includes(`-# `) && p.content.includes(C.MARK_CLIP_POST),
+    'a clip is no longer recognisable as one');
   assert.ok(buttons(p).some(b => b.style === 5 && b.url === 'https://medal.tv/clips/xyz'), 'no Watch button');
   assert.ok(buttons(p).some(b => b.custom_id === 'clip_submit'), 'no way to post one from a clip');
 });
@@ -319,8 +328,28 @@ await check('the clip PLAYS, which means the URL is in the message body and not 
 await check('a clip with nothing typed in it still renders', () => {
   const member = { id: '77', user: { username: 'someone' }, displayAvatarURL: () => 'https://cdn/a.png' };
   const p = C.buildClipCard(guild, member, { url: 'https://streamable.com/abc', title: null, game: null });
-  assert.ok(json(p).embed.title.length > 2, 'an untitled clip has no title at all');
-  assert.strictEqual(p.content, 'https://streamable.com/abc');
+  assert.ok(!p.embeds || p.embeds.length === 0);
+  assert.ok(p.content.split('\n').includes('https://streamable.com/abc'));
+  assert.ok(p.content.includes('<@77>'), 'an untitled clip loses its author');
+  // No empty `-#` line where the game and platform would have gone.
+  assert.ok(!/-# {2,}•|-# *\n/.test(p.content), p.content);
+});
+
+await check('a member cannot smuggle a second link or markdown into the clip post', () => {
+  // The title lands in plain content now, not in an embed field. A URL in there
+  // would (a) skip the blocked-domain check the clip link goes through and
+  // (b) be a second candidate for the unfurl — it could take the player.
+  const member = { id: '77', user: { username: 'someone' }, displayAvatarURL: () => 'https://cdn/a.png' };
+  const p = C.buildClipCard(guild, member, {
+    url: 'https://medal.tv/clips/ok',
+    title: 'free nitro http://evil.tld/x **BIG**',
+    game: '<@&1234> everyone',
+  });
+  assert.strictEqual((p.content.match(/https?:\/\//g) || []).length, 1,
+    'a member got a second URL into a bot post: ' + p.content);
+  assert.ok(!/evil\.tld/.test(p.content), p.content);
+  assert.ok(!/<@&1234>/.test(p.content), 'a role mention survived into the body');
+  assert.ok(/\\\*\\\*BIG\\\*\\\*/.test(p.content), 'markdown is not escaped: ' + p.content);
 });
 
 await check('a clip is never swept — the channel is meant to fill up', () => {
