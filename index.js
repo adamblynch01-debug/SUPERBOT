@@ -60,7 +60,8 @@ const {
 } = require('./modules/productInfo');
 const {
   commands: communityCommands, handleCommunityCommand, handleCommunityButton,
-  setCommunityGate,
+  handleCommunityModal, setCommunityGate,
+  MARK_GIVEAWAY, MARK_GW_ENTRY, MARK_GW_RESULTS,
 } = require('./modules/communityPanels');
 const translate = require('./modules/translate');
 // Only for the language dropdown: it reads a delivery DM back off the
@@ -68,6 +69,10 @@ const translate = require('./modules/translate');
 // not touch. See the dispatch site.
 const { protectFromEmbed } = require('./modules/deliveryEmbed');
 const { offerImageUpload } = require('./modules/imageAttach');
+// Turns a pasted body into something that renders: headings that work behind a
+// bullet, `[url](url)` unwrapped, and the link echoed into plain content so
+// Discord draws the preview card an embed never gets on its own.
+const { formatNotes, normalizeMarkdown, withPreview, fitsField, clampDescription } = require('./modules/richText');
 const { makeStaffRoleResolver } = require('./modules/staffRoles');
 const serverBackup = require('./modules/serverBackup');
 const mirror = require('./modules/mirror');
@@ -519,6 +524,87 @@ function saveGiveaways() {
   const obj = {};
   for (const [id, g] of giveaways) obj[id] = { ...g, participants: [...g.participants] };
   saveJSON(GIVEAWAYS_FILE, obj);
+}
+
+// Drawing the winners, retiring the entry card and posting the results used to
+// be written out three times — in /giveaway's own timer, and twice more in the
+// restart path that re-arms timers the process lost. Three copies of one flow
+// drift, and round 38 needed the SAME change in all three (the marker in the
+// footer, without which the next giveaway cannot find the old one to clear it),
+// which is the point at which three copies stop being tolerable.
+async function endGiveaway(msgId, why = 'timer') {
+  const gw = giveaways.get(msgId);
+  if (!gw || gw.ended) return;
+  gw.ended = true;
+  saveGiveaways();
+
+  const participants = [...gw.participants];
+  const winners = pickWinners(participants, gw.winnerCount || 1);
+  const winnersText = winners.length ? winners.map(w => `<@${w}>`).join(', ') : null;
+
+  try {
+    const gwCh = await client.channels.fetch(gw.channelId);
+    const endedEmbed = new EmbedBuilder()
+      .setColor(0x95A5A6)
+      .setAuthor({ name: BOT_NAME, iconURL: client.user.displayAvatarURL() })
+      .setTitle(`🎁 ${gw.prize} [ENDED]`)
+      .setDescription(`This giveaway has ended!\n\n**${winners.length > 1 ? 'Winners' : 'Winner'}:** ${winnersText || 'No participants'}`)
+      .setThumbnail(client.user.displayAvatarURL())
+      // The marker has to survive being ended. This footer REPLACES the one the
+      // entry card was posted with, so leaving it off would hide the finished
+      // giveaway from the sweep that is supposed to clear it next time.
+      .setFooter({ text: `Ended on ${new Date(gw.endsAt).toUTCString()} • ${MARK_GW_ENTRY}`, iconURL: client.user.displayAvatarURL() });
+    if (gw.imageUrl) endedEmbed.setImage(gw.imageUrl);
+    const disabledRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('giveaway_enter').setLabel(`🎉 Participate (${participants.length})`).setStyle(ButtonStyle.Primary).setDisabled(true),
+    );
+    try {
+      const gwMsg = await gwCh.messages.fetch(msgId);
+      await gwMsg.edit(withLanguageRow({ embeds: [endedEmbed], components: [disabledRow] }));
+    } catch (e) {
+      // Somebody deleted the entry card. The draw still happened, so the
+      // results still go out — silently swallowing them would lose the winners.
+      console.warn(`[Giveaway] entry card ${msgId} is gone (${e.message}) — posting results anyway`);
+    }
+
+    const resultsEmbed = new EmbedBuilder()
+      .setColor(0x2ECC71)
+      .setTitle(`🎁 ${gw.prize} [RESULTS]`)
+      .setDescription(`The ${winners.length > 1 ? 'winners are' : 'winner is'} tagged above! Congratulations 🎉`)
+      .addFields(
+        { name: 'Prize', value: gw.prize, inline: false },
+        { name: 'Winners', value: `${winners.length}`, inline: false },
+        { name: 'Participants', value: `${participants.length}`, inline: false },
+      )
+      .setFooter({ text: `${BOT_NAME} | ${SITE_URL} • ${MARK_GW_RESULTS}`, iconURL: client.user.displayAvatarURL() })
+      .setTimestamp();
+    await gwCh.send(withLanguageRow({ content: winnersText || '❌ No participants — no winner.', embeds: [resultsEmbed] }));
+  } catch (e) { console.error(`Giveaway end error (${why}):`, e); }
+}
+
+// "when a giveaway is done, make sure next time giveaway is done it clears the
+// old giveaway + giveaway results. Leaving just the ./Setup-Giveaway alone."
+//
+// Narrow on purpose. It removes only messages the bot itself posted that carry
+// one of the two DISPOSABLE giveaway markers. The standing panel is
+// `panel:giveaway` and neither marker is a substring of it, which is the whole
+// reason the markers are named the way they are — `giveaway:entry` under a
+// `includes('panel:giveaway')` test would have made this delete the panel.
+async function clearOldGiveaway(channel) {
+  const removed = [];
+  try {
+    const recent = await channel.messages.fetch({ limit: 50 });
+    for (const m of recent.values()) {
+      if (m.author.id !== client.user.id) continue;
+      const footers = m.embeds.map(e => (e.footer && e.footer.text) || '');
+      if (!footers.some(f => f.includes(MARK_GW_ENTRY) || f.includes(MARK_GW_RESULTS))) continue;
+      if (footers.some(f => f.includes(MARK_GIVEAWAY))) continue;   // never the panel
+      try { await m.delete(); removed.push(m.id); giveaways.delete(m.id); }
+      catch (e) { console.warn('[Giveaway] could not remove an old post:', e.message); }
+    }
+    if (removed.length) saveGiveaways();
+  } catch (e) { console.warn('[Giveaway] could not scan for old posts:', e.message); }
+  return removed;
 }
 
 function saveVouches() {
@@ -3384,57 +3470,11 @@ client.once('ready', async () => {
     const remaining = new Date(gw.endsAt).getTime() - Date.now();
     if (remaining <= 0) {
       // Already expired while bot was offline — end it now
-      gw.ended = true;
-      saveGiveaways();
-      (async () => {
-        try {
-          const gwCh  = await client.channels.fetch(gw.channelId);
-          const gwMsg = await gwCh.messages.fetch(msgId);
-          const participants = [...gw.participants];
-          const count   = gw.winnerCount || 1;
-          const winners = pickWinners(participants, count);
-          const winnersText = winners.length ? winners.map(w => `<@${w}>`).join(', ') : null;
-          const endedEmbed = new EmbedBuilder().setColor(0x95A5A6).setTitle(`🎁 ${gw.prize} [ENDED]`)
-            .setDescription(`This giveaway has ended!\n\n**${winners.length > 1 ? 'Winners' : 'Winner'}:** ${winnersText || 'No participants'}`)
-            .setFooter({ text: `Ended on ${new Date(gw.endsAt).toUTCString()}`, iconURL: client.user.displayAvatarURL() });
-          const disabledRow = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId('giveaway_enter').setLabel(`🎉 Participate (${participants.length})`).setStyle(ButtonStyle.Primary).setDisabled(true),
-          );
-          await gwMsg.edit(withLanguageRow({ embeds: [endedEmbed], components: [disabledRow] }));
-          const resultsEmbed = new EmbedBuilder().setColor(0x2ECC71).setTitle(`🎁 ${gw.prize} [RESULTS]`)
-            .setDescription(`The ${winners.length > 1 ? 'winners are' : 'winner is'} tagged above! Congratulations 🎉`)
-            .addFields({ name: 'Prize', value: gw.prize }, { name: 'Participants', value: `${participants.length}` }, { name: 'Winners', value: `${winners.length}` })
-            .setFooter({ text: `${BOT_NAME} | ${SITE_URL}`, iconURL: client.user.displayAvatarURL() }).setTimestamp();
-          await gwCh.send(withLanguageRow({ content: winnersText || '❌ No participants — no winner.', embeds: [resultsEmbed] }));
-        } catch (e) { console.error('Giveaway restart-end error:', e); }
-      })();
+      endGiveaway(msgId, 'restart').catch(e => console.error('Giveaway restart-end error:', e));
     } else {
       // Still has time left — re-arm the timer for the remaining duration
-      safeSetTimeout(async () => {
-        const g = giveaways.get(msgId);
-        if (!g || g.ended) return;
-        g.ended = true;
-        saveGiveaways();
-        try {
-          const gwCh  = await client.channels.fetch(g.channelId);
-          const gwMsg = await gwCh.messages.fetch(msgId);
-          const participants = [...g.participants];
-          const count   = g.winnerCount || 1;
-          const winners = pickWinners(participants, count);
-          const winnersText = winners.length ? winners.map(w => `<@${w}>`).join(', ') : null;
-          const endedEmbed = new EmbedBuilder().setColor(0x95A5A6).setTitle(`🎁 ${g.prize} [ENDED]`)
-            .setDescription(`This giveaway has ended!\n\n**${winners.length > 1 ? 'Winners' : 'Winner'}:** ${winnersText || 'No participants'}`)
-            .setFooter({ text: `Ended on ${new Date(g.endsAt).toUTCString()}`, iconURL: client.user.displayAvatarURL() });
-          const disabledRow = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId('giveaway_enter').setLabel(`🎉 Participate (${participants.length})`).setStyle(ButtonStyle.Primary).setDisabled(true),
-          );
-          await gwMsg.edit(withLanguageRow({ embeds: [endedEmbed], components: [disabledRow] }));
-          const resultsEmbed = new EmbedBuilder().setColor(0x2ECC71).setTitle(`🎁 ${g.prize} [RESULTS]`)
-            .setDescription(`The ${winners.length > 1 ? 'winners are' : 'winner is'} tagged above! Congratulations 🎉`)
-            .addFields({ name: 'Prize', value: g.prize }, { name: 'Participants', value: `${participants.length}` }, { name: 'Winners', value: `${winners.length}` })
-            .setFooter({ text: `${BOT_NAME} | ${SITE_URL}`, iconURL: client.user.displayAvatarURL() }).setTimestamp();
-          await gwCh.send(withLanguageRow({ content: winnersText || '❌ No participants — no winner.', embeds: [resultsEmbed] }));
-        } catch (e) { console.error('Giveaway rescheduled-end error:', e); }
+      safeSetTimeout(() => {
+        endGiveaway(msgId, 'rescheduled').catch(e => console.error('Giveaway rescheduled-end error:', e));
       }, remaining);
       console.log(`⏰ Rescheduled giveaway ${msgId} (${gw.prize}) — ${Math.round(remaining / 60000)}m remaining`);
     }
@@ -3873,7 +3913,7 @@ client.on('interactionCreate', async interaction => {
             { name: '🔐 Verification & Invites', value: '`/setup-verify` — Set up verification channel\n`/setup-invites` — Set up invite reward channel\n`/show-voucher-stats` — Invite leaderboard / one member\'s stats', inline: false },
             { name: '📦 Products & Downloads', value: '`/product-info` — Look up any product: price, plans, stock, features\n`/downloads` — Browse & download products\n`/setupdownloads` — Post download panel to #downloads\n`/setdownload` — Set a product download link', inline: false },
             { name: '📣 Updates & Status', value: '`/postupdate` — Post a product update\n`/statusupdate` — Post a status update\n`/announce` — Send a custom announcement', inline: false },
-            { name: '🌐 Server Setup', value: '`/setup-website` — Post the website panel\n`/setup-payments` — Post the payment methods panel (live fees)\n`/setup-livestream` — Post the live-stream panel\n`/golive` — Announce a stream with its link (blank link = ended)\n`/setup-clips` — Post the post-your-clips panel\n`/setupreseller` — Post reseller panel\n`/setresellerlinks` — Update reseller button links\n`/postimage` — Post an image', inline: false },
+            { name: '🌐 Server Setup', value: '`/setup-website` — Post the website panel\n`/setup-payments` — Post the payment methods panel (live fees)\n`/setup-livestream` — Post the live-stream panel (members can go live from it)\n`/golive` — Announce a stream with its link (blank link = remove the announcement)\n`/setup-clips` — Post the post-your-clips panel\n`/setup-postyourpc` — Post the post-your-setup panel\n`/setup-suggestions` — Post the suggestions panel\n`/setup-giveaway` — Post the giveaways panel\n`/setupreseller` — Post reseller panel\n`/setresellerlinks` — Update reseller button links\n`/postimage` — Post an image', inline: false },
             { name: '💾 Server Snapshots', value: '`/serverbackup create` — Save the server\'s roles, channels & permissions\n`/serverbackup list|view|export` — Browse or download a snapshot\n`/serverbackup restore` — Rebuild from one: tick roles / categories / channels / permissions / emojis (never deletes anything)', inline: false },
             { name: '🔁 Cross-Server Mirroring', value: '`/mirror follow` — Announcement channels: let another server follow this one (Discord delivers it)\n`/mirror add` — Any channel: relay its posts into another server\n`/mirror list|remove|test` — Manage the relays\n`/mirror panic` — Stop everything arriving here, right now\n`/mirror block|unblock|resume` — Refuse a server outright, or restart a paused route', inline: false },
             { name: '🎫 Support Tickets', value: '`/panel` — Post the support panel\n`/clearlogs` — Clear ticket log channel\n`/reply` — Reply to a user\'s ticket', inline: false },
@@ -4419,7 +4459,9 @@ client.on('interactionCreate', async interaction => {
           .setTitle(`🎁 ${prize}`)
           .setDescription(`Click the button below to enter the giveaway!\n\n🏆 **Winners:** ${winnerCount}\n⏰ **Ends:** ${endsTs}`)
           .setThumbnail(client.user.displayAvatarURL())
-          .setFooter({ text: `${BOT_NAME} | ${SITE_URL}`, iconURL: client.user.displayAvatarURL() })
+          // The marker is what lets the NEXT giveaway find this one and clear
+          // it. Without it in the footer the sweep below is blind.
+          .setFooter({ text: `${BOT_NAME} | ${SITE_URL} • ${MARK_GW_ENTRY}`, iconURL: client.user.displayAvatarURL() })
           .setTimestamp(endsAt);
         if (imageUrl) embed.setImage(imageUrl);
 
@@ -4428,59 +4470,31 @@ client.on('interactionCreate', async interaction => {
         );
 
         await interaction.deferReply({ ephemeral: true });
+
+        // "when a giveaway is done, make sure next time giveaway is done it
+        // clears the old giveaway + giveaway results." Done BEFORE the new post
+        // so the channel is never holding two giveaways at once, and scoped to
+        // the two disposable markers so `/setup-giveaway`'s panel survives.
+        const swept = await clearOldGiveaway(targetCh);
+
         // A giveaway is one of the few posts that pings the whole server, so it
         // is read by more people who do not read English than almost anything
         // else the bot writes.
         const msg = await targetCh.send(withLanguageRow({ content: '@everyone', embeds: [embed], components: [row] }));
 
-        giveaways.set(msg.id, { prize, channelId: targetCh.id, guildId: interaction.guild.id, endsAt: endsAt.toISOString(), participants: new Set(), ended: false, winnerCount });
+        // imageUrl is stored, not just closed over: endGiveaway() runs from the
+        // restart path too, where the closure is long gone, and an ended card
+        // that silently loses its picture reads as a different giveaway.
+        giveaways.set(msg.id, { prize, channelId: targetCh.id, guildId: interaction.guild.id, endsAt: endsAt.toISOString(), participants: new Set(), ended: false, winnerCount, imageUrl });
         saveGiveaways();
 
-        // Schedule auto-end
-        safeSetTimeout(async () => {
-          const gw = giveaways.get(msg.id);
-          if (!gw || gw.ended) return;
-          gw.ended = true;
-          saveGiveaways();
-          const participants = [...gw.participants];
-          const count   = gw.winnerCount || 1;
-          const winners = pickWinners(participants, count);
-          const winnersText = winners.length ? winners.map(w => `<@${w}>`).join(', ') : null;
-
-          // Edit original embed to [ENDED]
-          try {
-            const endedEmbed = new EmbedBuilder()
-              .setColor(0x95A5A6)
-              .setAuthor({ name: BOT_NAME, iconURL: client.user.displayAvatarURL() })
-              .setTitle(`🎁 ${prize} [ENDED]`)
-              .setDescription(`This giveaway has ended!\n\n**${winners.length > 1 ? 'Winners' : 'Winner'}:** ${winnersText || 'No participants'}`)
-              .setThumbnail(client.user.displayAvatarURL())
-              .setFooter({ text: `Ended on ${endsAt.toUTCString()}`, iconURL: client.user.displayAvatarURL() });
-            if (imageUrl) endedEmbed.setImage(imageUrl);
-            const disabledRow = new ActionRowBuilder().addComponents(
-              new ButtonBuilder().setCustomId('giveaway_enter').setLabel(`🎉 Participate (${participants.length})`).setStyle(ButtonStyle.Primary).setDisabled(true),
-            );
-            const gwCh = await client.channels.fetch(gw.channelId);
-            const gwMsg = await gwCh.messages.fetch(msg.id);
-            await gwMsg.edit(withLanguageRow({ embeds: [endedEmbed], components: [disabledRow] }));
-
-            // Post results embed
-            const resultsEmbed = new EmbedBuilder()
-              .setColor(0x2ECC71)
-              .setTitle(`🎁 ${prize} [RESULTS]`)
-              .setDescription(`The ${winners.length > 1 ? 'winners are' : 'winner is'} tagged above! Congratulations 🎉`)
-              .addFields(
-                { name: 'Prize', value: prize, inline: false },
-                { name: 'Winners', value: `${winners.length}`, inline: false },
-                { name: 'Participants', value: `${participants.length}`, inline: false },
-              )
-              .setFooter({ text: `${BOT_NAME} | ${SITE_URL}`, iconURL: client.user.displayAvatarURL() })
-              .setTimestamp();
-            await gwCh.send(withLanguageRow({ content: winnersText || '❌ No participants — no winner.', embeds: [resultsEmbed] }));
-          } catch (e) { console.error('Giveaway end error:', e); }
+        safeSetTimeout(() => {
+          endGiveaway(msg.id, 'timer').catch(e => console.error('Giveaway end error:', e));
         }, durMs);
 
-        await interaction.editReply({ content: `✅ Giveaway started in <#${targetCh.id}>! Ends ${endsTs}` }); autoDelete(interaction, 8000);
+        await interaction.editReply({ content: `✅ Giveaway started in <#${targetCh.id}>! Ends ${endsTs}`
+          + (swept.length ? `\n🧹 Cleared ${swept.length} post${swept.length === 1 ? '' : 's'} from the previous giveaway. The \`/setup-giveaway\` panel was left alone.` : '') });
+        autoDelete(interaction, 8000);
         return;
       }
 
@@ -6753,6 +6767,11 @@ client.on('interactionCreate', async interaction => {
       // Reply-to-website-ticket modal (modules/webTickets.js)
       if (await handleWebTicketModal(interaction)) return;
 
+      // The two member-facing panel modals: "I'm going live" and "Make a
+      // suggestion" (modules/communityPanels.js). Both ungated on purpose —
+      // they are the half of those panels that members use.
+      if (await handleCommunityModal(interaction)) return;
+
       // Redeem panel modal
       if (interaction.customId === 'redeem_modal') {
         const keyInput = interaction.fields.getTextInputValue('redeem_key_input');
@@ -6855,7 +6874,10 @@ client.on('interactionCreate', async interaction => {
         }
         if (newStatus) { const nk = Object.keys(STATUS_TYPES).find(k => STATUS_TYPES[k] === newStatus); if (nk) productLastStatus[product.toLowerCase()] = nk; }
 
-        const notes = notesRaw ? notesRaw.split('|').map(n => `• ${n.trim()}`).join('\n') : null;
+        // Bullets when the admin wrote a pipe-separated list, prose when they
+        // pasted prose. The old code did the first unconditionally, which is
+        // how `# ⚠️ INJECTION ERROR FIX` came out as `• # ⚠️ INJECTION ERROR FIX`.
+        const notes = formatNotes(notesRaw);
         const embedColor = newStatus ? newStatus.color : getProductColor(product);
         const fields = [
           { name: 'Product', value: `\`${product}\``, inline: false },
@@ -6864,18 +6886,29 @@ client.on('interactionCreate', async interaction => {
         if ((typeKey === 'time_extension' || typeKey === 'new_feature') && statusRaw) fields.push({ name: 'Time Added', value: statusRaw, inline: false });
         if (oldStatus && newStatus) { fields.push({ name: 'Changed from', value: `${oldStatus.emoji}  ${oldStatus.label}`, inline: true }, { name: 'New Status', value: `${newStatus.emoji}  ${newStatus.label}`, inline: true }); }
         else if (newStatus) fields.push({ name: 'Status', value: `${newStatus.emoji}  ${newStatus.label}`, inline: false });
-        if (notes) fields.push({ name: 'Notes', value: notes, inline: false });
+        // A field value is capped at 1024 characters and going over REJECTS the
+        // whole message. A long paste is prose, and prose belongs in the
+        // description (4096) — so it moves rather than being cut.
+        const longNotes = notes && !fitsField(notes);
+        if (notes && !longNotes) fields.push({ name: 'Notes', value: notes, inline: false });
 
         const embed = new EmbedBuilder()
           .setTitle((customTitle ? customTitle.toUpperCase() : product.toUpperCase()))
           .setColor(embedColor).addFields(fields)
           .setFooter({ text: `${BOT_NAME} | ${SITE_URL}`, iconURL: client.user.displayAvatarURL() }).setTimestamp();
+        if (longNotes) embed.setDescription(clampDescription(notes));
         if (imageUrl) embed.setThumbnail(imageUrl);
 
         const productData = getProductByName(product);
         const downloadUrl = productData ? (productData.url || '') : '';
         const buttonRow = downloadUrl ? new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel('⬇️  DOWNLOAD').setURL(downloadUrl).setStyle(ButtonStyle.Link)) : null;
-        const payload = { embeds: [embed], ...(buttonRow ? { components: [buttonRow] } : {}) };
+        // The preview card. Discord unfurls a link in the plain content and
+        // never one inside an embed — that is the whole difference between the
+        // post the user liked and the post they were shown. The download link
+        // is skipped: it already has a button, and a second card for it would
+        // be the same address twice.
+        const previewContent = withPreview('', notes, { skip: [downloadUrl, imageUrl] });
+        const payload = { embeds: [embed], ...(previewContent ? { content: previewContent } : {}), ...(buttonRow ? { components: [buttonRow] } : {}) };
 
         // Deferred because the sync below is two more network calls, and a
         // modal reply has about three seconds before Discord declares the
@@ -6927,12 +6960,15 @@ client.on('interactionCreate', async interaction => {
           else { const rm = pingStr.match(/\d+/); if (rm) pingText = `<@&${rm[0]}>`; else { const r = interaction.guild.roles.cache.find(r => r.name.toLowerCase() === clean); if (r) pingText = `<@&${r.id}>`; } }
         }
 
+        const body = normalizeMarkdown(message);
         const embed = new EmbedBuilder().setColor(0x5865F2);
         if (title) embed.setTitle(title);
-        embed.setDescription(message).setFooter({ text: `${BOT_NAME} | ${SITE_URL}`, iconURL: client.user.displayAvatarURL() }).setTimestamp();
+        embed.setDescription(clampDescription(body)).setFooter({ text: `${BOT_NAME} | ${SITE_URL}`, iconURL: client.user.displayAvatarURL() }).setTimestamp();
         const buttonRow = dlUrl ? new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel('⬇️  DOWNLOAD').setURL(dlUrl).setStyle(ButtonStyle.Link)) : null;
         try {
-          const posted = await targetCh.send(withLanguageRow({ content: pingText, embeds: [embed], ...(buttonRow ? { components: [buttonRow] } : {}) }));
+          // The ping and, under it, any link from the body as a bare URL — the
+          // only place Discord will draw a preview card for it.
+          const posted = await targetCh.send(withLanguageRow({ content: withPreview(pingText, body, { skip: [dlUrl] }), embeds: [embed], ...(buttonRow ? { components: [buttonRow] } : {}) }));
           await interaction.reply({ content: `✅ Announcement posted to <#${targetCh.id}>`, flags: 64 }); autoDelete(interaction, 5000);
           // Offered here even when the announcement went to another channel:
           // the admin is typing in THIS one, so this is where they can drop a
@@ -6953,9 +6989,12 @@ client.on('interactionCreate', async interaction => {
         const fields = [{ name: 'Product', value: `\`${product.toUpperCase()}\``, inline: false }];
         if (oldStatus && newStatus) { fields.push({ name: 'Changed from', value: `${oldStatus.emoji}  ${oldStatus.label}`, inline: false }, { name: 'New Status', value: `${newStatus.emoji}  ${newStatus.label}`, inline: false }); }
         else if (newStatus) fields.push({ name: 'New Status', value: `${newStatus.emoji}  ${newStatus.label}`, inline: false });
-        if (notesRaw) fields.push({ name: 'Notes', value: notesRaw.split('|').map(n => `• ${n.trim()}`).join('\n'), inline: false });
+        const ssNotes = formatNotes(notesRaw);
+        const ssLong = ssNotes && !fitsField(ssNotes);
+        if (ssNotes && !ssLong) fields.push({ name: 'Notes', value: ssNotes, inline: false });
         const embed = new EmbedBuilder().setTitle('Status Change').setColor(getProductColor(product)).addFields(fields)
           .setFooter({ text: `${BOT_NAME} | ${SITE_URL}`, iconURL: client.user.displayAvatarURL() }).setTimestamp();
+        if (ssLong) embed.setDescription(clampDescription(ssNotes));
         const statusCh = findChannelByName(interaction.guild, 'statusupdates') || interaction.channel;
         let pingText = '@everyone';
         if (pingStr) { const clean = pingStr.replace('@','').trim().toLowerCase(); if (clean==='everyone') pingText='@everyone'; else if (clean==='here') pingText='@here'; else { const rm=pingStr.match(/\d+/); if(rm) pingText=`<@&${rm[0]}>`; else { const r=interaction.guild.roles.cache.find(r=>r.name.toLowerCase()===clean); if(r) pingText=`<@&${r.id}>`; } } }
@@ -6970,7 +7009,7 @@ client.on('interactionCreate', async interaction => {
         }
 
         try {
-          const posted = await statusCh.send(withLanguageRow({ content: pingText, embeds: [embed] }));
+          const posted = await statusCh.send(withLanguageRow({ content: withPreview(pingText, ssNotes), embeds: [embed] }));
           await interaction.editReply({ content: `✅ Status update posted to <#${statusCh.id}>${describeSync(siteSync)}` });
           autoDelete(interaction, siteSync && !siteSync.ok ? 30000 : 5000);
           offerImageUpload({ interaction, message: posted, embed, fileBase: `status-${posted.id}` });

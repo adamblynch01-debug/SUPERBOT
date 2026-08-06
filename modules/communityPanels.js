@@ -1,45 +1,85 @@
-// ─── #live-stream AND #post-your-clips ────────────────────────────────────────
+// ─── the standing channel panels ──────────────────────────────────────────────
 // "WHAT YOU DID WITH THE /SETUP-WEBSITE WHEN I TOLD YOU IT LOOK DEAD. DO THE
 // SAME FOR THE LIVE-STREAM AND POST-YOUR-CLIPS CHANNEL."
 //
-// Same complaint, same shape of answer. #post-your-clips had NOTHING in it —
-// members were pasting bare medal.tv URLs into an empty room with no post at
-// the top saying what the room is for. #live-stream had nothing standing in it
-// either, so between streams it read as abandoned.
+// Same complaint, same shape of answer, now covering #live-stream,
+// #post-your-clips, #post-your-pc and #suggestions. Each channel gets ONE post
+// at the top saying what the room is for and giving the member the button that
+// does the thing.
 //
-// The part that is not a nicer-looking hardcode:
+// ─── the rule this module got wrong once, and is the reason for the shape ─────
 //
-//   "EXCEPT FOR THIS ONE GIVE ME OPTION TO ATTACH STREAM LINK EVERYTIME GOING
-//    LIVE."
+//   "at the moment after posting ./golive url, it makes 2 post + removeS
+//    ./setup-livestream.  ./setup-livestream SHOULD BE LEFT ALONE IF POSTED."
+//
+// It did. `/golive` used to EDIT the standing panel into a "🔴 LIVE RIGHT NOW"
+// state as well as posting the announcement, which from the channel's point of
+// view is two posts and a panel that has stopped looking like a panel. The
+// panel and the announcement are different KINDS of thing and the fix is to
+// stop pretending otherwise:
+//
+//   • **The panel is furniture.** Only `/setup-livestream` ever writes it. It
+//     always reads the same. `/golive` must not touch it, ever — there is no
+//     code path in here that edits MARK_LIVE outside the setup command, and
+//     that is asserted in test_community_panels.js.
+//   • **The announcement is disposable.** There is one, it is the current one,
+//     and a new one REPLACES it: "do have it remove the old one." Deleted, not
+//     retitled. Retiring it to a "Stream ended" card is only the fallback for
+//     when the bot has no Manage Messages, because a card still claiming to be
+//     live is worse than a tidy tombstone.
 //
 // A stream link is different every time, so it cannot live in the panel. It is
-// `/golive link:<url>` — which posts a fresh card (a fresh ping; that is the
-// point of announcing) AND edits the standing panel so it says LIVE RIGHT NOW
-// with that link on it. Run `/golive` with no link and the stream is marked
-// over: the panel goes back to idle and the last card stops saying LIVE, so a
-// three-day-old announcement is not still claiming to be live.
+// `/golive link:<url>` for staff, and for everyone else it is the **I'm going
+// live** button on the panel, which asks for the link in a modal and posts the
+// same nice card on their behalf.
 //
-// Which message is the panel is not stored anywhere. Each embed carries a
-// marker in its footer and the command finds it by scanning recent history —
-// the same trick storefrontPanels.js uses, for the same reason: it survives a
-// restart, and an in-memory id does not.
+// Which message is which is not stored anywhere. Each embed carries a marker in
+// its footer and the commands find it by scanning recent history — the same
+// trick storefrontPanels.js uses, for the same reason: it survives a restart,
+// and an in-memory id does not.
+//
+// **Markers must never be prefixes of each other.** The lookup is `includes()`,
+// so a marker named `panel:giveaway-live` would be found by a search for
+// `panel:giveaway` and a sweep meant for the old giveaway would eat the panel.
+// That is why the disposable ones are `live-by:` / `giveaway:` and the
+// furniture is `panel:`.
 'use strict';
 
 const {
   SlashCommandBuilder, EmbedBuilder, ActionRowBuilder, ButtonBuilder,
-  ButtonStyle, PermissionFlagsBits,
+  ButtonStyle, PermissionFlagsBits, ModalBuilder, TextInputBuilder,
+  TextInputStyle,
 } = require('discord.js');
 const { languageRow } = require('./translate');
 const { upsertPanel } = require('./storefrontPanels');
 
 const SITE_URL = (process.env.SITE_URL || 'https://uhservices.xyz').replace(/\/+$/, '');
 
-const MARK_LIVE     = 'panel:live-stream';   // the standing panel
-const MARK_LIVE_NOW = 'panel:live-now';      // one announcement, per stream
+// Furniture — written only by its own /setup- command, never by anything else.
+const MARK_LIVE     = 'panel:live-stream';
 const MARK_CLIPS    = 'panel:clips';
+const MARK_PC       = 'panel:post-your-pc';
+const MARK_SUGGEST  = 'panel:suggestions';
+const MARK_GIVEAWAY = 'panel:giveaway';
+
+// Disposable — replaced or removed by the next one of its kind. Deliberately
+// NOT prefixed `panel:`, so a sweep can never match a panel by substring.
+const MARK_LIVE_NOW    = 'live-now';                        // the staff announcement
+const markLiveBy       = (userId) => `live-by:${userId}`;   // a member's, one each
+const MARK_SUGGESTION  = 'suggestion:filed';
+// index.js owns /giveaway; these are declared here so the panel and the sweep
+// cannot drift apart, and so the prefix rule above is enforced in one place.
+const MARK_GW_ENTRY    = 'giveaway:entry';
+const MARK_GW_RESULTS  = 'giveaway:results';
 
 let gate = { hasAccess: () => false };
 function setCommunityGate(g) { gate = { ...gate, ...g }; }
+
+// A member pressing "I'm going live" replaces their own last announcement, so
+// spamming it cannot fill the channel — but it can churn a delete and a post
+// per press, so it is rate limited to one every few minutes per person.
+const MEMBER_GOLIVE_COOLDOWN_MS = 3 * 60_000;
+const lastMemberGoLive = new Map();   // `${guildId}:${userId}` → ms
 
 // ─── the link ─────────────────────────────────────────────────────────────────
 // A Link button with a URL Discord will not accept does not degrade — it
@@ -82,70 +122,70 @@ function platformOf(url) {
 }
 
 // ─── the live-stream panel ────────────────────────────────────────────────────
-// `live` is either null (nobody is streaming) or the announcement's details.
-// Both states are real states and the panel says which one it is in — an idle
-// panel that looks identical to a live one is how a channel starts reading as
-// dead in the first place.
-function buildLivePanel(guild, live) {
-  const p = live && platformOf(live.url);
+// ONE state, always the same, because it is furniture. It used to take a `live`
+// argument and render a second "🔴 LIVE RIGHT NOW" form, which is what let
+// `/golive` overwrite the panel with an announcement — the bug being fixed. The
+// argument is gone rather than merely unused: an unused parameter is an
+// invitation to pass something to it again.
+function buildLivePanel(guild) {
   const embed = new EmbedBuilder()
-    .setColor(live ? (p ? p.color : 0xE91E63) : 0x2B2D31)
+    .setColor(0xE91E63)
     .setAuthor({ name: guild.name, iconURL: guild.iconURL({ size: 128 }) || undefined })
-    .setTitle(live ? '🔴  LIVE RIGHT NOW' : '📺  Live streams');
-
-  if (live) {
-    if (live.url) embed.setURL(live.url);
-    embed.setDescription(
-      (live.title ? `**${live.title}**\n` : '')
-      + `The stream is up now${p ? ` on **${p.name}**` : ''}. Tap **Watch now** below.`
-    );
-    if (live.game) embed.addFields({ name: '🎮 Playing', value: live.game, inline: true });
-    embed.addFields({ name: '🔗 Where', value: p ? `${p.emoji} ${p.name}` : 'Link below', inline: true });
-  } else {
-    embed.setDescription(
+    .setTitle('📺  Live streams')
+    .setDescription(
       `**This is where streams get announced.**\n`
-      + `Nobody is live at the moment. When a stream starts, the link is posted right here — `
-      + `you do not have to go looking for it.`
-    ).addFields(
-      { name: '🔴 When we go live', value: 'An announcement lands in this channel with the link on it.', inline: true },
+      + `When anyone goes live the link is posted right here — you do not have to go looking for it. `
+      + `Streaming yourself? Press **I'm going live**, paste your link, and the bot will post it for you.`
+    )
+    .addFields(
+      { name: '🔴 Going live yourself', value: 'Press the button, paste the link. It gets posted properly, with the platform and a Watch button on it.', inline: true },
       { name: '🔔 Get notified', value: 'Turn on notifications for this channel so you actually see it.', inline: true },
       { name: '💬 Watching along', value: 'Chat in the stream, or in here — both get read.', inline: true },
+      { name: '📌 Links only', value: 'Keep this channel for streams. The announcement is what people scroll back for.', inline: false },
     );
-  }
 
   if (guild.iconURL()) embed.setThumbnail(guild.iconURL({ size: 256 }));
   embed.setFooter({ text: `${SITE_URL.replace(/^https?:\/\//, '')} • ${MARK_LIVE}` }).setTimestamp();
 
-  const row = new ActionRowBuilder();
-  if (live && live.url) {
-    row.addComponents(new ButtonBuilder().setLabel('Watch now').setEmoji('▶️').setStyle(ButtonStyle.Link).setURL(live.url));
-  }
-  // Offline there is no link to put on a Link button, and a Link button has to
-  // have one. This is the button that stops the idle panel being three lines
-  // and a full stop.
-  row.addComponents(
+  // No Link button can point at "the current stream" — there may not be one,
+  // and a Link button without a URL rejects the whole message. These three are
+  // what stops the panel being three lines and a full stop.
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('live_go').setLabel("I'm going live").setEmoji('🔴').setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId('live_notify').setLabel('How do I get notified?').setEmoji('🔔').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setLabel('The store').setEmoji('🛒').setStyle(ButtonStyle.Link).setURL(SITE_URL),
   );
   return { embeds: [embed], components: [row] };
 }
 
-// The announcement itself. Separate message from the panel on purpose: the
-// panel is edited in place (so it is never a duplicate) and the announcement is
-// posted fresh (so it actually notifies somebody).
+// The announcement itself, and a different KIND of message from the panel: the
+// panel is edited in place forever, this one is posted fresh (so it actually
+// notifies somebody) and deleted when it is replaced.
+//
+// `live.by` is a user id when a member posted it through the panel button. It
+// changes the wording and the marker, so a member's announcement replaces only
+// their own and never the server's.
 function buildLiveCard(guild, live) {
   const p = platformOf(live.url);
+  const marker = live.by ? markLiveBy(live.by) : MARK_LIVE_NOW;
   const embed = new EmbedBuilder()
     .setColor(p ? p.color : 0xE91E63)
     .setAuthor({ name: guild.name, iconURL: guild.iconURL({ size: 128 }) || undefined })
     .setTitle(`🔴  LIVE NOW${live.title ? ` — ${live.title}`.slice(0, 200) : ''}`)
     .setURL(live.url)
-    .setDescription(`We are streaming${p ? ` on **${p.name}**` : ''} right now.\n${live.url}`);
+    .setDescription(
+      (live.by ? `<@${live.by}> is live` : 'We are streaming')
+      + `${p ? ` on **${p.name}**` : ''} right now.\n${live.url}`
+    );
 
   if (live.game) embed.addFields({ name: '🎮 Playing', value: live.game, inline: true });
   if (p) embed.addFields({ name: '📺 Platform', value: `${p.emoji} ${p.name}`, inline: true });
+  // Said on the card as well as in the description, because whoever is
+  // streaming is the first thing a reader wants and the description gets
+  // truncated on a narrow client.
+  if (live.by) embed.addFields({ name: '🎙️ Streaming', value: `<@${live.by}>`, inline: true });
   if (guild.iconURL()) embed.setThumbnail(guild.iconURL({ size: 256 }));
-  embed.setFooter({ text: `${SITE_URL.replace(/^https?:\/\//, '')} • ${MARK_LIVE_NOW}` }).setTimestamp();
+  embed.setFooter({ text: `${SITE_URL.replace(/^https?:\/\//, '')} • ${marker}` }).setTimestamp();
 
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setLabel('Watch now').setEmoji('▶️').setStyle(ButtonStyle.Link).setURL(live.url),
@@ -154,9 +194,28 @@ function buildLiveCard(guild, live) {
   return { embeds: [embed], components: [row] };
 }
 
-// What the last announcement becomes once the stream is over. The link stays —
-// on most platforms it is the VOD — but nothing on it still says LIVE, which is
-// the whole reason this exists. A card that claims to be live three days later
+// What happens to the last announcement when a new one goes up: it goes away.
+// "do have it remove the old one."
+//
+// The fallback matters. Deleting somebody else's message needs Manage Messages
+// and the bot does not always have it; a delete that quietly fails would leave
+// two cards both saying LIVE NOW, which is the worse of the two failures. So if
+// the delete is refused the card is retired in place instead — the link stays
+// (on most platforms it is the VOD) and nothing on it still says LIVE.
+//
+// Returns 'deleted' | 'retired' | 'failed'.
+async function retireAnnouncement(message) {
+  if (!message) return 'failed';
+  try { await message.delete(); return 'deleted'; }
+  catch (e) { console.warn('[Community] could not delete the old announcement:', e.message); }
+  try { await message.edit(withLanguage(endedCard(message))); return 'retired'; }
+  catch (e) { console.warn('[Community] could not retire the old announcement either:', e.message); }
+  return 'failed';
+}
+
+// The retired form, used only by the fallback above. The link stays — on most
+// platforms it is the VOD — but nothing on it still says LIVE, which is the
+// whole reason this exists. A card that claims to be live three days later
 // teaches people to ignore the channel.
 function endedCard(message) {
   const old = message.embeds[0];
@@ -199,6 +258,115 @@ function buildClipsPanel(guild) {
   return { embeds: [embed], components: [row] };
 }
 
+// ─── the post-your-pc panel ───────────────────────────────────────────────────
+// "lets do one for /Setup-Postyourpc (for user to post their pc setups etc..)"
+function buildPcPanel(guild) {
+  const embed = new EmbedBuilder()
+    .setColor(0x00B0F4)
+    .setAuthor({ name: guild.name, iconURL: guild.iconURL({ size: 128 }) || undefined })
+    .setTitle('🖥️  Post your setup')
+    .setDescription(
+      `**Show the room. Rig, desk, handheld, whole battlestation — all of it counts.**\n`
+      + `Drag the photo straight into this channel. No link needed and no upload site involved.`
+    )
+    .addFields(
+      { name: '📸 How to post', value: 'Drop the picture in the channel and put your specs in the same message. One message per setup keeps it readable.', inline: false },
+      { name: '🧾 What to list', value: 'CPU, GPU, RAM, monitors, peripherals — and the mouse, because somebody always asks.', inline: true },
+      { name: '🔧 Want advice?', value: 'Say what you use it for and your budget. "Is this good" with no context gets no useful answers.', inline: true },
+      { name: '📌 Setups only', value: 'Keep the back-and-forth in the general channels so this one stays scrollable.', inline: false },
+      { name: '🚫 Careful what is on screen', value: 'Check the photo for licence keys, order emails and your own address before you post it. This channel is public.', inline: false },
+    );
+
+  if (guild.iconURL()) embed.setThumbnail(guild.iconURL({ size: 256 }));
+  embed.setFooter({ text: `${SITE_URL.replace(/^https?:\/\//, '')} • ${MARK_PC}` }).setTimestamp();
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('pc_howto').setLabel('What should I include?').setEmoji('❓').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setLabel('The store').setEmoji('🛒').setStyle(ButtonStyle.Link).setURL(SITE_URL),
+  );
+  return { embeds: [embed], components: [row] };
+}
+
+// ─── the suggestions panel ────────────────────────────────────────────────────
+// "do one for the suggestion channel aslo". A panel that only explains the
+// channel is half a feature — the button files the suggestion, so it lands in
+// one shape every time and is votable straight away.
+function buildSuggestPanel(guild) {
+  const embed = new EmbedBuilder()
+    .setColor(0xFEE75C)
+    .setAuthor({ name: guild.name, iconURL: guild.iconURL({ size: 128 }) || undefined })
+    .setTitle('💡  Suggestions')
+    .setDescription(
+      `**Tell us what to build, stock or change.**\n`
+      + `Press **Make a suggestion** and it gets posted here with voting on it. `
+      + `Every one is read, and the ones people vote for get done first.`
+    )
+    .addFields(
+      { name: '👍 Voting', value: 'Vote on other people\'s with the arrows under each suggestion. That ordering is what we work from.', inline: true },
+      { name: '✅ What gets picked up', value: 'Concrete beats vague. "Stock X for Y" or "the panel should show Z" is actionable; "make it better" is not.', inline: true },
+      { name: '🔎 Check first', value: 'Have a scroll — if it is already up there, vote on that one instead. Two of the same splits the vote.', inline: false },
+      { name: '🎫 Not a suggestion?', value: 'A broken product, a missing order or anything about your own account is a ticket, not a suggestion — you will get an answer faster.', inline: false },
+    );
+
+  if (guild.iconURL()) embed.setThumbnail(guild.iconURL({ size: 256 }));
+  embed.setFooter({ text: `${SITE_URL.replace(/^https?:\/\//, '')} • ${MARK_SUGGEST}` }).setTimestamp();
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('suggest_new').setLabel('Make a suggestion').setEmoji('💡').setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setLabel('The store').setEmoji('🛒').setStyle(ButtonStyle.Link).setURL(SITE_URL),
+  );
+  return { embeds: [embed], components: [row] };
+}
+
+// A filed suggestion. Voted on with reactions rather than buttons on purpose:
+// a reaction count is stored by Discord, so it survives a redeploy, and this
+// bot has already been bitten once by state that only lived in the container.
+function buildSuggestionCard(guild, member, text) {
+  const embed = new EmbedBuilder()
+    .setColor(0xFEE75C)
+    .setAuthor({
+      name: member.user ? (member.user.globalName || member.user.username) : String(member.id),
+      iconURL: (member.displayAvatarURL && member.displayAvatarURL({ size: 128 })) || undefined,
+    })
+    .setTitle('💡  Suggestion')
+    .setDescription(text.slice(0, 3000))
+    .addFields({ name: 'From', value: `<@${member.id}>`, inline: true })
+    .setFooter({ text: `${SITE_URL.replace(/^https?:\/\//, '')} • ${MARK_SUGGESTION}` })
+    .setTimestamp();
+  return { embeds: [embed] };
+}
+
+// ─── the giveaway panel ───────────────────────────────────────────────────────
+// "Lets do one for ./Setup-giveway". Furniture again: it explains the channel
+// and stays put. `/giveaway` posts the entry card next to it and clears the
+// previous one, and it never touches this.
+function buildGiveawayPanel(guild) {
+  const embed = new EmbedBuilder()
+    .setColor(0x9B59B6)
+    .setAuthor({ name: guild.name, iconURL: guild.iconURL({ size: 128 }) || undefined })
+    .setTitle('🎁  Giveaways')
+    .setDescription(
+      `**Free stuff, drawn at random, no strings.**\n`
+      + `When one is running it is posted right underneath this. Press the button on it once — that is your entry.`
+    )
+    .addFields(
+      { name: '🎉 How to enter', value: 'Hit **Participate** on the giveaway post. One press is enough; pressing again does nothing.', inline: true },
+      { name: '⏰ When it ends', value: 'Each post carries its own countdown. Winners are drawn automatically the second it runs out.', inline: true },
+      { name: '🏆 If you win', value: 'You get tagged here. Open a ticket to claim it — nobody will ever DM you first asking for anything.', inline: false },
+      { name: '🔔 Do not miss one', value: 'Turn notifications on for this channel. Giveaways ping, but only once.', inline: true },
+      { name: '📌 One post at a time', value: 'A new giveaway clears the last one and its results, so what you see here is always current.', inline: true },
+    );
+
+  if (guild.iconURL()) embed.setThumbnail(guild.iconURL({ size: 256 }));
+  embed.setFooter({ text: `${SITE_URL.replace(/^https?:\/\//, '')} • ${MARK_GIVEAWAY}` }).setTimestamp();
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('giveaway_howto').setLabel('How do giveaways work?').setEmoji('❓').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setLabel('The store').setEmoji('🛒').setStyle(ButtonStyle.Link).setURL(SITE_URL),
+  );
+  return { embeds: [embed], components: [row] };
+}
+
 // ─── posting ──────────────────────────────────────────────────────────────────
 const withLanguage = (payload) => {
   const components = [...(payload.components || [])];
@@ -236,14 +404,24 @@ function liveFromCard(message) {
 }
 
 // ─── commands ─────────────────────────────────────────────────────────────────
+// Every /setup- one is the same command with a different panel and a different
+// default channel, so it is a table rather than five copies of one handler.
+const PANELS = {
+  'setup-livestream': { marker: MARK_LIVE,     build: buildLivePanel,     wanted: 'live-stream',      alt: 'streams',     label: 'live-stream' },
+  'setup-clips':      { marker: MARK_CLIPS,    build: buildClipsPanel,    wanted: 'post-your-clips',  alt: 'clips',       label: 'clips' },
+  'setup-postyourpc': { marker: MARK_PC,       build: buildPcPanel,       wanted: 'post-your-pc',     alt: 'setups',      label: 'setup' },
+  'setup-suggestions':{ marker: MARK_SUGGEST,  build: buildSuggestPanel,  wanted: 'suggestions',      alt: 'suggestion',  label: 'suggestions' },
+  'setup-giveaway':   { marker: MARK_GIVEAWAY, build: buildGiveawayPanel, wanted: 'giveaways',        alt: 'giveaway',    label: 'giveaway' },
+};
+
 const commands = [
   new SlashCommandBuilder().setName('setup-livestream')
     .setDescription('Admin: Post (or refresh) the live-stream panel')
     .addChannelOption(o => o.setName('channel').setDescription('Where to post it (defaults to #live-stream)').setRequired(false))
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
   new SlashCommandBuilder().setName('golive')
-    .setDescription('Admin: Announce a stream with its link — leave the link blank to mark it ended')
-    .addStringOption(o => o.setName('link').setDescription('The stream link for THIS stream (blank = the stream is over)').setRequired(false))
+    .setDescription('Admin: Announce a stream with its link — leave the link blank to clear the announcement')
+    .addStringOption(o => o.setName('link').setDescription('The stream link for THIS stream (blank = remove the announcement)').setRequired(false))
     .addStringOption(o => o.setName('title').setDescription('What the stream is, e.g. "Ranked grind with the spoofer on"').setRequired(false))
     .addStringOption(o => o.setName('game').setDescription('What you are playing').setRequired(false))
     .addRoleOption(o => o.setName('ping').setDescription('Role to notify (pick @everyone for everyone)').setRequired(false))
@@ -253,6 +431,18 @@ const commands = [
     .setDescription('Admin: Post (or refresh) the post-your-clips panel')
     .addChannelOption(o => o.setName('channel').setDescription('Where to post it (defaults to #post-your-clips)').setRequired(false))
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+  new SlashCommandBuilder().setName('setup-postyourpc')
+    .setDescription('Admin: Post (or refresh) the post-your-setup panel')
+    .addChannelOption(o => o.setName('channel').setDescription('Where to post it (defaults to #post-your-pc)').setRequired(false))
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+  new SlashCommandBuilder().setName('setup-suggestions')
+    .setDescription('Admin: Post (or refresh) the suggestions panel')
+    .addChannelOption(o => o.setName('channel').setDescription('Where to post it (defaults to #suggestions)').setRequired(false))
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+  new SlashCommandBuilder().setName('setup-giveaway')
+    .setDescription('Admin: Post (or refresh) the giveaways panel')
+    .addChannelOption(o => o.setName('channel').setDescription('Where to post it (defaults to #giveaways)').setRequired(false))
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 ];
 
 // findChannelByName is handed in rather than re-implemented: it is the
@@ -260,54 +450,46 @@ const commands = [
 // mathematical bold, which toLowerCase() cannot touch.
 async function handleCommunityCommand(interaction, { findChannel }) {
   const cmd = interaction.commandName;
-  if (cmd !== 'setup-livestream' && cmd !== 'golive' && cmd !== 'setup-clips') return false;
+  const spec = PANELS[cmd];
+  if (!spec && cmd !== 'golive') return false;
   if (!gate.hasAccess(interaction)) {
     await interaction.reply({ content: '❌ No permission.', flags: 64 });
     return true;
   }
   await interaction.deferReply({ flags: 64 });
 
-  const wanted = cmd === 'setup-clips' ? 'post-your-clips' : 'live-stream';
+  const wanted = spec ? spec.wanted : 'live-stream';
+  const alt    = spec ? spec.alt    : 'streams';
   const picked = interaction.options.getChannel('channel');
-  const found  = picked || findChannel(interaction.guild, wanted)
-    || (cmd === 'setup-clips' ? findChannel(interaction.guild, 'clips') : findChannel(interaction.guild, 'streams'));
+  const found  = picked || findChannel(interaction.guild, wanted) || findChannel(interaction.guild, alt);
   const channel = found || interaction.channel;
   const me = interaction.client.user;
 
   try {
-    if (cmd === 'setup-clips') {
-      const { edited } = await upsertPanel(channel, MARK_CLIPS, withLanguage(buildClipsPanel(interaction.guild)), me);
-      await interaction.editReply(`${edited ? '♻️ Refreshed' : '📌 Posted'} the clips panel in <#${channel.id}>.`
-        + (found ? '' : `\nℹ️ No **#${wanted}** channel here, so it went in this one.`));
-      return true;
-    }
-
-    if (cmd === 'setup-livestream') {
-      // If a stream is running right now, the panel says so. Re-posting the
-      // panel mid-stream must not quietly claim nobody is live.
-      const live = liveFromCard(await findMarked(channel, MARK_LIVE_NOW, me));
-      const { edited } = await upsertPanel(channel, MARK_LIVE, withLanguage(buildLivePanel(interaction.guild, live)), me);
-      await interaction.editReply(`${edited ? '♻️ Refreshed' : '📌 Posted'} the live-stream panel in <#${channel.id}>.`
-        + (live ? '\n🔴 A stream is live, so the panel carries its link. `/golive` with no link marks it over.' : '')
+    if (spec) {
+      // Furniture. It renders one way, so re-running this can never turn it
+      // into something else, and nothing outside this branch writes it.
+      const { edited } = await upsertPanel(channel, spec.marker, withLanguage(spec.build(interaction.guild)), me);
+      await interaction.editReply(`${edited ? '♻️ Refreshed' : '📌 Posted'} the ${spec.label} panel in <#${channel.id}>.`
         + (found ? '' : `\nℹ️ No **#${wanted}** channel here, so it went in this one.`));
       return true;
     }
 
     // ── /golive ───────────────────────────────────────────────────────────────
+    // What this does NOT do is touch the panel. It used to, and that is the bug
+    // being fixed: "./setup-livestream SHOULD BE LEFT ALONE IF POSTED."
     const raw = (interaction.options.getString('link') || '').trim();
     const previous = await findMarked(channel, MARK_LIVE_NOW, me);
 
     if (!raw) {
-      // No link means the stream is over.
-      const wasLive = liveFromCard(previous);
-      if (wasLive) { try { await previous.edit(withLanguage(endedCard(previous))); } catch (e) { console.warn('[Community] could not close the live card:', e.message); } }
-      const panel = await findMarked(channel, MARK_LIVE, me);
-      if (panel) { try { await panel.edit(withLanguage(buildLivePanel(interaction.guild, null))); } catch (e) { console.warn('[Community] could not idle the panel:', e.message); } }
+      // No link means take the announcement down. Nothing replaces it.
+      const outcome = previous ? await retireAnnouncement(previous) : 'none';
       await interaction.editReply(
-        wasLive
-          ? `⚫ Marked the stream as ended in <#${channel.id}> — the announcement now reads *Stream ended* and the panel is back to idle.`
-          : `ℹ️ Nothing was live in <#${channel.id}>${panel ? ' — the panel is idle either way.' : '.'}`
-          + `\nTo announce a stream, run this again with **link:** set.`);
+        outcome === 'deleted' ? `🧹 Removed the stream announcement from <#${channel.id}>. The panel is untouched.`
+        : outcome === 'retired' ? `⚫ I could not delete the old announcement (no **Manage Messages** in <#${channel.id}>), so it now reads *Stream ended* instead. Grant that permission and the next one gets removed properly.`
+        : outcome === 'failed' ? `⚠️ There is an announcement in <#${channel.id}> I can neither delete nor edit — check my permissions there.`
+        : `ℹ️ There was no stream announcement in <#${channel.id}> to remove.`
+          + `\nTo announce one, run this again with **link:** set.`);
       return true;
     }
 
@@ -324,11 +506,10 @@ async function handleCommunityCommand(interaction, { findChannel }) {
       game:  (interaction.options.getString('game')  || '').trim() || null,
     };
 
-    // The previous announcement stops saying LIVE before the new one goes up,
-    // so the channel never holds two live cards at once.
-    if (liveFromCard(previous)) {
-      try { await previous.edit(withLanguage(endedCard(previous))); } catch (e) { console.warn('[Community] could not close the previous card:', e.message); }
-    }
+    // "when ./golive url post happens, do have it remove the old one." The old
+    // one goes BEFORE the new one is posted, so there is never a moment with
+    // two cards in the channel both saying LIVE NOW.
+    const outcome = previous ? await retireAnnouncement(previous) : 'none';
 
     const role = interaction.options.getRole('ping');
     // @everyone is a real role whose id is the guild id, and its mention form
@@ -338,19 +519,14 @@ async function handleCommunityCommand(interaction, { findChannel }) {
 
     const card = await channel.send(withLanguage({ ...buildLiveCard(interaction.guild, live), ...(content ? { content } : {}) }));
 
-    const panel = await findMarked(channel, MARK_LIVE, me);
-    let panelNote = '';
-    if (panel) {
-      try { await panel.edit(withLanguage(buildLivePanel(interaction.guild, live))); panelNote = ' The panel now says LIVE with this link on it.'; }
-      catch (e) { panelNote = ` ⚠️ The panel could not be updated: ${e.message}`; }
-    } else {
-      panelNote = ' There is no standing panel in that channel yet — run `/setup-livestream` once and it will track every stream after this.';
-    }
-
     const p = platformOf(url);
     await interaction.editReply(`🔴 Announced in <#${channel.id}>${p ? ` (${p.name})` : ''}${role ? `, pinging ${role.id === interaction.guildId ? '@everyone' : `**${role.name}**`}` : ' with no ping'}.`
-      + panelNote
-      + `\nWhen you stop, run \`/golive\` with **no link** and both go back to idle.`
+      + (outcome === 'deleted' ? ' The previous announcement was removed.'
+         : outcome === 'retired' ? ' ⚠️ I could not delete the previous announcement (no **Manage Messages** here) so it was marked *Stream ended* instead.'
+         : outcome === 'failed' ? ' ⚠️ The previous announcement is still standing — I can neither delete nor edit it.'
+         : '')
+      + `\nThe \`/setup-livestream\` panel was not touched.`
+      + `\nWhen you stop, run \`/golive\` with **no link** and this announcement is removed.`
       + `\n${card.url}`);
     return true;
   } catch (e) {
@@ -359,10 +535,83 @@ async function handleCommunityCommand(interaction, { findChannel }) {
   }
 }
 
-// ─── the two buttons ──────────────────────────────────────────────────────────
-// Both ephemeral: they are a walkthrough for the person who pressed them, not
-// another wall of text in a channel that was already too quiet.
+// ─── the panel buttons ────────────────────────────────────────────────────────
+// The walkthroughs are ephemeral: they answer the person who pressed them, not
+// another wall of text in a channel that was already too quiet. The other two
+// open a modal, which is the only way to ask a member for a line of text
+// without making them type a slash command they will never find.
 async function handleCommunityButton(interaction) {
+  // "add a button for users, they add link, you post for them and make it look
+  // all nice." Deliberately ungated — this is the member-facing half of
+  // /golive, and gating it would leave the button on the panel doing nothing
+  // for everyone who is not staff.
+  if (interaction.customId === 'live_go') {
+    const modal = new ModalBuilder().setCustomId('community_golive_modal').setTitle('Going live');
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(new TextInputBuilder()
+        .setCustomId('link').setLabel('Your stream link').setStyle(TextInputStyle.Short)
+        .setPlaceholder('https://twitch.tv/yourname').setRequired(true).setMaxLength(400)),
+      new ActionRowBuilder().addComponents(new TextInputBuilder()
+        .setCustomId('title').setLabel('What are you streaming? (optional)').setStyle(TextInputStyle.Short)
+        .setPlaceholder('Ranked grind').setRequired(false).setMaxLength(120)),
+      new ActionRowBuilder().addComponents(new TextInputBuilder()
+        .setCustomId('game').setLabel('Game (optional)').setStyle(TextInputStyle.Short)
+        .setPlaceholder('Rainbow Six Siege').setRequired(false).setMaxLength(80)),
+    );
+    await interaction.showModal(modal);
+    return true;
+  }
+
+  if (interaction.customId === 'suggest_new') {
+    const modal = new ModalBuilder().setCustomId('community_suggest_modal').setTitle('Make a suggestion');
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(new TextInputBuilder()
+        .setCustomId('text').setLabel('What should we do?').setStyle(TextInputStyle.Paragraph)
+        .setPlaceholder('Be specific — what, and why it would help.')
+        .setRequired(true).setMinLength(12).setMaxLength(1500)),
+    );
+    await interaction.showModal(modal);
+    return true;
+  }
+
+  if (interaction.customId === 'pc_howto') {
+    const embed = new EmbedBuilder()
+      .setColor(0x00B0F4)
+      .setTitle('❓ Posting your setup')
+      .setDescription([
+        '**1.** Take the photo in decent light — the whole desk, not just the tower.',
+        '**2.** Drag it into this channel. Discord allows 10 MB without Nitro, which any phone photo fits.',
+        '**3.** In the SAME message, list the parts.',
+      ].join('\n'))
+      .addFields(
+        { name: 'Worth listing', value: 'CPU • GPU • RAM • storage • monitors (size and refresh rate) • keyboard • mouse • headset • chair.' },
+        { name: 'Do not know your specs?', value: 'Press **Win + R**, type `dxdiag`, hit Enter. CPU and RAM are on the first tab, the GPU is on **Display**.' },
+        { name: 'Check the photo first', value: 'Licence keys, order emails, your own name on a browser tab — all of it is readable in a screenshot. This channel is public.' },
+      )
+      .setFooter({ text: SITE_URL.replace(/^https?:\/\//, '') });
+    await interaction.reply({ embeds: [embed], flags: 64 });
+    return true;
+  }
+
+  if (interaction.customId === 'giveaway_howto') {
+    const embed = new EmbedBuilder()
+      .setColor(0x9B59B6)
+      .setTitle('❓ How the giveaways work')
+      .setDescription([
+        '**1.** A giveaway post appears in this channel with a countdown on it.',
+        '**2.** Press **🎉 Participate** once. That is your entry — pressing again changes nothing.',
+        '**3.** When the countdown runs out the winners are drawn at random and tagged here.',
+      ].join('\n'))
+      .addFields(
+        { name: 'If you win', value: 'Open a ticket to claim. **Nobody will DM you first** — anyone who does is not us, and will not be asking for a payment either way.' },
+        { name: 'Only one at a time', value: 'Starting a new giveaway clears the previous post and its results, so whatever is in this channel is the current one.' },
+        { name: 'Missed it?', value: 'Turn notifications on for this channel. Each giveaway pings once when it starts and never again.' },
+      )
+      .setFooter({ text: SITE_URL.replace(/^https?:\/\//, '') });
+    await interaction.reply({ embeds: [embed], flags: 64 });
+    return true;
+  }
+
   if (interaction.customId === 'live_notify') {
     const embed = new EmbedBuilder()
       .setColor(0xE91E63)
@@ -401,10 +650,117 @@ async function handleCommunityButton(interaction) {
   return false;
 }
 
+// ─── the member-facing modals ─────────────────────────────────────────────────
+// A member's announcement is not the server's. It carries their own marker, so
+// a second press replaces THEIR card and leaves everyone else's — including
+// staff's — exactly where it was. Deleting somebody else's stream announcement
+// because a different person started streaming would be the same class of bug
+// as /golive overwriting the panel.
+async function handleCommunityModal(interaction) {
+  if (interaction.customId === 'community_golive_modal') {
+    await interaction.deferReply({ flags: 64 });
+    const me = interaction.client.user;
+    const channel = interaction.channel;
+    const key = `${interaction.guildId}:${interaction.user.id}`;
+
+    const since = Date.now() - (lastMemberGoLive.get(key) || 0);
+    if (since < MEMBER_GOLIVE_COOLDOWN_MS) {
+      const wait = Math.ceil((MEMBER_GOLIVE_COOLDOWN_MS - since) / 1000);
+      await interaction.editReply(`⏳ You posted a stream link a moment ago — try again in ${wait}s.`
+        + `\nYour announcement is already up; posting again just replaces it.`);
+      return true;
+    }
+
+    const raw = (interaction.fields.getTextInputValue('link') || '').trim();
+    const url = normalizeUrl(raw);
+    if (!url) {
+      await interaction.editReply(`❌ \`${raw.slice(0, 100)}\` is not a link I can post.`
+        + `\nPaste the full address, e.g. \`https://twitch.tv/yourname\`, and try again.`);
+      return true;
+    }
+
+    // The bot's name is on the post, so the post is the bot vouching for the
+    // link. Anything on the server's own banned-domain list does not get that.
+    // Loaded lazily and behind a try: an unavailable list must not take the
+    // feature down, and requiring antiscam at the top of this file would drag
+    // its start-up into every test that renders a panel.
+    try {
+      const { _internals } = require('./antiscam');
+      const bad = _internals && _internals.hasBannedLink && _internals.hasBannedLink(url);
+      if (bad && bad.found) {
+        await interaction.editReply('❌ That domain is on this server\'s blocked list, so I will not post it.');
+        return true;
+      }
+    } catch (_) { /* no list available — carry on */ }
+
+    const live = {
+      url,
+      title: (interaction.fields.getTextInputValue('title') || '').trim() || null,
+      game:  (interaction.fields.getTextInputValue('game')  || '').trim() || null,
+      by: interaction.user.id,
+    };
+
+    try {
+      const previous = await findMarked(channel, markLiveBy(interaction.user.id), me);
+      const outcome = previous ? await retireAnnouncement(previous) : 'none';
+      // No ping, ever. A member pressing a button must not be able to notify
+      // the server, and allowMentions is pinned rather than left to the
+      // default because the description carries their own mention.
+      const card = await channel.send({
+        ...withLanguage(buildLiveCard(interaction.guild, live)),
+        allowedMentions: { parse: [] },
+      });
+      lastMemberGoLive.set(key, Date.now());
+      const p = platformOf(url);
+      await interaction.editReply(`🔴 Posted your stream in <#${channel.id}>${p ? ` (${p.name})` : ''}.`
+        + (outcome === 'deleted' ? ' Your previous announcement was removed.' : '')
+        + `\n${card.url}`);
+    } catch (e) {
+      await interaction.editReply(`❌ I could not post that here: ${e.message}`);
+    }
+    return true;
+  }
+
+  if (interaction.customId === 'community_suggest_modal') {
+    await interaction.deferReply({ flags: 64 });
+    const text = (interaction.fields.getTextInputValue('text') || '').trim();
+    if (text.length < 12) {
+      await interaction.editReply('❌ That is too short to act on — say what you want and why in a sentence or two.');
+      return true;
+    }
+    try {
+      const card = await interaction.channel.send({
+        ...buildSuggestionCard(interaction.guild, interaction.member || interaction.user, text),
+        // The card mentions the author. Mentioning them is the point; pinging
+        // them about their own suggestion is not.
+        allowedMentions: { parse: [] },
+      });
+      // Reactions rather than buttons: Discord stores the count, so the vote
+      // survives a redeploy. A button tally would need a table.
+      for (const e of ['⬆️', '⬇️']) { try { await card.react(e); } catch (_) {} }
+      // A thread keeps the discussion off the list, which is the thing that
+      // makes a suggestion channel unreadable by the fifth suggestion.
+      try {
+        await card.startThread({ name: `💡 ${text.replace(/\s+/g, ' ').slice(0, 80)}`, autoArchiveDuration: 10080 });
+      } catch (_) { /* no thread permission, or not a text channel */ }
+      await interaction.editReply(`✅ Filed — it is up in <#${interaction.channel.id}> with voting on it.\n${card.url}`);
+    } catch (e) {
+      await interaction.editReply(`❌ I could not post that here: ${e.message}`);
+    }
+    return true;
+  }
+
+  return false;
+}
+
 module.exports = {
-  commands, handleCommunityCommand, handleCommunityButton, setCommunityGate,
+  commands, handleCommunityCommand, handleCommunityButton, handleCommunityModal,
+  setCommunityGate,
   // Exported for the tests, which render the panels without a Discord connection.
-  buildLivePanel, buildLiveCard, buildClipsPanel, endedCard, liveFromCard,
-  normalizeUrl, platformOf, findMarked,
-  MARK_LIVE, MARK_LIVE_NOW, MARK_CLIPS,
+  buildLivePanel, buildLiveCard, buildClipsPanel, buildPcPanel, buildSuggestPanel,
+  buildSuggestionCard, buildGiveawayPanel,
+  endedCard, liveFromCard, retireAnnouncement,
+  normalizeUrl, platformOf, findMarked, markLiveBy,
+  MARK_LIVE, MARK_LIVE_NOW, MARK_CLIPS, MARK_PC, MARK_SUGGEST, MARK_SUGGESTION,
+  MARK_GIVEAWAY, MARK_GW_ENTRY, MARK_GW_RESULTS,
 };

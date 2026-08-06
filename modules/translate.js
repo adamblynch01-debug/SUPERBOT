@@ -453,21 +453,20 @@ async function handleLanguageSelect(interaction, { chunkEmbedsIntoMessages, prot
   // this from a dropdown that appears to do nothing, which is how it read when
   // the delivery DM was going out pre-translated: picking English handed the
   // Spanish back, because translate.js takes its source to be English.
+  // The disclaimer rides ON the translation, it does not follow it. Machine
+  // translation is good enough to read and not good enough to hold anyone to,
+  // and the Terms of Service is one of the documents this dropdown sits under —
+  // so it still has to be said. But an ephemeral follow-up is not transient:
+  // nothing expires it, so a second message saying "translated automatically"
+  // stayed on screen after every single translation until the reader dismissed
+  // it by hand. One message, one line at the top of it, nothing left behind.
   await interaction.editReply({
-    content: lang === DEFAULT_LANG ? '🇬🇧 English — the original.' : null,
+    content: lang === DEFAULT_LANG
+      ? '🇬🇧 English — the original.'
+      : `-# ${meta.flag} Translated to **${meta.native}** automatically — the English original is the official version.`,
     embeds: messages[0],
   });
   for (const m of messages.slice(1)) await interaction.followUp({ embeds: m, flags: 64 });
-
-  if (lang !== DEFAULT_LANG) {
-    // Named once, not on every page: machine translation is good enough to
-    // read and not good enough to hold anyone to, and the Terms of Service is
-    // one of the documents this dropdown sits under.
-    await interaction.followUp({
-      content: `${meta.flag} Translated to **${meta.native}** automatically — the English version above is the official one.`,
-      flags: 64,
-    });
-  }
 }
 
 module.exports = {

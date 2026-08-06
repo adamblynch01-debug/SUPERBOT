@@ -394,20 +394,26 @@ async function check(name, fn) {
     assert.strictEqual(await T.getUserLang('g1', 'clicker'), 'it');
   });
 
-  await check('a machine translation says so', async () => {
+  await check('a machine translation says so, on the translation itself', async () => {
     // Under a Terms of Service especially. Nobody should be held to a sentence
-    // a machine wrote.
+    // a machine wrote — so the disclaimer stays. What it must NOT be is a
+    // second message: an ephemeral follow-up has no expiry, so one was left
+    // sitting in the channel after every translation until the reader dismissed
+    // it by hand. It goes on the reply that carries the embeds or nowhere.
     const it = fakeInteraction(['fr'], [{ toJSON: () => ({ description: 'All sales are final.' }) }]);
     await T.handleLanguageSelect(it, { chunkEmbedsIntoMessages });
-    const note = it.replies.find(r => /English/i.test(r.content || ''));
+    const note = it.replies.find(r => /Translated to/i.test(r.content || ''));
     assert.ok(note, 'no disclaimer was shown');
-    assert.strictEqual(note.flags, 64);
+    assert.strictEqual(note.kind, 'edit', 'the disclaimer is a separate message again');
+    assert.ok(note.embeds && note.embeds.length, 'the disclaimer is not on the translation');
+    assert.strictEqual(it.replies.length, 1, `${it.replies.length} messages for a one-page translation`);
   });
 
   await check('choosing English shows the post back with no disclaimer', async () => {
     const it = fakeInteraction(['en'], [{ toJSON: () => ({ description: 'All sales are final.' }) }]);
     await T.handleLanguageSelect(it, { chunkEmbedsIntoMessages });
-    assert.ok(!it.replies.some(r => /official one/i.test(r.content || '')));
+    assert.ok(!it.replies.some(r => /Translated to/i.test(r.content || '')));
+    assert.strictEqual(it.replies.length, 1);
   });
 
   await check('a post with no embed says so instead of replying with nothing', async () => {
@@ -499,11 +505,19 @@ async function check(name, fn) {
     // and the [RESULTS] announcement. Missing one leaves the winner unable to
     // read that they won.
     const block = indexSrc.slice(indexSrc.indexOf("cmd === 'giveaway'"), indexSrc.indexOf("cmd === 'endgiveaway'") + 1 || undefined);
+    assert.ok(/targetCh\.send\(withLanguageRow\(\{ content: '@everyone'/.test(block),
+      'the entry card posts without the dropdown');
+
+    // Round 38 folded the three copies of the end-of-giveaway code (timer,
+    // restart, reschedule) into one endGiveaway(). Both of its posts are
+    // checked here rather than in the /giveaway block, which is where they
+    // used to live.
+    const ending = indexSrc.slice(indexSrc.indexOf('async function endGiveaway'),
+      indexSrc.indexOf('async function clearOldGiveaway'));
     for (const [what, re] of [
-      ['the entry card', /targetCh\.send\(withLanguageRow\(\{ content: '@everyone'/],
       ['the ENDED edit', /gwMsg\.edit\(withLanguageRow\(/],
       ['the RESULTS post', /gwCh\.send\(withLanguageRow\(/],
-    ]) assert.ok(re.test(block), `${what} posts without the dropdown`);
+    ]) assert.ok(re.test(ending), `${what} posts without the dropdown`);
 
     // Every edit REPLACES the component list, so each one has to send the row
     // again. The count button is the easy one to miss: the first person to
@@ -514,12 +528,15 @@ async function check(name, fn) {
     assert.ok(/interaction\.update\(withLanguageRow\(/.test(enter),
       'entering a giveaway strips the dropdown off it for everyone else');
 
-    // The restart path rebuilds the same two posts from disk. It is a separate
-    // copy of the code, so it is a separate place to forget.
-    const restart = indexSrc.slice(indexSrc.indexOf('Giveaway restart-end error') - 3000,
-      indexSrc.indexOf('Giveaway rescheduled-end error'));
-    assert.strictEqual((restart.match(/withLanguageRow\(/g) || []).length, 4,
-      'a giveaway that ended while the bot was restarting posts without the dropdown');
+    // The restart path used to be a third copy of the same code, and a third
+    // place to forget the dropdown. It now calls endGiveaway like everything
+    // else — which is what is pinned, because a re-inlined copy is exactly how
+    // this regresses.
+    const restart = indexSrc.slice(indexSrc.indexOf('client.once'), indexSrc.indexOf("cmd === 'giveaway'"));
+    assert.ok(/endGiveaway\(msgId, 'restart'\)/.test(restart) && /endGiveaway\(msgId, 'rescheduled'\)/.test(restart),
+      'the restart path ends a giveaway its own way again — it will drift');
+    assert.strictEqual((ending.match(/withLanguageRow\(/g) || []).length, 2,
+      'one of endGiveaway\'s two posts lost the dropdown');
   });
 
   await check('a post already using five action rows keeps its buttons', async () => {

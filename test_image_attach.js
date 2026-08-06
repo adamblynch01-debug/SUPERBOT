@@ -18,6 +18,8 @@
 'use strict';
 
 const assert = require('assert');
+const fs = require('fs');
+const path = require('path');
 const { offerImageUpload, isImage, embedHasImage } = require('./modules/imageAttach');
 const { EmbedBuilder } = require('discord.js');
 
@@ -40,6 +42,7 @@ function makeWorld({ embed, attachments } = {}) {
     edits: [],          // what the post was edited with
     followUps: [],      // ephemeral prompts sent
     webhookEdits: [],   // ephemeral prompts edited
+    webhookDeletes: [], // ephemeral prompts taken back off the screen
     deleted: [],        // uploader messages deleted
     collector,
   };
@@ -50,7 +53,10 @@ function makeWorld({ embed, attachments } = {}) {
   };
   w.interaction = {
     user: { id: 'AUTHOR' },
-    webhook: { async editMessage(id, payload) { w.webhookEdits.push({ id, ...payload }); } },
+    webhook: {
+      async editMessage(id, payload) { w.webhookEdits.push({ id, ...payload }); },
+      async deleteMessage(id) { w.webhookDeletes.push(id); },
+    },
     async followUp(payload) { w.followUps.push(payload); return { id: 'PROMPT' }; },
     channel: {
       createMessageCollector(opts) { collector.filter = opts.filter; collector.opts = opts; return collector; },
@@ -198,9 +204,15 @@ check('embedHasImage reads both a builder and a raw embed', () => {
     await offerImageUpload({ interaction: w.interaction, message: w.message, embed: w.embed });
     await w.collector.fire('end');
     await flush();
-    check('timing out says so instead of leaving the prompt hanging', () => {
-      assert.strictEqual(w.webhookEdits.length, 1);
-      assert.ok(w.webhookEdits[0].content.startsWith('⏱️'));
+    check('timing out removes the prompt instead of reporting that nothing happened', () => {
+      // An ephemeral message has no expiry. Nothing in Discord takes it away,
+      // so "⏱️ No image uploaded — the post is fine as it is." stayed on screen
+      // after every post that did not get a picture, which is most of them.
+      // Nothing happened, so there is nothing to say: delete it.
+      assert.strictEqual(w.webhookDeletes.length, 1, 'the prompt was left on screen');
+      assert.strictEqual(w.webhookDeletes[0], 'PROMPT');
+      assert.strictEqual(w.webhookEdits.length, 0,
+        `the timeout still writes a notice: ${JSON.stringify(w.webhookEdits[0] && w.webhookEdits[0].content)}`);
     });
   }
 
@@ -213,6 +225,19 @@ check('embedHasImage reads both a builder and a raw embed', () => {
     check('the success message is not overwritten by the timeout message', () => {
       assert.strictEqual(w.webhookEdits.length, 1);
       assert.ok(w.webhookEdits[0].content.startsWith('✅'));
+    });
+
+    check('and every notice is scheduled to clear itself off the screen', () => {
+      // Same reason as the timeout: an ephemeral reply is permanent until the
+      // reader dismisses it. Each of the three outcomes says its piece and
+      // then takes itself back.
+      const s = fs.readFileSync(path.join(__dirname, 'modules/imageAttach.js'), 'utf8')
+        .replace(/^\s*\/\/.*$/gm, '');
+      assert.ok(/webhook\.deleteMessage\(/.test(s), 'nothing ever deletes the prompt');
+      // sayBriefly is the only caller of say(), and it passes a variable — so a
+      // say() handed a literal is an outcome that was left on screen forever.
+      assert.strictEqual((s.match(/say\((['"`])/g) || []).length, 0,
+        'an outcome still uses the permanent say() instead of sayBriefly()');
     });
   }
 

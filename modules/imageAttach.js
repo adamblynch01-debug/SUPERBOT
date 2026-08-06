@@ -78,6 +78,25 @@ async function offerImageUpload({ interaction, message, embed, fileBase = 'image
       try { await interaction.webhook.editMessage(prompt.id, { content }); } catch (_) {}
     };
 
+    // An ephemeral message is not transient. Nothing expires it — it sits in
+    // that channel for the person who triggered it until they dismiss it by
+    // hand or restart the client, so "⏱️ No image uploaded" was still on
+    // screen days later. Deleting the prompt is the only thing that clears it.
+    const drop = async () => {
+      if (!prompt) return;
+      try { await interaction.webhook.deleteMessage(prompt.id); } catch (_) {}
+      prompt = null;
+    };
+    // Said, then taken away: the outcome is worth a moment on screen and
+    // nothing after that.
+    const sayBriefly = async (content, ms = 8000) => {
+      await say(content);
+      // unref'd so a pending clean-up never holds a process open — the bot is
+      // long-running so the timer still fires, and a test run still exits.
+      const t = setTimeout(() => { drop().catch(() => {}); }, ms);
+      if (typeof t.unref === 'function') t.unref();
+    };
+
     let handled = false;
     const collector = channel.createMessageCollector({
       filter: m => m.author && m.author.id === interaction.user.id && m.attachments && m.attachments.size > 0,
@@ -93,7 +112,7 @@ async function offerImageUpload({ interaction, message, embed, fileBase = 'image
         // this may well be an admin dropping a zip in the channel who has
         // nothing to do with the post — deleting it would destroy a message
         // that was never addressed to the bot.
-        await say('❌ That was not an image, so the post is unchanged. Run the command again if you want another go.');
+        await sayBriefly('❌ That was not an image, so the post is unchanged. Run the command again if you want another go.', 25000);
         return;
       }
       try {
@@ -104,13 +123,13 @@ async function offerImageUpload({ interaction, message, embed, fileBase = 'image
         // on purpose so the post keeps its buttons and language dropdown —
         // edit only overwrites the fields it is given.
         await message.edit({ embeds: [next], files: [new AttachmentBuilder(att.url, { name: fileName })] });
-        await say('✅ Image added to the post.');
+        await sayBriefly('✅ Image added to the post.');
         if (typeof onAttached === 'function') {
           try { await onAttached(message.embeds?.[0]?.image?.url || att.url, message); } catch (_) {}
         }
       } catch (err) {
         // Nearly always the upload size limit for the server's boost tier.
-        await say(`❌ Couldn't attach that: ${err.message}`);
+        await sayBriefly(`❌ Couldn't attach that: ${err.message}`, 30000);
       }
       // Keep the channel as clean as it was before the picture existed. Needs
       // Manage Messages; if the bot hasn't got it the upload just stays put,
@@ -119,7 +138,10 @@ async function offerImageUpload({ interaction, message, embed, fileBase = 'image
     });
 
     collector.on('end', async () => {
-      if (!handled) await say('⏱️ No image uploaded — the post is fine as it is.');
+      // Nobody uploaded anything, so nothing happened and there is nothing to
+      // report. Announcing that the post is unchanged left a permanent notice
+      // in the channel after every single post that did not get a picture.
+      if (!handled) await drop();
     });
   } catch (err) {
     console.warn('[ImageAttach] skipped:', err && err.message);
