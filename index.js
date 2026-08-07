@@ -54,6 +54,7 @@ const {
   commands: storefrontCommands, handleStorefrontCommand, handleStorefrontButton, setStorefrontGate,
   buildWebsitePanel, storeConfig: storefrontConfig, upsertPanel, MARK_SITE,
 } = require('./modules/storefrontPanels');
+const { handleMethodsCommand, handleMethodButton } = require('./modules/paymentSwitches');
 const {
   commands: productInfoCommands, handleProductInfoCommand, handleProductInfoSelect,
   handleProductInfoButton, setProductInfoGate,
@@ -3251,6 +3252,10 @@ const ownCommands = [
         .addChoices(
           { name: '💵 Cash App Cashtag',    value: 'cashapp' },
           { name: '🅿️ PayPal Email',         value: 'paypal'  },
+          // The handle behind the pay screen's QR code. It is NOT the email
+          // address — the QR was built from the email for months and every one
+          // of them led to a dead PayPal.Me page.
+          { name: '🔗 PayPal.Me Handle',     value: 'paypalme' },
           { name: '📧 Gmail Address',        value: 'gmail'   },
           { name: '🔑 Gmail App Password',   value: 'gmailpw' },
           { name: '🏪 Store Name',           value: 'store'   },
@@ -3263,7 +3268,13 @@ const ownCommands = [
           // not a DB row. See the handler for why.
         ))
       .addStringOption(o => o.setName('value').setDescription('The value to set').setRequired(true)))
-    .addSubcommand(sub => sub.setName('view').setDescription('View current shop payment backend config')),
+    .addSubcommand(sub => sub.setName('view').setDescription('View current shop payment backend config'))
+    // Its own subcommand rather than another /config set choice. Turning a
+    // method off is a switch, and `set` takes a REQUIRED free-text value —
+    // there is no way to express "off" through it without inventing a magic
+    // string, and blanking the address instead is what this replaces.
+    .addSubcommand(sub => sub.setName('methods')
+      .setDescription('Turn each payment method on or off — addresses are kept')),
   new SlashCommandBuilder().setName('order').setDescription('Staff: Look up or manage a shop order')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addSubcommand(sub => sub.setName('lookup').setDescription('Look up an order by ID')
@@ -5782,6 +5793,18 @@ client.on('interactionCreate', async interaction => {
                 { name: '₿ BTC Enabled',      value: cfg.payment_methods.btc ? '✅' : '❌', inline: true },
                 { name: 'Ł LTC Enabled',      value: cfg.payment_methods.ltc ? '✅' : '❌', inline: true },
               )
+              // The four ✅/❌ above cannot tell "switched off on purpose" from
+              // "the address is broken", and those want opposite reactions.
+              // This line names the difference. Absent on an older backend,
+              // which is why it is added conditionally rather than inline.
+              .addFields(...(cfg.payment_method_states ? [{
+                name: '🔀 Method Switches',
+                value: Object.entries(cfg.payment_method_states).map(([m, st]) =>
+                  st.available ? `🟢 ${m} — accepting`
+                    : st.state === 'off' ? `🔴 ${m} — switched off`
+                    : `🟠 ${m} — needs setup · ${st.reason}`).join('\n')
+                  + '\n\nUse `/config methods` to change these.',
+              }] : []))
               .setFooter({ text: 'Use /config set to update values' }).setTimestamp();
             return interaction.editReply({ embeds: [embed] });
           } catch (err) {
@@ -5789,10 +5812,15 @@ client.on('interactionCreate', async interaction => {
           }
         }
 
+        if (sub === 'methods') {
+          return handleMethodsCommand(interaction);
+        }
+
         if (sub === 'set') {
           const CONFIG_KEYS = {
             cashapp:  { key: 'CASHAPP_CASHTAG',        label: 'Cash App Cashtag' },
             paypal:   { key: 'PAYPAL_EMAIL',            label: 'PayPal Email' },
+            paypalme: { key: 'PAYPAL_ME',               label: 'PayPal.Me Handle' },
             gmail:    { key: 'GMAIL_USER',              label: 'Gmail Address' },
             gmailpw:  { key: 'GMAIL_PASSWORD',          label: 'Gmail App Password' },
             store:    { key: 'STORE_NAME',              label: 'Store Name' },
@@ -6549,6 +6577,12 @@ client.on('interactionCreate', async interaction => {
       // "How do I get notified?" / "How do I record a clip?" — both answer from
       // static text and need nothing from this guild's settings row.
       if (await handleCommunityButton(interaction)) return;
+
+      // Payment on/off switches. Answered before getGuildSettings for the same
+      // reason as the others — the switch lives in the shop backend, not in
+      // this guild's row — and the permission check is passed in rather than
+      // done inside the module so there is exactly one definition of "owner".
+      if (await handleMethodButton(interaction, hasOwnerAccess(interaction))) return;
 
       // Server-snapshot restore. Answered before getGuildSettings for the same
       // reason: it does not need it, and this is a long job that should not
