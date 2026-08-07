@@ -67,16 +67,22 @@ check('the reply says addresses are kept', () => {
   assert.match(f, /nothing retyped/i);
 });
 
-// A posted panel is a message, not a live view. Repointing it silently would
-// be worse than telling the admin to re-run one command — a stale panel that
-// still says "send Cash App" is an instruction, and buyers follow it.
-check('the footer points at the command that refreshes the posted panel', () => {
-  assert.match(embedOf(states()).footer.text, /post-payment-method\b/);
-});
-check('that command actually exists in index.js', () => {
-  const idx = fs.readFileSync(path.join(__dirname, 'index.js'), 'utf8');
-  assert.ok(/setName\('post-payment-method'\)/.test(idx),
-    'the footer names a slash command this bot does not register');
+// Repinned 2026-08-06. This used to assert the footer named
+// `/post-payment-method` and, separately, that the command existed. Both
+// passed. Both were wrong: /post-payment-method posts the free-text document
+// from /set-payment-method and has nothing to do with the live availability
+// panel, so an admin following that footer would have changed nothing and had
+// no way to tell. **Asserting a command exists is not asserting it does the
+// job** — the check was pinned to the string I had written rather than to the
+// outcome it was there to guarantee.
+//
+// The panel now refreshes itself, so what has to stay true is that the footer
+// does not send anyone chasing a command at all. Covered in full, including the
+// edit path, by test_payment_panel_refresh.js.
+check('the footer does not send the admin to a command', () => {
+  const f = embedOf(states()).footer.text;
+  assert.ok(!/post-payment-method/.test(f), 'still naming the document command');
+  assert.ok(!/re-run/i.test(f) || /nothing to re-run/i.test(f), `still asking for a chore: ${f}`);
 });
 
 // The one state worth shouting about: nothing can be paid at all.

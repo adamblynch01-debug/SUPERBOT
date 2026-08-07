@@ -43,8 +43,12 @@ function setStorefrontGate(g) { gate = { ...gate, ...g }; }
 // Cached for a minute so posting both panels back to back is one request, and
 // so a backend that is down does not make the command hang twice.
 let cache = { at: 0, cfg: null };
-async function storeConfig() {
-  if (cache.cfg && Date.now() - cache.at < 60000) return cache.cfg;
+// `fresh` bypasses the cache. Used by the refresher when it has just been told
+// a switch moved: reading a minute-old config there would repaint the panel
+// with the state the admin just changed away from, which looks exactly like
+// the toggle not working.
+async function storeConfig({ fresh = false } = {}) {
+  if (!fresh && cache.cfg && Date.now() - cache.at < 60000) return cache.cfg;
   try {
     const { data } = await axios.get(`${BACKEND_URL}/api/config`, { timeout: 8000 });
     cache = { at: Date.now(), cfg: data };
@@ -283,6 +287,168 @@ async function upsertPanel(channel, marker, payload, me) {
   return { edited: false, message };
 }
 
+// ─── keeping the payments panel true ──────────────────────────────────────────
+// The panel lists methods straight out of `cfg.payment_methods`, so the moment
+// somebody closes Cash App the posted message is a lie — and it is a lie in the
+// worst possible direction, because "send your money here" is an instruction
+// and buyers follow instructions. Telling an admin to re-run a command puts the
+// correctness of a public payment notice on someone remembering to do it while
+// dealing with whatever made them close the method in the first place.
+//
+// So the panel edits itself, the same way /post-status does. Two triggers,
+// because there are two ways the state moves: a timer (the website's admin
+// panel can toggle a method, and Discord hears nothing about it) and an
+// immediate forced pass right after a /config methods press, so the person who
+// just clicked sees the channel change.
+//
+// The message reference is kept on the backend under a free-form `kind` in the
+// same app_state blob /post-status uses — no migration, no new route. It has to
+// live there rather than in memory because a redeploy would otherwise orphan
+// the panel and the next command would post a duplicate.
+const PAY_PANEL_KIND = 'paypanel';
+const payPanelKind = (guildId) => `${PAY_PANEL_KIND}:${guildId}`;
+
+// Keyed by guild: "unchanged since I last wrote it" is a per-server question,
+// and one shared variable would let the second server's first refresh see the
+// first server's signature and skip its write.
+const payPanelSignatures = new Map();
+// Guilds already searched for a panel posted before this file could record one.
+// Searched once per boot, so a server that has no panel does not pay for a
+// history scan on every tick forever.
+const payPanelAdopted = new Set();
+
+async function loadPayPanelRefs() {
+  if (!process.env.API_SECRET) return null;
+  try {
+    const r = await axios.get(`${BACKEND_URL}/api/status/panel`,
+      { params: { secret: process.env.API_SECRET, kind: PAY_PANEL_KIND }, timeout: 10000 });
+    return (r.data && r.data.panels) || {};
+  } catch (err) {
+    console.warn('[Panels] could not load the payments panel reference:', err.message);
+    return null;
+  }
+}
+
+async function savePayPanelRef(guildId, channelId, messageIds) {
+  if (!process.env.API_SECRET) return;
+  try {
+    await axios.post(`${BACKEND_URL}/api/status/panel`, {
+      secret: process.env.API_SECRET, kind: payPanelKind(guildId),
+      channel_id: channelId || null, message_ids: messageIds || [],
+    }, { timeout: 10000 });
+  } catch (err) {
+    console.warn('[Panels] could not save the payments panel reference:', err.message);
+  }
+}
+
+// Deliberately built from the config the panel is rendered FROM, never from the
+// rendered embed: the embed carries a .setTimestamp() that changes on every
+// build, so a signature taken from it would report a change every tick and edit
+// the panel forever.
+function paymentPanelSignature(cfg) {
+  if (!cfg) return null;
+  return JSON.stringify({
+    methods: cfg.payment_methods || {},
+    fees: [cfg.crypto_fee, cfg.cashapp_fee, cfg.paypal_fee],
+    windows: cfg.expiry_minutes || {},
+    addresses: [cfg.cashapp_cashtag, cfg.paypal_email],
+    name: cfg.store_name,
+  });
+}
+
+function payPanelPayload(guild, cfg) {
+  const built = buildPaymentPanel(guild, cfg, '');
+  // The language dropdown has to be re-attached on every edit. An edit replaces
+  // the components wholesale, so leaving it off would silently strip the
+  // translate control off a panel that had one — a refresh that quietly removes
+  // a feature is worse than no refresh.
+  return built.components && built.components.length >= 5
+    ? built
+    : { ...built, components: [...(built.components || []), languageRow()] };
+}
+
+// A panel posted before any of this existed has no stored reference, so the
+// refresher would ignore it until somebody re-ran the command — which is the
+// exact chore this is meant to remove. Find it by the same footer marker the
+// command uses and file it.
+async function adoptPaymentPanel(guild, findChannel) {
+  if (payPanelAdopted.has(guild.id)) return null;
+  payPanelAdopted.add(guild.id);
+  const channel = findChannel && findChannel(guild, 'payment-methods');
+  if (!channel || !channel.isTextBased?.()) return null;
+  try {
+    const recent = await channel.messages.fetch({ limit: 50 });
+    const found = recent.find(m =>
+      m.author.id === guild.client.user.id &&
+      m.embeds.some(e => (e.footer && e.footer.text || '').includes(MARK_PAY)));
+    if (!found) return null;
+    await savePayPanelRef(guild.id, channel.id, [found.id]);
+    console.log(`[Panels] adopted the payments panel already posted in guild ${guild.id}`);
+    return { channel_id: channel.id, message_ids: [found.id] };
+  } catch (e) {
+    console.warn('[Panels] could not scan for an existing payments panel:', e.message);
+    return null;
+  }
+}
+
+/**
+ * Repaint every payments panel this bot knows about.
+ *
+ * `force` skips the unchanged-check — used straight after a toggle, where
+ * showing the change immediately is the entire point.
+ */
+async function refreshPaymentPanels(client, { force = false, findChannel = null } = {}) {
+  if (!client || !process.env.API_SECRET) return;
+
+  const refs = await loadPayPanelRefs();
+  if (!refs) return;
+
+  const targets = Object.keys(refs)
+    .filter(k => k.startsWith(`${PAY_PANEL_KIND}:`))
+    .map(k => ({ guildId: k.slice(PAY_PANEL_KIND.length + 1), ref: refs[k] }))
+    .filter(t => t.ref && t.ref.channel_id && (t.ref.message_ids || []).length);
+
+  // Nothing filed yet — look for a panel posted before this shipped.
+  if (findChannel) {
+    for (const guild of client.guilds.cache.values()) {
+      if (targets.some(t => t.guildId === guild.id)) continue;
+      const adopted = await adoptPaymentPanel(guild, findChannel);
+      if (adopted) targets.push({ guildId: guild.id, ref: adopted });
+    }
+  }
+  if (!targets.length) return;
+
+  const cfg = await storeConfig({ fresh: true });
+  // A failed read is not "no methods are accepted". Repainting a public channel
+  // to an empty method list because /api/config blipped would invent an outage.
+  if (!cfg) return;
+  const signature = paymentPanelSignature(cfg);
+
+  for (const { guildId, ref } of targets) {
+    if (!force && signature === payPanelSignatures.get(guildId)) continue;
+    try {
+      const guild = await client.guilds.fetch(guildId);
+      const channel = await client.channels.fetch(ref.channel_id);
+      if (!channel || !channel.isTextBased?.()) continue;
+      const msg = await channel.messages.fetch(ref.message_ids[0]);
+      await msg.edit(payPanelPayload(guild, cfg));
+      payPanelSignatures.set(guildId, signature);
+    } catch (err) {
+      // 10008 Unknown Message / 10003 Unknown Channel — somebody deleted it.
+      // Forget the reference rather than failing on a timer forever; the next
+      // /setup-payments files a new one.
+      if (err.code === 10008 || err.code === 10003) {
+        console.warn(`[Panels] the payments panel in guild ${guildId} is gone — forgetting it`);
+        await savePayPanelRef(guildId, null, []);
+        payPanelSignatures.delete(guildId);
+        payPanelAdopted.delete(guildId);
+        continue;
+      }
+      console.warn(`[Panels] payments panel refresh failed for guild ${guildId}:`, err.message);
+    }
+  }
+}
+
 const commands = [
   new SlashCommandBuilder().setName('setup-website')
     .setDescription('Admin: Post (or refresh) the website panel')
@@ -332,9 +498,17 @@ async function handleStorefrontCommand(interaction, { findChannel }) {
     : { ...built, components: [...(built.components || []), languageRow()] };
 
   try {
-    const { edited } = await upsertPanel(channel, isSite ? MARK_SITE : MARK_PAY, payload, interaction.client.user);
+    const { edited, message } = await upsertPanel(channel, isSite ? MARK_SITE : MARK_PAY, payload, interaction.client.user);
+    // File the payments panel so the refresher can keep it true. The website
+    // panel is not tracked: nothing on it moves on its own.
+    if (!isSite && message) {
+      payPanelSignatures.set(interaction.guildId, paymentPanelSignature(cfg));
+      payPanelAdopted.add(interaction.guildId);
+      await savePayPanelRef(interaction.guildId, channel.id, [message.id]);
+    }
     await interaction.editReply(
       `${edited ? '♻️ Refreshed' : '📌 Posted'} the ${isSite ? 'website' : 'payment methods'} panel in <#${channel.id}>.`
+      + (isSite ? '' : ' It updates itself from now on — you will not need to run this again when a method is switched on or off.')
       + (cfg ? '' : '\n⚠️ The store did not answer, so the panel went out without live fees or payment windows.'
              + ' Run this again once it is up — it will edit the same message.')
       + (interaction.options.getChannel('channel') || findChannel(interaction.guild, wanted)
@@ -401,7 +575,11 @@ module.exports = {
   // to post. Two commands writing two different posts into one channel is how
   // that channel ended up looking dead in the first place.
   storeConfig, upsertPanel,
+  // The panel keeps itself true; index.js drives it on a timer and /config
+  // methods forces a pass right after a toggle.
+  refreshPaymentPanels, savePayPanelRef,
   // Exported for the tests, which render the panels without a Discord connection.
   buildWebsitePanel, buildPaymentPanel, humanMinutes, paymentRows, addressProblems,
+  paymentPanelSignature, payPanelKind, PAY_PANEL_KIND,
   MARK_SITE, MARK_PAY,
 };

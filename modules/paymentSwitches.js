@@ -12,14 +12,28 @@
 // reads /api/config already picks it up. That includes the #payment-methods
 // panel, which lists methods straight out of `cfg.payment_methods`.
 //
-// One thing this deliberately does NOT do is quietly repost that panel. It is
-// a message sitting in a channel, not a live view, so a toggle leaves it
-// stale — and a stale panel telling buyers to send Cash App is worse than an
-// admin being told to re-run one command. The reply says so, every time.
+// That panel used to go stale on a toggle, and the footer here told the admin
+// to go and re-run the command that posts it. Two things were wrong with that.
+// The command it named — /post-payment-method — posts the free-text document
+// from /set-payment-method and has nothing to do with the live panel, so
+// following the instruction would not have fixed anything. And leaving a public
+// "send your money here" notice correct only for as long as somebody remembers
+// a chore is not a design, it is a pending incident: the moment you close a
+// method is the moment you are least likely to remember.
+//
+// The panel now edits itself. This file forces a pass immediately after a
+// successful toggle so the channel changes while the admin is still looking at
+// it; the timer in index.js covers the other direction, where the website's
+// admin panel moves a switch and Discord is never told.
 'use strict';
 
 const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const axios = require('axios');
+
+// Set by index.js, which owns the client and the channel resolver. Left as a
+// no-op so this module stays renderable by the tests with no Discord at all.
+let refreshPanels = async () => {};
+function setPanelRefresher(fn) { if (typeof fn === 'function') refreshPanels = fn; }
 
 const METHODS = ['cashapp', 'paypal', 'btc', 'ltc'];
 const META = {
@@ -96,7 +110,7 @@ function buildEmbed(states) {
     })
     .setFooter({
       text: anyOn
-        ? 'Re-run /post-payment-method so the posted panel matches'
+        ? 'The #payment-methods panel updates itself — nothing to re-run'
         : 'NOTHING IS BEING ACCEPTED — the store cannot take money right now',
     })
     .setTimestamp();
@@ -175,6 +189,10 @@ async function handleMethodButton(interaction, isOwnerAdmin) {
       embeds: [buildEmbed(states)],
       components: buildRows(states),
     });
+    // Deliberately after the reply and deliberately not awaited into it: the
+    // switch is already saved, and a channel the bot cannot edit must not turn
+    // a successful toggle into an error message.
+    refreshPanels().catch(e => console.warn('[PaySwitch] panel refresh failed:', e.message));
   } catch (err) {
     await interaction.followUp({
       content: `❌ Could not change that: ${err.response && err.response.data && err.response.data.error || err.message}`,
@@ -185,7 +203,7 @@ async function handleMethodButton(interaction, isOwnerAdmin) {
 }
 
 module.exports = {
-  handleMethodsCommand, handleMethodButton,
+  handleMethodsCommand, handleMethodButton, setPanelRefresher,
   // Exported for the tests, which render without a Discord connection.
   buildEmbed, buildRows, METHODS, META,
 };

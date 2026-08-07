@@ -53,8 +53,11 @@ const {
 const {
   commands: storefrontCommands, handleStorefrontCommand, handleStorefrontButton, setStorefrontGate,
   buildWebsitePanel, storeConfig: storefrontConfig, upsertPanel, MARK_SITE,
+  refreshPaymentPanels,
 } = require('./modules/storefrontPanels');
-const { handleMethodsCommand, handleMethodButton } = require('./modules/paymentSwitches');
+const {
+  handleMethodsCommand, handleMethodButton, setPanelRefresher,
+} = require('./modules/paymentSwitches');
 const {
   commands: productInfoCommands, handleProductInfoCommand, handleProductInfoSelect,
   handleProductInfoButton, setProductInfoGate,
@@ -806,6 +809,10 @@ setManualAccessGate({ hasAccess: (i) => hasAccess(i) });
 // Same gate for the storefront panels. Posting one rewrites a channel every
 // member reads, so it is staff-only for the same reason /post-tos is.
 setStorefrontGate({ hasAccess: (i) => hasAccess(i) });
+// Closing a payment method from /config methods has to reach the posted
+// #payment-methods panel. paymentSwitches owns the toggle but not the client,
+// so it is handed the one call it needs rather than the whole bot.
+setPanelRefresher(() => refreshPaymentPanels(client, { force: true, findChannel: findChannelByName }));
 // And the #live-stream / #post-your-clips panels, for the same reason —
 // /golive posts an @everyone announcement, which is not a thing a member gets
 // to do.
@@ -3564,6 +3571,19 @@ client.once('ready', async () => {
   refreshStatusPanel({ force: true }).catch(err => console.warn('[Status] first refresh failed:', err.message));
   setInterval(() => {
     refreshStatusPanel().catch(err => console.warn('[Status] refresh failed:', err.message));
+  }, STATUS_PANEL_REFRESH_MS);
+
+  // Same treatment for the #payment-methods panel. It lists the methods the
+  // store accepts, so a toggle anywhere — here or the website's admin panel —
+  // has to reach it, and "send your money here" is not a notice to leave stale.
+  // The first pass is forced and carries the channel resolver, which is what
+  // lets it adopt a panel posted before any of this existed.
+  const payPanelOpts = { findChannel: findChannelByName };
+  refreshPaymentPanels(client, { force: true, ...payPanelOpts })
+    .catch(err => console.warn('[Panels] first payments refresh failed:', err.message));
+  setInterval(() => {
+    refreshPaymentPanels(client, payPanelOpts)
+      .catch(err => console.warn('[Panels] payments refresh failed:', err.message));
   }, STATUS_PANEL_REFRESH_MS);
 
   await client.user.setActivity('for scams 🛡️', { type: 3 }); // Watching
