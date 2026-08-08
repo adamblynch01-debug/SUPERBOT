@@ -14,6 +14,11 @@
 
 const assert = require('assert');
 const P = require('./modules/productInfo');
+// The shop's own symbol, escaped for use inside a regex, rather than a '€'
+// typed here. A hand-typed symbol is a second declaration of the currency and
+// it goes on passing after the first one changes.
+const { SYMBOL } = require('./modules/money');
+const SYM = SYMBOL.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 let passed = 0, failed = 0;
 const check = async (name, fn) => {
@@ -138,8 +143,8 @@ await check('every plan is priced, and each one says whether it is in stock', ()
     row({ tier_id: '2', tier_label: 'Month', price: 39.99 }),
   ]);
   const lines = P.tierLines(cat.products.get('main::181'), { 1: 12, 2: 0 });
-  assert.ok(/\$7\.99/.test(lines[0]) && /In stock/.test(lines[0]));
-  assert.ok(/\$39\.99/.test(lines[1]) && /Sold out/.test(lines[1]));
+  assert.ok(new RegExp(SYM + '7\\.99').test(lines[0]) && /In stock/.test(lines[0]), lines[0]);
+  assert.ok(new RegExp(SYM + '39\\.99').test(lines[1]) && /Sold out/.test(lines[1]), lines[1]);
 });
 
 await check('a stock lookup that FAILED is not printed as sold out', () => {
@@ -149,7 +154,7 @@ await check('a stock lookup that FAILED is not printed as sold out', () => {
   const cat = P.groupCatalog([row({ tier_id: '1' })]);
   const lines = P.tierLines(cat.products.get('main::181'), null);
   assert.ok(!/Sold out|In stock/.test(lines[0]), lines[0]);
-  assert.ok(/\$7\.99/.test(lines[0]), 'the price still shows');
+  assert.ok(new RegExp(SYM + '7\\.99').test(lines[0]), 'the price still shows');
 });
 
 await check('a product with no plans says why it cannot be bought', () => {

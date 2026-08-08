@@ -1316,7 +1316,7 @@ function renderDashboard(session, guild) {
                 '<b>' + esc(ref) + '</b> <span class="sub">' + esc(x.summary) + '</span><br>' +
                 '<span class="sub">' + esc(who) + ' · ' + esc(String(x.payment_method || '').toUpperCase()) +
                 (x.payment_note ? ' · note ' + esc(x.payment_note) : '') + '</span>',
-                '<b style="color:var(--amber)">$' + esc(Number(x.total).toFixed(2)) + '</b>' +
+                '<b style="color:var(--amber)">€' + esc(Number(x.total).toFixed(2)) + '</b>' +
                 '<button class="mini" onclick="approveOrder(' + JSON.stringify(String(x.order_id)) + ', ' + JSON.stringify(ref) + ')">approve</button>'
               );
             }).join('')

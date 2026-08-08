@@ -48,6 +48,10 @@ require.cache[dbPath] = {
 };
 
 const { registerInternalRoutes } = require('./modules/internalEvents');
+// Derived, not typed. An assertion spelling '€25.99' by hand passes for as
+// long as somebody keeps it in step with the shop by hand, which is exactly
+// what the dollar era proved does not happen.
+const { money } = require('./modules/money');
 
 // ─── fakes ───────────────────────────────────────────────
 const ORDERS_CH = '1400773021274341396'; // 19-digit snowflake
@@ -180,20 +184,20 @@ const field = (embed, name) => (embed.fields || []).find(f => f.name === name);
     });
     ok(r.status === 200 && r.body.posted === true, 'a new order posts to the order log channel');
     ok(SENT.length === 1 && SENT[0].channelId === ORDERS_CH, 'resolved from the config table');
-    ok(field(SENT[0].embed, 'Total').value === '$25.99', 'total_cents renders as dollars, not raw cents');
+    ok(field(SENT[0].embed, 'Total').value === money(25.99), 'total_cents renders as a price, not raw cents');
     ok(field(SENT[0].embed, 'Pay to').value === 'bc1qtest', 'the pay-to address is included');
   }
 
   reset();
   {
-    // The bridge did total_cents/100 unguarded, printing "$NaN" to staff.
+    // The bridge did total_cents/100 unguarded, printing "€NaN" to staff.
     const r = await post('/internal/new_order', {
       secret: SECRET, order: { id: '502', payment_method: 'paypal' }, payment_info: { amount: 7.5 },
     });
-    ok(field(SENT[0].embed, 'Total').value === '$7.50', 'payment_info.amount is treated as dollars');
+    ok(field(SENT[0].embed, 'Total').value === money(7.5), 'payment_info.amount is treated as whole units');
     const r2 = await post('/internal/new_order', { secret: SECRET, order: { id: '503' }, payment_info: {} });
     ok(r2.status === 200 && field(SENT[1].embed, 'Total').value === 'unknown',
-      'a missing amount reads "unknown", never "$NaN"');
+      'a missing amount reads "unknown", never "€NaN"');
   }
 
   reset();

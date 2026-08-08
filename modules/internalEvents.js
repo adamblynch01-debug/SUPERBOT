@@ -26,6 +26,7 @@ const { languageRow } = require('./translate');
 // The buyer's DM is rendered here and nowhere else — /manual-order-delivery
 // calls the same function, which is what keeps the two deliveries identical.
 const { buildDeliveryEmbed, gameWorthShowing } = require('./deliveryEmbed');
+const { money, moneyCents } = require('./money');
 
 // THE DELIVERY DM IS SENT IN ENGLISH. ALWAYS. The dropdown under it is how a
 // buyer reads it in anything else.
@@ -103,13 +104,14 @@ function lineLabel(g) {
 
 const SEVERITY_COLOR = { error: 0xED4245, warn: 0xFEE75C, info: 0x5865F2 };
 
-// orders.total_cents is CENTS; payment_info.amount is DOLLARS. The bridge did
-// `total_cents / 100` unguarded, which renders "$NaN" when the field is absent.
+// orders.total_cents is CENTS; payment_info.amount is WHOLE UNITS. The bridge
+// did `total_cents / 100` unguarded, which renders "€NaN" when the field is
+// absent.
 function formatAmount(order, payment_info) {
   const cents = Number(order && order.total_cents);
-  if (Number.isFinite(cents)) return `$${(cents / 100).toFixed(2)}`;
-  const dollars = Number(payment_info && payment_info.amount);
-  if (Number.isFinite(dollars)) return `$${dollars.toFixed(2)}`;
+  if (Number.isFinite(cents)) return moneyCents(cents);
+  const units = Number(payment_info && payment_info.amount);
+  if (Number.isFinite(units)) return money(units);
   return 'unknown';
 }
 

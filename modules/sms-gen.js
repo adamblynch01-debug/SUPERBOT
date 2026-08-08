@@ -428,6 +428,12 @@ async function fivesimGetOperators(apiKey, country, service) {
   const svcData = d[service];
   if (!svcData) throw new Error(`Service "${service}" not available in ${country}`);
   // Returns operators keyed by name, each has { cost, count, rate }
+  //
+  // ⚠ The `$` below is NOT the shop's currency and must not be swept into `€`
+  // with the rest. This is the SMS provider's own price list, billed against our
+  // account with them in genuine US dollars; the shop sells in euro and the two
+  // figures are not the same money. Printing a provider cost as "€0.30" would
+  // read as a euro charge that nobody is ever billed.
   const ops = Object.entries(svcData).map(([op, info]) => ({
     label: `${op} — $${info.cost} (${info.count} avail, ${Math.round(info.rate * 100)}% rate)`.slice(0, 100),
     value: op,

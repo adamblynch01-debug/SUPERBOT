@@ -28,6 +28,7 @@ const {
 } = require('discord.js');
 const axios = require('axios');
 const { languageRow } = require('./translate');
+const { CURRENCY, money } = require('./money');
 
 const BACKEND_URL = (process.env.BACKEND_URL || process.env.API_URL || 'http://localhost:3000').replace(/\/+$/, '');
 const SITE_URL    = (process.env.SITE_URL || 'https://uhservices.xyz').replace(/\/+$/, '');
@@ -205,7 +206,7 @@ function priceHint(p) {
   const prices = p.tiers.map(t => t.price).filter(n => typeof n === 'number' && !Number.isNaN(n));
   if (!prices.length) return p.tiers.length ? '' : 'No plans yet';
   const lo = Math.min(...prices);
-  return prices.length > 1 ? `from $${lo.toFixed(2)} · ${prices.length} plans` : `$${lo.toFixed(2)}`;
+  return prices.length > 1 ? `from ${money(lo)} · ${prices.length} plans` : `${money(lo)}`;
 }
 
 // ─── the card ─────────────────────────────────────────────────────────────────
@@ -227,7 +228,7 @@ async function tierStock(tiers) {
 function tierLines(product, stock) {
   const lines = [];
   for (const t of product.tiers) {
-    const price = typeof t.price === 'number' && !Number.isNaN(t.price) ? `**$${t.price.toFixed(2)}**` : '**—**';
+    const price = typeof t.price === 'number' && !Number.isNaN(t.price) ? `**${money(t.price)}**` : '**—**';
     const name = [t.label, t.period && t.period !== t.label ? `(${t.period})` : ''].filter(Boolean).join(' ') || 'Standard';
     let badge = '';
     if (stock) {
@@ -320,7 +321,7 @@ function buildProductEmbed(product, stock, { readAt = null } = {}) {
   if (media.screenshot && /^https?:\/\//i.test(String(media.screenshot))) embed.setImage(String(media.screenshot));
 
   embed.setFooter({
-    text: `${SITE_URL.replace(/^https?:\/\//, '')} • prices in USD${readAt ? ` • read ${readAt}` : ''}`,
+    text: `${SITE_URL.replace(/^https?:\/\//, '')} • prices in ${CURRENCY}${readAt ? ` • read ${readAt}` : ''}`,
   }).setTimestamp();
 
   return embed;

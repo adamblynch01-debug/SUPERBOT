@@ -81,6 +81,7 @@ const { makeStaffRoleResolver } = require('./modules/staffRoles');
 const serverBackup = require('./modules/serverBackup');
 const mirror = require('./modules/mirror');
 const counting = require('./modules/counting');
+const { money: gxMoney } = require('./modules/money');
 
 // ─── Mirror relay state ───────────────────────────────────────────────────────
 // Three pieces of memory, all of them there to stop a loop or a stampede.
@@ -5917,7 +5918,7 @@ client.on('interactionCreate', async interaction => {
               const d = t ? new Date(t) : null;
               return d && !isNaN(d.getTime()) ? `<t:${Math.floor(d.getTime() / 1000)}:f>` : '—';
             };
-            const money = n => (n == null || n === '' ? '—' : `$${Number(n).toFixed(2)}`);
+            const money = n => (n == null || n === '' ? '—' : gxMoney(n));
             const dash = v => (v == null || v === '' ? '—' : String(v));
             // An embed field caps at 1024 characters and Discord rejects the
             // whole message if one goes over — so a 40-item order must lose
@@ -6102,7 +6103,7 @@ client.on('interactionCreate', async interaction => {
               .addFields(
                 { name: 'Account', value: b.username || 'N/A', inline: true },
                 { name: 'Email', value: b.email || 'N/A', inline: true },
-                { name: 'Balance', value: `$${Number(b.balance).toFixed(2)}`, inline: true },
+                { name: 'Balance', value: gxMoney(b.balance), inline: true },
                 { name: 'Discord', value: `<@${target.id}>`, inline: true },
               ).setTimestamp();
             return interaction.editReply({ embeds: [embed] });
@@ -6126,8 +6127,8 @@ client.on('interactionCreate', async interaction => {
               .setTitle(amount >= 0 ? '➕ Balance Credited' : '➖ Balance Debited')
               .addFields(
                 { name: 'User', value: `<@${target.id}>`, inline: true },
-                { name: 'Change', value: `${amount >= 0 ? '+' : '-'}$${Math.abs(amount).toFixed(2)}`, inline: true },
-                { name: 'New Balance', value: `$${Number(res.data.balance).toFixed(2)}`, inline: true },
+                { name: 'Change', value: `${amount >= 0 ? '+' : '-'}${gxMoney(Math.abs(amount))}`, inline: true },
+                { name: 'New Balance', value: gxMoney(res.data.balance), inline: true },
                 { name: 'Reason', value: reason, inline: false },
               ).setFooter({ text: `By ${interaction.user.tag}` }).setTimestamp();
             return interaction.editReply({ embeds: [embed] });

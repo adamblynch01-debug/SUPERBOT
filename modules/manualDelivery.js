@@ -37,6 +37,10 @@ const { query } = require('../db');
 const { languageRow } = require('./translate');
 // One renderer for the buyer's DM, shared with the website delivery path.
 const { buildDeliveryEmbed } = require('./deliveryEmbed');
+// `money` here has always taken CENTS; `moneyUnits` takes whole euro, which is
+// the shape /api/orders/pending returns as `total`. Naming both stops the two
+// being swapped, which is a 100x error that renders without complaint.
+const { CURRENCY, money: moneyUnits, moneyCents, parseMoneyText } = require('./money');
 
 const BACKEND_URL = process.env.BACKEND_URL || process.env.API_URL || 'http://localhost:3000';
 const API_SECRET  = process.env.API_SECRET;
@@ -70,7 +74,7 @@ const commands = [
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
-function money(cents) { return `$${((Number(cents) || 0) / 100).toFixed(2)}`; }
+const money = moneyCents;
 
 // The panel's per-guild manual delivery channel, installed by index.js. The env
 // var and the fallback below are one id for the whole bot, and
@@ -228,7 +232,7 @@ async function openKeyModal(interaction) {
     new ActionRowBuilder().addComponents(
       new TextInputBuilder()
         .setCustomId('price')
-        .setLabel('Price paid, USD')
+        .setLabel(`Price paid, ${CURRENCY}`)
         .setPlaceholder(`blank = list price (${money(t.price_cents)}) · 0 = free / replacement`)
         .setStyle(TextInputStyle.Short)
         .setRequired(false)
@@ -269,7 +273,11 @@ async function submitKeys(interaction, client) {
   // free. `Number('')` is 0, so an empty box would silently comp the order.
   let unitCents;
   if (priceIn !== '') {
-    const n = Number(priceIn.replace(/[$,]/g, ''));
+    // parseMoneyText, not Number-after-stripping-`[$,]`. A euro-locale seller
+    // types "12,50" and the old strip deleted the comma, recording the order at
+    // €1250 and telling nobody; one typing "€12.50" got NaN, because `€` was
+    // never in the stripped set, and was told a valid price "is not a price".
+    const n = parseMoneyText(priceIn);
     if (!Number.isFinite(n) || n < 0) {
       return interaction.editReply(`❌ \`${priceIn}\` is not a price. Nothing was delivered — run the command again.`);
     }
@@ -405,7 +413,7 @@ async function listPending(interaction) {
     .setColor(0xfaa61a)
     .setTitle(`⏳ ${orders.length} order(s) awaiting payment`)
     .setDescription(orders.map(o =>
-      `\`${o.invoice_no || `#${o.order_id}`}\` · **${o.total.toFixed(2)}** ${String(o.payment_method || '').toUpperCase()}` +
+      `\`${o.invoice_no || `#${o.order_id}`}\` · **${moneyUnits(o.total)}** ${String(o.payment_method || '').toUpperCase()}` +
       `\n└ ${o.summary} — ${o.discord_id ? `<@${o.discord_id}>` : (o.email || 'no contact')}` +
       (o.payment_note ? `  ·  note \`${o.payment_note}\`` : '')
     ).join('\n').slice(0, 4000))
@@ -416,7 +424,7 @@ async function listPending(interaction) {
     .setCustomId('mdlv_approve')
     .setPlaceholder('Approve one — only if you have confirmed the money arrived')
     .addOptions(orders.slice(0, 25).map(o => ({
-      label: `${o.invoice_no || `#${o.order_id}`} — $${o.total.toFixed(2)}`.slice(0, 100),
+      label: `${o.invoice_no || `#${o.order_id}`} — ${moneyUnits(o.total)}`.slice(0, 100),
       description: o.summary.slice(0, 100),
       value: String(o.order_id),
     })));
