@@ -2951,6 +2951,35 @@ function describeSync(sync) {
   return `\n⚠️ **The website was NOT updated** — ${sync.reason}\nThe announcement above still posted. Fix it with \`/statusupdate\` or from the admin panel.`;
 }
 
+// Push one update card to the website's Updates page (the /api/updates route
+// that the round-45 migration added). Non-fatal — a network hiccup here must
+// never silently abort an update whose embed already posted in Discord.
+// Called after the Discord post, never before: the post is the announcement,
+// and if it fails we do not want to have also modified the website.
+async function syncUpdateToSite({ typeKey, product, title, notes, statusFrom, statusTo, imageUrl } = {}) {
+  if (!process.env.BACKEND_URL || !process.env.API_SECRET) return;
+  try {
+    await axios.post(
+      `${process.env.BACKEND_URL}/api/updates`,
+      {
+        secret:       process.env.API_SECRET,
+        update_type:  typeKey  || 'other',
+        product_name: product  || 'Unknown',
+        title:        title    || null,
+        notes:        notes    || null,
+        status_from:  statusFrom || null,
+        status_to:    statusTo   || null,
+        image_url:    imageUrl   || null,
+      },
+      { timeout: 10_000 }
+    );
+  } catch (_) {
+    // Non-fatal. The Discord embed already delivered the information; the
+    // website card is bonus. Log it so the operator can see a pattern.
+    console.error('[syncUpdateToSite] failed (non-fatal):', _.message);
+  }
+}
+
 // Only true for the bot owner's own Discord account — used for commands
 // that operate across every server the bot is in (list/leave a guild),
 // not just the guild the command was run from. Set OWNER_DISCORD_ID in
@@ -6987,6 +7016,18 @@ client.on('interactionCreate', async interaction => {
           await interaction.editReply({ content: `✅ Update posted to <#${interaction.channel.id}>${describeSync(siteSync)}` });
           // A warning needs long enough to actually be read.
           autoDelete(interaction, siteSync && !siteSync.ok ? 30000 : 5000);
+          // Mirror the update to the website's Updates page so /postupdate and
+          // the storefront are always in sync. Non-fatal — the embed is the
+          // announcement; the website card is secondary.
+          syncUpdateToSite({
+            typeKey:    typeKey,
+            product:    product,
+            title:      customTitle || null,
+            notes:      notesRaw    || null,
+            statusFrom: oldStatus   ? oldStatus.label  : null,
+            statusTo:   newStatus   ? newStatus.label   : null,
+            imageUrl:   imageUrl    || null,
+          });
           // The modal has an image_url field, but only for people who already
           // host the picture somewhere. This is for the far commoner case: the
           // screenshot is sitting on the poster's desktop.
