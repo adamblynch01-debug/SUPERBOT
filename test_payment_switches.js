@@ -52,6 +52,24 @@ console.log('\nthe embed distinguishes all three states');
 check('a live method reads as accepting', () => {
   assert.match(embedOf(states()).description, /Cash App\*\* — 🟢 accepting/);
 });
+// A method that cannot hold the shop's currency is still accepting — the order
+// is priced in euro and the buyer is quoted the converted figure, locked at
+// checkout. Worth saying on the line rather than leaving it to be discovered
+// from a receipt: whoever reconciles the Cash App balance is looking at dollars
+// and comparing them to a euro total, and needs to know that before they decide
+// the numbers are wrong.
+check('a bridged method says which currency actually lands in the account', () => {
+  const d = embedOf(states({ cashapp: { available: true, state: 'on', reason: null, settle_currency: 'USD' } })).description;
+  assert.match(d, /Cash App\*\* — 🟢 accepting/, 'it is accepting, not a fourth status');
+  assert.match(d, /collects USD/);
+  assert.match(d, /priced in EUR/);
+});
+check('an ordinary method is not given a currency it does not need', () => {
+  // Litecoin here is plain `state:'on'` with no settle_currency. Printing a
+  // conversion note on every live method would make the one that matters
+  // invisible.
+  assert.doesNotMatch(embedOf(states()).description, /Litecoin\*\* — 🟢 accepting · collects/);
+});
 // These two read identically at checkout, and want opposite reactions from
 // whoever is looking: one is a decision, the other is a fault to go and fix.
 check('a switched-off method says so, not "unavailable"', () => {

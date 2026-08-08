@@ -91,7 +91,16 @@ function buildEmbed(states) {
     // can undo here; "needs setup" is a fault that this command cannot fix,
     // and showing both as a red cross is how you end up clicking TURN ON four
     // times wondering why nothing happens.
-    if (st.available) return `${META[m].emoji} **${META[m].label}** — 🟢 accepting`;
+    // A method that cannot hold the shop's currency is still accepting — the
+    // order stays priced in euro and the buyer is quoted the converted figure,
+    // locked at checkout (backend utils/fx.js). Worth saying on the line rather
+    // than leaving it to be discovered from a receipt: the money that lands in
+    // that account is in another currency, and whoever reconciles it needs to
+    // know that before they compare a total to a bank statement.
+    if (st.available) {
+      return `${META[m].emoji} **${META[m].label}** — 🟢 accepting`
+        + (st.settle_currency ? ` · collects ${st.settle_currency}, priced in EUR` : '');
+    }
     if (st.state === 'off') return `${META[m].emoji} **${META[m].label}** — 🔴 switched off`;
     return `${META[m].emoji} **${META[m].label}** — 🟠 needs setup · ${st.reason || 'not configured'}`;
   };

@@ -204,6 +204,12 @@ function paymentRows(cfg) {
     name: '💵  Cash App',
     value: strip(cfg.cashapp_fee, cashWindow)
       + `${cashtagOK(cfg.cashapp_cashtag) ? `Send to **${String(cfg.cashapp_cashtag).trim()}**\n` : ''}`
+      // The one method that cannot hold the shop's currency. Said here because
+      // a buyer who reads €19.99 on this panel and then sees a dollar figure at
+      // checkout has every reason to think the price changed on them — and a
+      // buyer who thinks the price changed closes the tab.
+      + 'Cash App cannot send euro, so the pay screen shows your total converted to **USD** '
+      + 'at the ECB rate and holds that figure for your order. The price is still in EUR.\n'
       + 'Confirmed automatically when the payment notification arrives.',
   });
   if (enabled.paypal) rows.push({

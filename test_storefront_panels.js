@@ -162,6 +162,17 @@ await check('a real cashtag survives, trimmed', () => {
   assert.ok(/Send to \*\*\$uhpay\*\*/.test(v), JSON.stringify(v));
 });
 
+await check('the Cash App row explains the USD conversion', () => {
+  // The store prices in euro. A buyer who sees €19.99 here and then a dollar
+  // figure at checkout has every reason to think the price changed on them —
+  // and a buyer who thinks that closes the tab. Pinning this copy keeps that
+  // note visible even if somebody tidies the method's description.
+  const v = P.paymentRows(CFG).find(r => /Cash App/.test(r.name)).value;
+  assert.match(v, /USD/, 'must name the currency the buyer actually sends');
+  assert.match(v, /EUR/, 'must name the currency the order is priced in');
+  assert.match(v, /ECB|converted/i, 'must say WHERE the rate comes from');
+});
+
 await check('a paypal field that is not an email is dropped too', () => {
   const v = P.paymentRows({ ...CFG, paypal_email: 'ask staff' }).find(r => /PayPal/.test(r.name)).value;
   assert.ok(!/Send to/.test(v), v);
