@@ -428,7 +428,7 @@ const INVITE_LOG_CHANNEL_ENV= process.env.INVITE_LOG_CHANNEL_NAME|| 'invite-trac
 const INVITES_NEEDED_ENV = parseInt(process.env.INVITES_NEEDED || '10');
 
 // Updates module
-const BOT_NAME  = process.env.BOT_NAME  || 'UH Services';
+const BOT_NAME  = process.env.BOT_NAME  || 'ZEROPOINT';
 const SITE_URL  = process.env.SITE_URL  || '';
 // The store address, guaranteed non-empty and scheme-qualified. SITE_URL is
 // allowed to be blank above (the footer just prints nothing), but a Link button
@@ -436,6 +436,20 @@ const SITE_URL  = process.env.SITE_URL  || '';
 // goes through this one instead.
 const STORE_URL = (process.env.SITE_URL || 'https://zeropoint.wtf').replace(/\/+$/, '');
 const DOWNLOADS_URL = `${STORE_URL}/downloads`;
+
+// ── ZEROPOINT Brand Helper ────────────────────────────────────────────────────
+// Applies consistent branding to any embed: logo top-left (author), thumbnail
+// top-right, and the banner image at the bottom. Call brandEmbed(embed, guild)
+// anywhere in the codebase — or brandEmbed(embed) when no guild is available.
+const ZEROPOINT_BANNER = 'https://media.discordapp.net/attachments/1521288246573797418/1536183475630117034/ZEROPOINT_BANNER.png?ex=6a7a79d9&is=6a792859&hm=724513811a7f39bf0c2eab470e01765f8ebb7351c472869a1349a2bd970808f5&=&format=webp&quality=lossless&width=1280&height=511';
+function brandEmbed(embed, guild) {
+  const iconURL = (guild && guild.iconURL({ size: 128 })) || null;
+  const thumbURL = (guild && guild.iconURL({ size: 256 })) || null;
+  if (iconURL) embed.setAuthor({ name: BOT_NAME, iconURL });
+  if (thumbURL) embed.setThumbnail(thumbURL);
+  embed.setImage(ZEROPOINT_BANNER);
+  return embed;
+}
 // #downloads held two bot posts — a bare @everyone link, and the product
 // dropdowns — and the ask was to make them one. The marker is what lets the
 // command find and EDIT the merged panel instead of adding a third.
@@ -4580,8 +4594,8 @@ client.on('interactionCreate', async interaction => {
           .setColor(0x5865F2)
           .setTitle('📝 Leave a Vouch')
           .setDescription('We value your feedback!\nClick the button below to leave a vouch.\n\n**Your feedback helps us grow** 💡')
-          .setImage('https://media.discordapp.net/attachments/1521288246573797418/1536183475630117034/ZEROPOINT_BANNER.png?ex=6a7a79d9&is=6a792859&hm=724513811a7f39bf0c2eab470e01765f8ebb7351c472869a1349a2bd970808f5&=&format=webp&quality=lossless&width=1280&height=511')
           .setFooter({ text: `${BOT_NAME} | ${SITE_URL}`, iconURL: client.user.displayAvatarURL() });
+        brandEmbed(embed, interaction.guild);
         const row = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('leave_vouch').setLabel('📝 Leave a Vouch').setStyle(ButtonStyle.Primary),
         );
@@ -7064,6 +7078,7 @@ client.on('interactionCreate', async interaction => {
         const embed = new EmbedBuilder().setColor(0x5865F2);
         if (title) embed.setTitle(title);
         embed.setDescription(clampDescription(body)).setFooter({ text: `${BOT_NAME} | ${SITE_URL}`, iconURL: client.user.displayAvatarURL() }).setTimestamp();
+        brandEmbed(embed, interaction.guild);
         const buttonRow = dlUrl ? new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel('⬇️  DOWNLOAD').setURL(dlUrl).setStyle(ButtonStyle.Link)) : null;
         try {
           // The ping and, under it, any link from the body as a bare URL — the
