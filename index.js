@@ -989,11 +989,6 @@ async function buildContentEmbeds(guildId, key, guild) {
     } else {
       e.setFooter({ text: `page ${i + 1}/${pages.length}` });
     }
-        iconURL: client.user.displayAvatarURL(),
-      }).setTimestamp(new Date(row.updated_at));
-    } else {
-      e.setFooter({ text: `page ${i + 1}/${pages.length}` });
-    }
     return e;
   });
 }
