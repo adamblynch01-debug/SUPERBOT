@@ -789,7 +789,7 @@ function registerInternalRoutes(app, client) {
       const store = products.filter(p => !p.vault);
       const vault = products.filter(p => p.vault);
 
-      const storeUrl = String(req.body.store_url || 'https://uhservices.xyz').replace(/\/+$/, '');
+      const storeUrl = String(req.body.store_url || 'https://zeropoint.wtf').replace(/\/+$/, '');
       const vaultUrl = String(req.body.vault_url || storeUrl).replace(/\/+$/, '');
 
       const out = { ok: true, posted: false, store: null, vault: null };

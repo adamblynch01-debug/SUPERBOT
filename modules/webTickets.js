@@ -26,7 +26,7 @@ const {
 const { routeFor, isStaffFor, resolveLogChannel } = require('./support');
 
 const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:3000';
-const SITE_URL    = process.env.SITE_URL || 'https://uhservices.xyz';
+const SITE_URL    = process.env.SITE_URL || 'https://zeropoint.wtf';
 
 // Ticket routing is per-guild now, and a website ticket has no guild — nobody
 // pressed a button in a server to open it. There is one store, and it is the

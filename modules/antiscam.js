@@ -74,7 +74,7 @@ let ALLOWED_LINKS = [
   'klipy.com',
   'tenor.com', 'giphy.com', 'media.giphy.com',
   'cdn.discordapp.com', 'media.discordapp.net', 'images-ext-1.discordapp.net',
-  'uhservices.xyz',
+  'zeropoint.wtf',
 ];
 
 // How long a banned word costs you. Escalates with repeat offences.

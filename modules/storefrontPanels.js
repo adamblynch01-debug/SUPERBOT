@@ -29,7 +29,7 @@ const axios = require('axios');
 const { languageRow } = require('./translate');
 
 const BACKEND_URL = (process.env.BACKEND_URL || process.env.API_URL || 'http://localhost:3000').replace(/\/+$/, '');
-const SITE_URL    = (process.env.SITE_URL || 'https://uhservices.xyz').replace(/\/+$/, '');
+const SITE_URL    = (process.env.SITE_URL || 'https://zeropoint.wtf').replace(/\/+$/, '');
 
 // The needle the panels are found by. In the footer because a footer is the one
 // part of an embed nobody scans, and it has to survive being looked at.

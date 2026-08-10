@@ -31,7 +31,7 @@ const { languageRow } = require('./translate');
 const { CURRENCY, money } = require('./money');
 
 const BACKEND_URL = (process.env.BACKEND_URL || process.env.API_URL || 'http://localhost:3000').replace(/\/+$/, '');
-const SITE_URL    = (process.env.SITE_URL || 'https://uhservices.xyz').replace(/\/+$/, '');
+const SITE_URL    = (process.env.SITE_URL || 'https://zeropoint.wtf').replace(/\/+$/, '');
 
 const MAX_OPTIONS = 25;   // per select menu
 const MAX_ROWS    = 5;    // per message — the language row takes one of them

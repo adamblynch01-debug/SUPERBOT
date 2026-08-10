@@ -58,7 +58,7 @@ function clipKeys(values, max) {
 // would read as part of a key.
 const omittedNote = (n) =>
   `\n⚠️ **${n} more ${n === 1 ? 'key is' : 'keys are'} not shown here** — Discord caps how much fits in one message.`
-  + ' All of them are on your uhservices.xyz account under **Orders**, and staff can re-send them from your invoice.';
+  + ' All of them are on your zeropoint.wtf account under **Orders**, and staff can re-send them from your invoice.';
 
 // Discord's own green. 0x00ff00 is the green of a terminal, not of a receipt.
 const COLOR = 0x57F287;
@@ -175,12 +175,12 @@ function buildDeliveryEmbed({ items = [], invoiceNo = null, orderId = null, emai
       value: clip(
         `\`${invoiceNo || `#${orderId}`}\`\nKeep this. Use \`/claim-customer\` with it`
         + `${email ? ` and \`${email}\`` : ' (leave the email blank — this order was delivered to you on Discord)'}`
-        + ' to get your customer role and put this order on your uhservices.xyz account, or quote it to staff.',
+        + ' to get your customer role and put this order on your zeropoint.wtf account, or quote it to staff.',
         LIMIT.value),
     });
   }
 
-  embed.setFooter({ text: 'uhservices.xyz • thank you for your order' });
+  embed.setFooter({ text: 'zeropoint.wtf • thank you for your order' });
 
   return {
     embed,

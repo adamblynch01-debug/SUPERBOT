@@ -53,7 +53,7 @@ const {
 const { languageRow } = require('./translate');
 const { upsertPanel } = require('./storefrontPanels');
 
-const SITE_URL = (process.env.SITE_URL || 'https://uhservices.xyz').replace(/\/+$/, '');
+const SITE_URL = (process.env.SITE_URL || 'https://zeropoint.wtf').replace(/\/+$/, '');
 
 // Furniture — written only by its own /setup- command, never by anything else.
 const MARK_LIVE     = 'panel:live-stream';
