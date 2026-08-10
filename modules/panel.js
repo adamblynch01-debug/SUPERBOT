@@ -1594,7 +1594,7 @@ function renderDashboard(session, guild) {
             return '<div class="embed">' +
               (i === 0 && title ? '<div class="etitle">' + esc(title) + '</div>' : '') +
               discordish(p) +
-              '<div class="efoot">' + (d.pages.length > 1 ? 'page ' + (i + 1) + '/' + d.pages.length : 'UH SERVICES') + '</div>' +
+              '<div class="efoot">' + (d.pages.length > 1 ? 'page ' + (i + 1) + '/' + d.pages.length : 'ZEROPOINT') + '</div>' +
             '</div>';
           }).join('');
       } catch (e) { fail('preview_' + key, e); }

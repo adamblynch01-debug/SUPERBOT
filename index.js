@@ -1,6 +1,6 @@
 /**
  * ╔══════════════════════════════════════════════════════╗
- * ║          UH SERVICES — SUPER BOT  v2.0.0            ║
+ * ║          ZEROPOINT — SUPER BOT  v2.0.0            ║
  * ║  Combines: Verify/Welcome • Updates • Anti-Scam     ║
  * ║            DM Support • 2FA Auth Server             ║
  * ╚══════════════════════════════════════════════════════╝
@@ -1978,7 +1978,7 @@ async function announceInvite(member, inviterId, fake, isRejoin) {
       .setAuthor({ name: member.user.tag, iconURL: member.user.displayAvatarURL() })
       .setDescription(`📨 ${line}`)
       .addFields({ name: 'Account created', value: created, inline: true })
-      .setFooter({ text: 'UH SERVICES • Invite Tracker' })
+      .setFooter({ text: 'ZEROPOINT • Invite Tracker' })
       .setTimestamp();
 
     await ch.send({ embeds: [embed] });
@@ -3787,7 +3787,7 @@ client.on('guildMemberRemove', async member => {
         .setColor(0xED4245)
         .setAuthor({ name: member.user?.tag || member.id, iconURL: member.user?.displayAvatarURL?.() })
         .setDescription(`👋 **${member.user?.tag || member.id}** left — invited by <@${inviterId}>, who is now on **${d.real}** real invite${d.real === 1 ? '' : 's'}.`)
-        .setFooter({ text: 'UH SERVICES • Invite Tracker' })
+        .setFooter({ text: 'ZEROPOINT • Invite Tracker' })
         .setTimestamp()],
     }).catch(() => {});
   } catch (err) { console.error('Invite leave-tracking error:', err); }
@@ -4093,7 +4093,7 @@ client.on('interactionCreate', async interaction => {
               { name: '🔑 Used',   value: `\`${d.usedKeys}\``, inline: true },
               { name: `👥 Invited (${names.length})`, value: names.length ? names.join('\n').slice(0, 1024) : '_nobody yet_', inline: false },
             )
-            .setFooter({ text: 'UH SERVICES • Invite Tracker' })
+            .setFooter({ text: 'ZEROPOINT • Invite Tracker' })
             .setTimestamp();
           return interaction.editReply({ embeds: [embed] });
         }
@@ -4431,7 +4431,7 @@ client.on('interactionCreate', async interaction => {
         await interaction.deferReply({ flags: 64 });
         const resCh = findChannelByName(interaction.guild, 'reseller') || interaction.channel;
         const embed = new EmbedBuilder().setColor(0x5865F2).setDescription(
-          '# UH SERVICES IS LOOKING FOR RESELLERS\n\n**Did you know you can make up to $5000+ monthly reselling our products?**\n\n## Why Start Reselling?\n- All keys are bought through our **centralized panel**, where you can **generate, manage, reset, and freeze keys**\n- We provide **10+** of the **markets leading products**\n- We offer all of our resellers a **minimum discount of 50% off keys** right away\n- We take care of the hard part. **Development, testing, updates, and more are all handled by us**\n- We offer **priority support** in your personal ticket\n- We provide **tips on how to grow and expand** your brand\n- We offer **dynamic delivery** so you can link your site to our panel for seamless product delivery\n- **Pressure free environment**, we don\'t force you to deposit\n- Access to a community of over **100+ successful resellers**'
+          '# ZEROPOINT IS LOOKING FOR RESELLERS\n\n**Did you know you can make up to $5000+ monthly reselling our products?**\n\n## Why Start Reselling?\n- All keys are bought through our **centralized panel**, where you can **generate, manage, reset, and freeze keys**\n- We provide **10+** of the **markets leading products**\n- We offer all of our resellers a **minimum discount of 50% off keys** right away\n- We take care of the hard part. **Development, testing, updates, and more are all handled by us**\n- We offer **priority support** in your personal ticket\n- We provide **tips on how to grow and expand** your brand\n- We offer **dynamic delivery** so you can link your site to our panel for seamless product delivery\n- **Pressure free environment**, we don\'t force you to deposit\n- Access to a community of over **100+ successful resellers**'
         );
         const row = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setLabel('APPLY HERE!').setEmoji('📋').setStyle(ButtonStyle.Link).setURL(resellerLinks.apply),

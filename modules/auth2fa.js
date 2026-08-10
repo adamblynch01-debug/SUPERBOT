@@ -55,7 +55,7 @@ async function handle2FAInteraction(interaction) {
       .setColor(0x57F287)
       .setTitle('✅ Authentication Successful')
       .setDescription('You have been verified. You can now return to the website — you will be logged in automatically.')
-      .setFooter({ text: 'UH SERVICES • Security' })
+      .setFooter({ text: 'ZEROPOINT • Security' })
       .setTimestamp()],
     components: [],
   });
@@ -103,7 +103,7 @@ function startAuthServer(discordClient, { issueKey, invalidateGuildSettings, pan
         // the only thing telling the customer which of the two they are looking
         // at, and "📧 Account: @ghost" reads as a broken template.
         .addFields({ name: label.includes('@') && label.includes('.') ? '📧 Account' : '👤 Account', value: label, inline: true })
-        .setFooter({ text: 'This request expires in 10 minutes • UH SERVICES' })
+        .setFooter({ text: 'This request expires in 10 minutes • ZEROPOINT' })
         .setTimestamp();
       const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder()
@@ -115,7 +115,7 @@ function startAuthServer(discordClient, { issueKey, invalidateGuildSettings, pan
       return res.json({ userId: sessionId, message: 'Verification DM sent.' });
     } catch (err) {
       pendingSessions.delete(sessionId);
-      let message = 'Failed to send Discord DM. Make sure you are in the UH SERVICES server.';
+      let message = 'Failed to send Discord DM. Make sure you are in the ZEROPOINT server.';
       if (err.code === 50007) message = 'Cannot send DM — please enable DMs from server members in your Discord privacy settings.';
       if (err.code === 10013) message = 'Discord User ID not found. Double-check the ID in your Security settings.';
       return res.status(488).json({ message });

@@ -562,7 +562,7 @@ function buildOrderEmbed(provider, serviceName, country, number, status, code) {
       // stray character with it.
       ...(code ? [{ name: '🔑 Your Code', value: `\`${code}\``, inline: false }] : []),
     )
-    .setFooter({ text: "UH SERVICES • SMS Gen  |  Code didn't work? Hit 🔄 for a new one or 🚫 to cancel & refund" })
+    .setFooter({ text: "ZEROPOINT • SMS Gen  |  Code didn't work? Hit 🔄 for a new one or 🚫 to cancel & refund" })
     .setTimestamp();
 }
 
@@ -624,7 +624,7 @@ function buildPanelEmbed() {
       '> Hit **🚫 Cancel & Refund** to get your balance back and try a different number\n' +
       '> Numbers auto-cancel after **5 minutes** if no SMS arrives'
     )
-    .setFooter({ text: 'UH SERVICES • SMS Gen' })
+    .setFooter({ text: 'ZEROPOINT • SMS Gen' })
     .setTimestamp();
 }
 
@@ -799,7 +799,7 @@ async function showProviderPicker(interaction) {
     .setColor(0x5865f2)
     .setTitle('📲 SMS Number Generator')
     .setDescription('**Step 1 of 3** — Select a network')
-    .setFooter({ text: 'UH SERVICES • SMS Gen' });
+    .setFooter({ text: 'ZEROPOINT • SMS Gen' });
 
   if (interaction.replied || interaction.deferred)
     return interaction.editReply({ embeds: [embed], components: [row] });
@@ -931,7 +931,7 @@ async function handleSMSInteraction(interaction, client) {
           .setColor(PROVIDER_COLOR[provider] || 0x5865f2)
           .setTitle(`${providerTag(provider)} Select Service`)
           .setDescription(`**Step 2 of 3** — Find the service you need\n${total} services available — type a name to search`)
-          .setFooter({ text: 'UH SERVICES • SMS Gen' }),
+          .setFooter({ text: 'ZEROPOINT • SMS Gen' }),
       ],
       components: [searchRow],
     });
@@ -986,7 +986,7 @@ async function handleSMSInteraction(interaction, client) {
             .setColor(0xed4245)
             .setTitle('❌ No Services Found')
             .setDescription(`No results for **"${query}"** — try a different search term.`)
-            .setFooter({ text: 'UH SERVICES • SMS Gen' }),
+            .setFooter({ text: 'ZEROPOINT • SMS Gen' }),
         ],
         components: [searchRow],
       });
@@ -1020,7 +1020,7 @@ async function handleSMSInteraction(interaction, client) {
 ` +
             `${matches.length > 25 ? `Showing top 25 of ${matches.length} matches — refine your search if needed` : `${matches.length} match${matches.length > 1 ? 'es' : ''} found`}`
           )
-          .setFooter({ text: 'UH SERVICES • SMS Gen' }),
+          .setFooter({ text: 'ZEROPOINT • SMS Gen' }),
       ],
       components: [row, searchAgainRow],
     });
@@ -1051,7 +1051,7 @@ async function handleSMSInteraction(interaction, client) {
             .setColor(PROVIDER_COLOR[provider] || 0x5865f2)
             .setTitle(`${providerTag(provider)} Select Service`)
             .setDescription(`**Step 2 of 3** — Page ${newPage + 1} of ${Math.ceil(total / PAGE_SIZE)}\n${total} services available`)
-            .setFooter({ text: 'UH SERVICES • SMS Gen' }),
+            .setFooter({ text: 'ZEROPOINT • SMS Gen' }),
         ],
         components: [row],
       });
@@ -1086,7 +1086,7 @@ async function handleSMSInteraction(interaction, client) {
           .setColor(PROVIDER_COLOR[provider] || 0x5865f2)
           .setTitle(`${PROVIDER_EMOJI[provider]} Select Country`)
           .setDescription(`**Step 3 of 3** — Service: **${serviceName}**\n${total} countries available`)
-          .setFooter({ text: 'UH SERVICES • SMS Gen' }),
+          .setFooter({ text: 'ZEROPOINT • SMS Gen' }),
       ],
       components: [row],
     });
@@ -1117,7 +1117,7 @@ async function handleSMSInteraction(interaction, client) {
             .setColor(PROVIDER_COLOR[provider] || 0x5865f2)
             .setTitle(`${PROVIDER_EMOJI[provider]} Select Country`)
             .setDescription(`**Step 3 of 3** — Service: **${session.serviceName}**\nPage ${newPage + 1} of ${Math.ceil(total / PAGE_SIZE)}`)
-            .setFooter({ text: 'UH SERVICES • SMS Gen' }),
+            .setFooter({ text: 'ZEROPOINT • SMS Gen' }),
         ],
         components: [row],
       });
@@ -1153,7 +1153,7 @@ async function handleSMSInteraction(interaction, client) {
             .setColor(0x57f287)
             .setTitle('🌐 Select Operator')
             .setDescription(`**Service:** ${session.serviceName} · **Country:** ${capitalize(country)}\nPick an operator — higher % = better delivery rate`)
-            .setFooter({ text: 'UH SERVICES • SMS Gen' }),
+            .setFooter({ text: 'ZEROPOINT • SMS Gen' }),
         ],
         components: [row],
       });
@@ -1315,7 +1315,7 @@ async function purchaseNumber(interaction, client, provider, apiKey, session, co
           .setColor(0xed4245)
           .setTitle('❌ Not Available')
           .setDescription(denied.content)
-          .setFooter({ text: 'UH SERVICES • SMS Gen' }),
+          .setFooter({ text: 'ZEROPOINT • SMS Gen' }),
       ],
       components: [],
     });
@@ -1340,7 +1340,7 @@ async function purchaseNumber(interaction, client, provider, apiKey, session, co
           .setColor(0xed4245)
           .setTitle('❌ Failed to Purchase Number')
           .setDescription(`**${maskProvider(e.message)}**\n\nNo charge was applied. Try a different country or network.`)
-          .setFooter({ text: 'UH SERVICES • SMS Gen' }),
+          .setFooter({ text: 'ZEROPOINT • SMS Gen' }),
       ],
       components: [],
     });
