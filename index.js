@@ -3463,7 +3463,7 @@ console.log(`[Lockdown] ${_lockedCount}/${allCommands.length} commands hidden fr
 // ─── Ready ────────────────────────────────────────────────────────────────────
 client.once('ready', async () => {
   console.log(`\n╔════════════════════════════════════╗`);
-  console.log(`║  ✅ UH SUPER BOT online            ║`);
+  console.log(`║  ✅ ZEROPOINT BOT online           ║`);
   console.log(`║  Logged in as: ${client.user.tag.padEnd(19)}║`);
   console.log(`╚════════════════════════════════════╝\n`);
 
