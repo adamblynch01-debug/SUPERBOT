@@ -235,14 +235,15 @@ async function handleInteraction(interaction, client) {
     const msgs = await interaction.channel.messages.fetch({ limit: 100 });
     for (const [, m] of msgs) if (m.author.id === client.user.id) try { await m.delete(); } catch (_) {}
     const embed = new EmbedBuilder()
-      .setTitle('UH Support').setColor(0x5865f2)
+      .setTitle('ZEROPOINT Support').setColor(0x5865f2)
       .setDescription(
         'Click a button below to start a support ticket. Our assistant will help you with your request.\n\n' +
         '**READ FAQ BEFORE MAKING A SUPPORT TICKET**\n\n' +
         '**TYPE !close IF YOU HAVE MULTIPLE TICKETS**\n\n' +
         '**How it works**\n1. Click the appropriate button below\n2. I\'ll DM you to start a conversation\n3. Describe your issue and I\'ll help!\n\n' +
-        '© 2026 UH. All rights reserved.'
-      );
+        '© 2026 ZEROPOINT. All rights reserved.'
+      )
+      .setImage('https://media.discordapp.net/attachments/1521288246573797418/1536183475630117034/ZEROPOINT_BANNER.png?ex=6a7a79d9&is=6a792859&hm=724513811a7f39bf0c2eab470e01765f8ebb7351c472869a1349a2bd970808f5&=&format=webp&quality=lossless&width=1280&height=511');
     // Exactly 5 buttons — Discord's limit for one action row. A sixth type
     // needs a second row, not another entry here.
     const row = new ActionRowBuilder().addComponents(

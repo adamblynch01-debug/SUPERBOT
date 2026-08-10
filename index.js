@@ -2692,6 +2692,7 @@ async function buildStatusPanel() {
     .setColor(0x00ff88)
     .setTitle('📊 PRODUCT STATUS')
     .setDescription(`🟢 ${counts.undetected} Undetected  •  🧪 ${counts.testing} Testing  •  🔵 ${counts.updating} Updating  •  🔴 ${counts.detected} Detected`)
+    .setImage('https://media.discordapp.net/attachments/1521288246573797418/1536183475630117034/ZEROPOINT_BANNER.png?ex=6a7a79d9&is=6a792859&hm=724513811a7f39bf0c2eab470e01765f8ebb7351c472869a1349a2bd970808f5&=&format=webp&quality=lossless&width=1280&height=511')
     .setFooter({ text: `${BOT_NAME}${SITE_URL ? ' | ' + SITE_URL : ''} • updates automatically`, iconURL: client.user.displayAvatarURL() })
     .setTimestamp();
 
@@ -4283,6 +4284,7 @@ client.on('interactionCreate', async interaction => {
             { name: '🌐 On the site', value: 'Sign in with Discord — no password — for the full list and your keys.', inline: true },
             { name: '🆕 Updates', value: 'Links are replaced in place, so this panel always points at the current build.', inline: true },
           )
+          .setImage('https://media.discordapp.net/attachments/1521288246573797418/1536183475630117034/ZEROPOINT_BANNER.png?ex=6a7a79d9&is=6a792859&hm=724513811a7f39bf0c2eab470e01765f8ebb7351c472869a1349a2bd970808f5&=&format=webp&quality=lossless&width=1280&height=511')
           .setFooter({ text: `${BOT_NAME}${SITE_URL ? ` | ${SITE_URL}` : ''} • ${MARK_DOWNLOADS}`, iconURL: client.user.displayAvatarURL() }).setTimestamp();
 
         const linkRow = new ActionRowBuilder().addComponents(
@@ -4432,7 +4434,7 @@ client.on('interactionCreate', async interaction => {
         const resCh = findChannelByName(interaction.guild, 'reseller') || interaction.channel;
         const embed = new EmbedBuilder().setColor(0x5865F2).setDescription(
           '# ZEROPOINT IS LOOKING FOR RESELLERS\n\n**Did you know you can make up to $5000+ monthly reselling our products?**\n\n## Why Start Reselling?\n- All keys are bought through our **centralized panel**, where you can **generate, manage, reset, and freeze keys**\n- We provide **10+** of the **markets leading products**\n- We offer all of our resellers a **minimum discount of 50% off keys** right away\n- We take care of the hard part. **Development, testing, updates, and more are all handled by us**\n- We offer **priority support** in your personal ticket\n- We provide **tips on how to grow and expand** your brand\n- We offer **dynamic delivery** so you can link your site to our panel for seamless product delivery\n- **Pressure free environment**, we don\'t force you to deposit\n- Access to a community of over **100+ successful resellers**'
-        );
+        ).setImage('https://media.discordapp.net/attachments/1521288246573797418/1536183475630117034/ZEROPOINT_BANNER.png?ex=6a7a79d9&is=6a792859&hm=724513811a7f39bf0c2eab470e01765f8ebb7351c472869a1349a2bd970808f5&=&format=webp&quality=lossless&width=1280&height=511');
         const row = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setLabel('APPLY HERE!').setEmoji('📋').setStyle(ButtonStyle.Link).setURL(resellerLinks.apply),
           new ButtonBuilder().setLabel('Preview Panel').setEmoji('👀').setStyle(ButtonStyle.Link).setURL(resellerLinks.panel),
@@ -4578,6 +4580,7 @@ client.on('interactionCreate', async interaction => {
           .setColor(0x5865F2)
           .setTitle('📝 Leave a Vouch')
           .setDescription('We value your feedback!\nClick the button below to leave a vouch.\n\n**Your feedback helps us grow** 💡')
+          .setImage('https://media.discordapp.net/attachments/1521288246573797418/1536183475630117034/ZEROPOINT_BANNER.png?ex=6a7a79d9&is=6a792859&hm=724513811a7f39bf0c2eab470e01765f8ebb7351c472869a1349a2bd970808f5&=&format=webp&quality=lossless&width=1280&height=511')
           .setFooter({ text: `${BOT_NAME} | ${SITE_URL}`, iconURL: client.user.displayAvatarURL() });
         const row = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('leave_vouch').setLabel('📝 Leave a Vouch').setStyle(ButtonStyle.Primary),
@@ -6979,6 +6982,7 @@ client.on('interactionCreate', async interaction => {
         const embed = new EmbedBuilder()
           .setTitle((customTitle ? customTitle.toUpperCase() : product.toUpperCase()))
           .setColor(embedColor).addFields(fields)
+          .setImage('https://media.discordapp.net/attachments/1521288246573797418/1536183475630117034/ZEROPOINT_BANNER.png?ex=6a7a79d9&is=6a792859&hm=724513811a7f39bf0c2eab470e01765f8ebb7351c472869a1349a2bd970808f5&=&format=webp&quality=lossless&width=1280&height=511')
           .setFooter({ text: `${BOT_NAME} | ${SITE_URL}`, iconURL: client.user.displayAvatarURL() }).setTimestamp();
         if (longNotes) embed.setDescription(clampDescription(notes));
         if (imageUrl) embed.setThumbnail(imageUrl);
@@ -7218,6 +7222,7 @@ client.on('interactionCreate', async interaction => {
             { name: 'Vouched By', value: `<@${interaction.user.id}>`, inline: false },
             { name: 'Vouched At', value: `<t:${Math.floor(Date.now() / 1000)}:R>`, inline: false },
           )
+          .setImage('https://media.discordapp.net/attachments/1521288246573797418/1536183475630117034/ZEROPOINT_BANNER.png?ex=6a7a79d9&is=6a792859&hm=724513811a7f39bf0c2eab470e01765f8ebb7351c472869a1349a2bd970808f5&=&format=webp&quality=lossless&width=1280&height=511')
           .setFooter({ text: `Thanks for supporting ${BOT_NAME} | ${new Date().toLocaleDateString('en-US', { month: '2-digit', day: '2-digit', year: 'numeric' })} ${new Date().toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true })}`, iconURL: client.user.displayAvatarURL() });
 
         if (imageUrl && /^https?:\/\//i.test(imageUrl)) embed.setImage(imageUrl);

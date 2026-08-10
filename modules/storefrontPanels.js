@@ -153,7 +153,8 @@ function buildWebsitePanel(guild, cfg, url) {
       { name: '🛒 Browse & buy', value: 'Every product, live stock and current pricing.', inline: true },
       { name: '⚡ Instant delivery', value: 'Keys are issued the moment payment confirms.', inline: true },
       { name: '📦 Your orders', value: 'Sign in with Discord — no password. Every key you have ever bought stays there.', inline: true },
-    );
+    )
+    .setImage('https://media.discordapp.net/attachments/1521288246573797418/1536183475630117034/ZEROPOINT_BANNER.png?ex=6a7a79d9&is=6a792859&hm=724513811a7f39bf0c2eab470e01765f8ebb7351c472869a1349a2bd970808f5&=&format=webp&quality=lossless&width=1280&height=511');
 
   if (methods.length) {
     embed.addFields({ name: '💳 Payments accepted', value: methods.join(' • '), inline: false });
@@ -252,6 +253,8 @@ function buildPaymentPanel(guild, cfg, url) {
       '• Staff will **never** DM you first asking for payment. Nobody here needs your password.',
     ].join('\n'),
   });
+
+  embed.setImage('https://media.discordapp.net/attachments/1521288246573797418/1536183475630117034/ZEROPOINT_BANNER.png?ex=6a7a79d9&is=6a792859&hm=724513811a7f39bf0c2eab470e01765f8ebb7351c472869a1349a2bd970808f5&=&format=webp&quality=lossless&width=1280&height=511');
 
   // Says what it actually read, not what it hoped to. "Fees and windows read
   // from the store" over a panel with no windows on it is the small kind of

@@ -157,6 +157,7 @@ function buildLivePanel(guild) {
     );
 
   if (guild.iconURL()) embed.setThumbnail(guild.iconURL({ size: 256 }));
+  embed.setImage('https://media.discordapp.net/attachments/1521288246573797418/1536183475630117034/ZEROPOINT_BANNER.png?ex=6a7a79d9&is=6a792859&hm=724513811a7f39bf0c2eab470e01765f8ebb7351c472869a1349a2bd970808f5&=&format=webp&quality=lossless&width=1280&height=511');
   embed.setFooter({ text: `${SITE_URL.replace(/^https?:\/\//, '')} • ${MARK_LIVE}` }).setTimestamp();
 
   // No Link button can point at "the current stream" — there may not be one,
@@ -267,6 +268,7 @@ function buildClipsPanel(guild) {
     );
 
   if (guild.iconURL()) embed.setThumbnail(guild.iconURL({ size: 256 }));
+  embed.setImage('https://media.discordapp.net/attachments/1521288246573797418/1536183475630117034/ZEROPOINT_BANNER.png?ex=6a7a79d9&is=6a792859&hm=724513811a7f39bf0c2eab470e01765f8ebb7351c472869a1349a2bd970808f5&=&format=webp&quality=lossless&width=1280&height=511');
   embed.setFooter({ text: `${SITE_URL.replace(/^https?:\/\//, '')} • ${MARK_CLIPS}` }).setTimestamp();
 
   const row = new ActionRowBuilder().addComponents(
@@ -370,6 +372,7 @@ function buildPcPanel(guild) {
     );
 
   if (guild.iconURL()) embed.setThumbnail(guild.iconURL({ size: 256 }));
+  embed.setImage('https://media.discordapp.net/attachments/1521288246573797418/1536183475630117034/ZEROPOINT_BANNER.png?ex=6a7a79d9&is=6a792859&hm=724513811a7f39bf0c2eab470e01765f8ebb7351c472869a1349a2bd970808f5&=&format=webp&quality=lossless&width=1280&height=511');
   embed.setFooter({ text: `${SITE_URL.replace(/^https?:\/\//, '')} • ${MARK_PC}` }).setTimestamp();
 
   const row = new ActionRowBuilder().addComponents(
@@ -401,6 +404,7 @@ function buildSuggestPanel(guild) {
     );
 
   if (guild.iconURL()) embed.setThumbnail(guild.iconURL({ size: 256 }));
+  embed.setImage('https://media.discordapp.net/attachments/1521288246573797418/1536183475630117034/ZEROPOINT_BANNER.png?ex=6a7a79d9&is=6a792859&hm=724513811a7f39bf0c2eab470e01765f8ebb7351c472869a1349a2bd970808f5&=&format=webp&quality=lossless&width=1280&height=511');
   embed.setFooter({ text: `${SITE_URL.replace(/^https?:\/\//, '')} • ${MARK_SUGGEST}` }).setTimestamp();
 
   const row = new ActionRowBuilder().addComponents(
@@ -450,6 +454,7 @@ function buildGiveawayPanel(guild) {
     );
 
   if (guild.iconURL()) embed.setThumbnail(guild.iconURL({ size: 256 }));
+  embed.setImage('https://media.discordapp.net/attachments/1521288246573797418/1536183475630117034/ZEROPOINT_BANNER.png?ex=6a7a79d9&is=6a792859&hm=724513811a7f39bf0c2eab470e01765f8ebb7351c472869a1349a2bd970808f5&=&format=webp&quality=lossless&width=1280&height=511');
   embed.setFooter({ text: `${SITE_URL.replace(/^https?:\/\//, '')} • ${MARK_GIVEAWAY}` }).setTimestamp();
 
   const row = new ActionRowBuilder().addComponents(

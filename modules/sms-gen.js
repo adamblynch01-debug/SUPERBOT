@@ -624,6 +624,7 @@ function buildPanelEmbed() {
       '> Hit **🚫 Cancel & Refund** to get your balance back and try a different number\n' +
       '> Numbers auto-cancel after **5 minutes** if no SMS arrives'
     )
+    .setImage('https://media.discordapp.net/attachments/1521288246573797418/1536183475630117034/ZEROPOINT_BANNER.png?ex=6a7a79d9&is=6a792859&hm=724513811a7f39bf0c2eab470e01765f8ebb7351c472869a1349a2bd970808f5&=&format=webp&quality=lossless&width=1280&height=511')
     .setFooter({ text: 'ZEROPOINT • SMS Gen' })
     .setTimestamp();
 }
