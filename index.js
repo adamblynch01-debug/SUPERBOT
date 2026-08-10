@@ -563,17 +563,16 @@ async function endGiveaway(msgId, why = 'timer') {
 
   try {
     const gwCh = await client.channels.fetch(gw.channelId);
+    const gwGuild = client.guilds.cache.find(g => g.channels.cache.has(gw.channelId));
     const endedEmbed = new EmbedBuilder()
       .setColor(0x95A5A6)
       .setAuthor({ name: BOT_NAME, iconURL: client.user.displayAvatarURL() })
       .setTitle(`🎁 ${gw.prize} [ENDED]`)
       .setDescription(`This giveaway has ended!\n\n**${winners.length > 1 ? 'Winners' : 'Winner'}:** ${winnersText || 'No participants'}`)
       .setThumbnail(client.user.displayAvatarURL())
-      // The marker has to survive being ended. This footer REPLACES the one the
-      // entry card was posted with, so leaving it off would hide the finished
-      // giveaway from the sweep that is supposed to clear it next time.
       .setFooter({ text: `Ended on ${new Date(gw.endsAt).toUTCString()} • ${MARK_GW_ENTRY}`, iconURL: client.user.displayAvatarURL() });
     if (gw.imageUrl) endedEmbed.setImage(gw.imageUrl);
+    else brandEmbed(endedEmbed, gwGuild);
     const disabledRow = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('giveaway_enter').setLabel(`🎉 Participate (${participants.length})`).setStyle(ButtonStyle.Primary).setDisabled(true),
     );
@@ -597,6 +596,7 @@ async function endGiveaway(msgId, why = 'timer') {
       )
       .setFooter({ text: `${BOT_NAME} | ${SITE_URL} • ${MARK_GW_RESULTS}`, iconURL: client.user.displayAvatarURL() })
       .setTimestamp();
+    brandEmbed(resultsEmbed, gwGuild);
     await gwCh.send(withLanguageRow({ content: winnersText || '❌ No participants — no winner.', embeds: [resultsEmbed] }));
   } catch (e) { console.error(`Giveaway end error (${why}):`, e); }
 }
@@ -970,7 +970,7 @@ const {
 // Returns an ARRAY now — a long document is several embeds, not one truncated
 // one. Callers spread it; `buildContentEmbed` is kept as the single-embed
 // convenience for the places that only ever preview.
-async function buildContentEmbeds(guildId, key) {
+async function buildContentEmbeds(guildId, key, guild) {
   const row = await getGuildContent(guildId, key);
   if (!row) return null;
 
@@ -979,12 +979,16 @@ async function buildContentEmbeds(guildId, key) {
     const e = new EmbedBuilder()
       .setColor(0x5865F2)
       .setDescription(page || '_(empty)_');
-    // Only the first page carries the title, and only the last the footer —
-    // repeating both on every page reads as four separate documents.
     if (i === 0) e.setTitle(row.title);
     if (i === pages.length - 1) {
       e.setFooter({
         text: pages.length > 1 ? `${BOT_NAME} · page ${i + 1}/${pages.length}` : BOT_NAME,
+        iconURL: client.user.displayAvatarURL(),
+      }).setTimestamp(new Date(row.updated_at));
+      brandEmbed(e, guild);
+    } else {
+      e.setFooter({ text: `page ${i + 1}/${pages.length}` });
+    }
         iconURL: client.user.displayAvatarURL(),
       }).setTimestamp(new Date(row.updated_at));
     } else {
@@ -4150,6 +4154,7 @@ client.on('interactionCreate', async interaction => {
           .setTitle('🎉 Invite Your Friends & Earn Rewards!')
           .setDescription(`Invite your friends and earn **free keys**!\n\n**How it works:**\n1️⃣ Click **Your Invite Link** to get your link\n2️⃣ Share it with friends\n3️⃣ Once you have **${settings.invitesNeeded} real invites**, click **Redeem Your Key**!\n\nRedeem **unlimited times** — every ${settings.invitesNeeded} invites = 1 free key 🔑\n\n⚠️ *Fake invites & users who leave don't count!*`)
           .setColor(0x5865f2).setTimestamp().setFooter({ text: 'Invite Reward System' });
+        brandEmbed(embed, guild);
         const row = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('get_invite_link').setLabel('🔗 Your Invite Link').setStyle(ButtonStyle.Primary),
           new ButtonBuilder().setCustomId('check_invites').setLabel('📊 Check Your Invites').setStyle(ButtonStyle.Secondary),
@@ -4593,7 +4598,17 @@ client.on('interactionCreate', async interaction => {
         const embed = new EmbedBuilder()
           .setColor(0x5865F2)
           .setTitle('📝 Leave a Vouch')
-          .setDescription('We value your feedback!\nClick the button below to leave a vouch.\n\n**Your feedback helps us grow** 💡')
+          .setDescription(
+            '**Share your experience with ZEROPOINT!**\n\n' +
+            '> Did you love our products? Let the community know!\n' +
+            '> Your feedback helps us grow and improve our services.\n\n' +
+            '**How it works:**\n' +
+            '> `1.` Click the **Leave a Vouch** button below\n' +
+            '> `2.` Rate your experience from 1-5 stars ⭐\n' +
+            '> `3.` Write a short review about your experience\n' +
+            '> `4.` Optionally attach a screenshot\n\n' +
+            '**All vouches are reviewed and posted publicly.** 🏆'
+          )
           .setFooter({ text: `${BOT_NAME} | ${SITE_URL}`, iconURL: client.user.displayAvatarURL() });
         brandEmbed(embed, interaction.guild);
         const row = new ActionRowBuilder().addComponents(
@@ -5122,6 +5137,7 @@ client.on('interactionCreate', async interaction => {
             `If you need help, open a support ticket.`
           )
           .setFooter({ text: BOT_NAME, iconURL: client.user.displayAvatarURL() });
+        brandEmbed(embed, interaction.guild);
 
         const row = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('redeem_open_modal').setLabel('Redeem Key').setEmoji('🔑').setStyle(ButtonStyle.Primary)
@@ -5150,6 +5166,7 @@ client.on('interactionCreate', async interaction => {
             `Your Invoice ID and email are on your order confirmation.`
           )
           .setFooter({ text: BOT_NAME, iconURL: client.user.displayAvatarURL() });
+        brandEmbed(embed, interaction.guild);
 
         const row = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('claim_customer_open').setLabel('Claim').setEmoji('🎫').setStyle(ButtonStyle.Success)
@@ -5216,7 +5233,7 @@ client.on('interactionCreate', async interaction => {
         const key = cmd.replace('post-', '');
         const meta = CONTENT_TYPES[key];
 
-        const embeds = await buildContentEmbeds(interaction.guild.id, key);
+        const embeds = await buildContentEmbeds(interaction.guild.id, key, interaction.guild);
         if (!embeds) {
           return interaction.reply({ content: `❌ No ${meta.label} content set yet. Run \`/set-${key}\` first.`, flags: 64 });
         }
@@ -7110,6 +7127,7 @@ client.on('interactionCreate', async interaction => {
         const embed = new EmbedBuilder().setTitle('Status Change').setColor(getProductColor(product)).addFields(fields)
           .setFooter({ text: `${BOT_NAME} | ${SITE_URL}`, iconURL: client.user.displayAvatarURL() }).setTimestamp();
         if (ssLong) embed.setDescription(clampDescription(ssNotes));
+        brandEmbed(embed, interaction.guild);
         const statusCh = findChannelByName(interaction.guild, 'statusupdates') || interaction.channel;
         let pingText = '@everyone';
         if (pingStr) { const clean = pingStr.replace('@','').trim().toLowerCase(); if (clean==='everyone') pingText='@everyone'; else if (clean==='here') pingText='@here'; else { const rm=pingStr.match(/\d+/); if(rm) pingText=`<@&${rm[0]}>`; else { const r=interaction.guild.roles.cache.find(r=>r.name.toLowerCase()===clean); if(r) pingText=`<@&${r.id}>`; } } }
