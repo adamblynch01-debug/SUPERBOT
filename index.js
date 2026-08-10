@@ -434,7 +434,7 @@ const SITE_URL  = process.env.SITE_URL  || '';
 // allowed to be blank above (the footer just prints nothing), but a Link button
 // with a blank URL REJECTS THE WHOLE MESSAGE, so anything that becomes a button
 // goes through this one instead.
-const STORE_URL = (process.env.SITE_URL || 'https://uhservices.xyz').replace(/\/+$/, '');
+const STORE_URL = (process.env.SITE_URL || 'https://zeropoint.wtf').replace(/\/+$/, '');
 const DOWNLOADS_URL = `${STORE_URL}/downloads`;
 // #downloads held two bot posts — a bare @everyone link, and the product
 // dropdowns — and the ask was to make them one. The marker is what lets the
@@ -2020,7 +2020,7 @@ const productLastStatus  = {};
 // recollection. See /setwebsite below.
 const resellerMessages   = {};
 const pendingUpdates     = {};
-const resellerLinks      = { apply: 'https://uhservices.xyz/', panel: 'https://uhservices.xyz/' };
+const resellerLinks      = { apply: 'https://zeropoint.wtf/', panel: 'https://zeropoint.wtf/' };
 // Competitor-detection: server IDs to watch for on join, role to tag flagged members with, and a staff log channel.
 const competitorWatch    = { guildIds: [], roleId: null, logChannel: 'mod-log' };
 
@@ -6290,7 +6290,7 @@ client.on('interactionCreate', async interaction => {
             .addFields({
               name: 'Site account',
               value: v.account_created
-                ? `Created **${v.username}** — they can sign in at uhservices.xyz with **SIGN IN WITH DISCORD**.`
+                ? `Created **${v.username}** — they can sign in at zeropoint.wtf with **SIGN IN WITH DISCORD**.`
                 : `Linked to **${v.username}**.`,
               inline: false,
             }, {
@@ -6899,8 +6899,8 @@ client.on('interactionCreate', async interaction => {
               {
                 name: v.account_created ? '🆕 Account created' : '👤 Your account',
                 value: v.account_created
-                  ? `**${v.username}** — sign in at https://uhservices.xyz with **SIGN IN WITH DISCORD** to see your orders and redeem your keys. No password needed.`
-                  : `**${v.username}** — your orders are at https://uhservices.xyz/account`,
+                  ? `**${v.username}** — sign in at https://zeropoint.wtf with **SIGN IN WITH DISCORD** to see your orders and redeem your keys. No password needed.`
+                  : `**${v.username}** — your orders are at https://zeropoint.wtf/account`,
                 inline: false,
               },
               {
