@@ -50,7 +50,7 @@ const LEGACY_PRODUCTS = [
   'ACTIVE MATTER - ARCANE', 'ARENA BREAKOUT INFINITE - FULL', 'BATTLEFIELD - ANCIENT',
   'BATTLEFIELD - ARCANE', 'CALL OF DUTY - BLITZ EXTERNAL', 'CALL OF DUTY - ZENITH V3 (BO7)',
   'CALL OF DUTY - ZENITH BO6 INTERNAL', 'CALL OF DUTY - GHOST INTERNAL MW3',
-  'CALL OF DUTY - GHOST INTERNAL MW19', 'CALL OF DUTY - H8ED.EXE', 'CS2 / CSGO - PREDATOR',
+  'CALL OF DUTY - GHOST INTERNAL MW19', 'CALL OF DUTY - ONTOP.EXE', 'CS2 / CSGO - PREDATOR',
   'DARK & DARKER - ARCANE', 'DAYZ - EXTERNAL', 'DAYZ - CHEVRON', 'DEAD BY DAYLIGHT - ARCANE',
   'DEADSIDE - ARCANE', 'DELTA FORCE - FULL', 'DELTA FORCE - EXODUS EXTERNAL',
   'DUNE AWAKENING - ARCANE', 'ESCAPE FROM TARKOV - ANCIENT CHAMS',
@@ -104,7 +104,7 @@ function slugify(name) {
 // is keyed by the catalog product NAME, and the website resolves an
 // entitlement by matching that same name against the order's items snapshot
 // (backend routes/downloads.js). Rename the key and the one link that is
-// already saved — "H8ED Private External" — stops resolving. So the game rides
+// already saved — "ONTOP Private External" — stops resolving. So the game rides
 // along as a separate display field.
 function displayLabel(name, game) {
   const n = String(name || '').trim();

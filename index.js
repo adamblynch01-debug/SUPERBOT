@@ -2865,7 +2865,7 @@ async function refreshOneStatusPanel(guildId, ref, built, force) {
 
 // ─── Announced status → actual status ────────────────────────────────────────
 // The update forms take a product name as free text, so it rarely matches the
-// catalog exactly ("C0D B07 - H8ED EXTERNAL" for "H8ED Private External").
+// catalog exactly ("C0D B07 - ONTOP EXTERNAL" for "ONTOP Private External").
 //
 // The one thing this must never do is guess. A wrong match sets the WRONG
 // product's status on the public website, which is worse than not syncing at
@@ -2890,8 +2890,8 @@ async function resolveStatusProduct(typed) {
   if (exact.length > 1) return { match: null, candidates: exact };
 
   // One name contained in the other — catches both the typed prefix
-  // ("H8ED PRIVATE EXTERNAL" for "COD - H8ED Private External") and the typed
-  // extra ("C0D B07 - H8ED PRIVATE EXTERNAL").
+  // ("ONTOP PRIVATE EXTERNAL" for "COD - ONTOP Private External") and the typed
+  // extra ("C0D B07 - ONTOP PRIVATE EXTERNAL").
   const contains = rows.filter(r => {
     const p = normProductName(r.product_name);
     return p && (t.includes(p) || p.includes(t));
