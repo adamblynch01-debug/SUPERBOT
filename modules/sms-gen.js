@@ -22,6 +22,7 @@ const path = require('path');
 const db   = require('../db');
 const { logGeneration } = require('./genLog');
 const { languageRow } = require('./translate');
+const brandEmbed = require('./brandEmbed');
 
 // ─── Order persistence ────────────────────────────────────────────────────────
 // Buying a number spends REAL provider credit. Orders used to live only in the
@@ -601,8 +602,8 @@ function buildOrderButtons(orderId, disabled = false, number = null, resendEnabl
 }
 
 // ─── Panel ────────────────────────────────────────────────────────────────────
-function buildPanelEmbed() {
-  return new EmbedBuilder()
+function buildPanelEmbed(guild) {
+  const embed = new EmbedBuilder()
     .setColor(0x5865f2)
     .setTitle('📲 SMS Number Generator')
     .setDescription(
@@ -624,9 +625,11 @@ function buildPanelEmbed() {
       '> Hit **🚫 Cancel & Refund** to get your balance back and try a different number\n' +
       '> Numbers auto-cancel after **5 minutes** if no SMS arrives'
     )
-    .setImage('https://media.discordapp.net/attachments/1521288246573797418/1536183475630117034/ZEROPOINT_BANNER.png?ex=6a7a79d9&is=6a792859&hm=724513811a7f39bf0c2eab470e01765f8ebb7351c472869a1349a2bd970808f5&=&format=webp&quality=lossless&width=1280&height=511')
     .setFooter({ text: 'ZEROPOINT • SMS Gen' })
     .setTimestamp();
+
+  brandEmbed(embed, guild);
+  return embed;
 }
 
 function buildPanelButton() {
@@ -876,7 +879,7 @@ async function handleSMSInteraction(interaction, client) {
   if (interaction.commandName === 'post-smsgen') {
     await interaction.deferReply({ ephemeral: true });
     const target = interaction.options.getChannel('channel') || interaction.channel;
-    await target.send({ embeds: [buildPanelEmbed()], components: [buildPanelButton(), languageRow()] });
+    await target.send({ embeds: [buildPanelEmbed(interaction.guild)], components: [buildPanelButton(), languageRow()] });
     return interaction.editReply({ content: `✅ SMS Gen panel posted in <#${target.id}>` });
   }
 
