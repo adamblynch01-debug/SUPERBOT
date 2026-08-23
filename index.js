@@ -1030,11 +1030,13 @@ async function buildUsefulLinksEmbed(guildId) {
   const description = links.length
     ? links.map((l, i) => `**${i + 1}.** [${l.label}](${l.url})`).join('\n')
     : 'No links added yet.';
-  return new EmbedBuilder()
+  const embed = new EmbedBuilder()
     .setColor(0x5865F2)
     .setTitle('🔗 Useful Links')
     .setDescription(description)
     .setFooter({ text: BOT_NAME, iconURL: client.user.displayAvatarURL() });
+  brandEmbed(embed);
+  return embed;
 }
 
 // ─── Redeemable time-limited role keys — migrated to Postgres ─────────────
