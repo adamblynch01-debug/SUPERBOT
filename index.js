@@ -4088,6 +4088,7 @@ client.on('interactionCreate', async interaction => {
           .setTitle('🔐 Verify to Access the Server')
           .setDescription('Welcome! To gain access to all channels, click the **Verify** button below.\n\nBy verifying, you agree to follow our server rules.')
           .setColor(0x5865f2).setFooter({ text: 'Click once — verification is instant!' });
+        brandEmbed(embed, guild);
         const row = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('verify_button').setLabel('✅ Verify Me').setStyle(ButtonStyle.Primary)
         );
@@ -7335,6 +7336,8 @@ client.on('interactionCreate', async interaction => {
           .setDescription(url)
           .setFooter({ text: `${BOT_NAME}${SITE_URL ? ` | ${SITE_URL}` : ''}`, iconURL: client.user.displayAvatarURL() })
           .setTimestamp();
+
+        brandEmbed(embed, interaction.guild);
 
         try {
           if (!targetCh.isTextBased()) throw new Error('That channel is not a text channel.');
