@@ -82,6 +82,8 @@ const serverBackup = require('./modules/serverBackup');
 const mirror = require('./modules/mirror');
 const counting = require('./modules/counting');
 const { money: gxMoney } = require('./modules/money');
+const totp2fa = require('./modules/totp2fa');
+const { getBannerAttachment: getBanner } = require('./modules/brandEmbed');
 
 // ─── Mirror relay state ───────────────────────────────────────────────────────
 // Three pieces of memory, all of them there to stop a loop or a stampede.
@@ -441,14 +443,19 @@ const DOWNLOADS_URL = `${STORE_URL}/downloads`;
 // Applies consistent branding to any embed: logo top-left (author), thumbnail
 // top-right, and the banner image at the bottom. Call brandEmbed(embed, guild)
 // anywhere in the codebase — or brandEmbed(embed) when no guild is available.
-const ZEROPOINT_BANNER = 'https://media.discordapp.net/attachments/1521288246573797418/1536183475630117034/ZEROPOINT_BANNER.png?ex=6a7a79d9&is=6a792859&hm=724513811a7f39bf0c2eab470e01765f8ebb7351c472869a1349a2bd970808f5&=&format=webp&quality=lossless&width=1280&height=511';
+const ZEROPOINT_BANNER = 'attachment://zeropoint_banner.png'; // Using local file to avoid CDN expiration
 function brandEmbed(embed, guild) {
   const iconURL = (guild && guild.iconURL({ size: 128 })) || null;
   const thumbURL = (guild && guild.iconURL({ size: 256 })) || null;
   if (iconURL) embed.setAuthor({ name: BOT_NAME, iconURL });
   if (thumbURL) embed.setThumbnail(thumbURL);
-  embed.setImage(ZEROPOINT_BANNER);
+  embed.setImage(ZEROPOINT_BANNER); // Uses attachment://zeropoint_banner.png
   return embed;
+}
+
+// Helper to get banner attachment for message sends
+function getBannerAttachment() {
+  return getBanner();
 }
 // #downloads held two bot posts — a bare @everyone link, and the product
 // dropdowns — and the ask was to make them one. The marker is what lets the
@@ -3399,6 +3406,22 @@ const ownCommands = [
   new SlashCommandBuilder().setName('post-status-vault').setDescription('Post vault product stock (IN STOCK / SOLD OUT) to a channel')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
     .addChannelOption(o => o.setName('channel').setDescription('Channel to post into (defaults to here)').setRequired(false)),
+
+  // ─── 2FA / TOTP Commands ───────────────────────────────────────────────────
+  new SlashCommandBuilder()
+    .setName('get2fa')
+    .setDescription('Staff: Get current 2FA code for a Microsoft account')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
+    .addStringOption(o => o.setName('email').setDescription('Account email address').setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('list2fa')
+    .setDescription('Staff: List all accounts with 2FA enabled')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+  new SlashCommandBuilder()
+    .setName('load2fa')
+    .setDescription('Admin: Load/reload TOTP accounts from file')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addStringOption(o => o.setName('filename').setDescription('File in DATA_DIR (default: outlook_accounts.txt)').setRequired(false)),
 ].map(c => c.toJSON());
 
 // Merge with support module commands
