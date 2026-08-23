@@ -4869,6 +4869,8 @@ client.on('interactionCreate', async interaction => {
           )
           .setFooter({ text: BOT_NAME, iconURL: client.user.displayAvatarURL() });
 
+        brandEmbed(embed, interaction.guild);
+
         // Chunked into rows of 5. Discord rejects the whole message if a row is
         // over-full, which would silently break the panel the moment someone
         // adds a fifth or sixth account type.
