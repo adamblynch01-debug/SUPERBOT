@@ -6727,10 +6727,10 @@ client.on('interactionCreate', async interaction => {
         modal.addComponents(
           new ActionRowBuilder().addComponents(
             new TextInputBuilder()
-              .setCustomId('account_email')
-              .setLabel('Account Email')
+              .setCustomId('totp_secret')
+              .setLabel('TOTP Secret / Authentication Code')
               .setStyle(TextInputStyle.Short)
-              .setPlaceholder('example@outlook.com')
+              .setPlaceholder('JBSWY3DPEHPK3PXP')
               .setRequired(true)
               .setMaxLength(100)
           )
@@ -6936,31 +6936,86 @@ client.on('interactionCreate', async interaction => {
       if (interaction.customId === 'gensteam_2fa_modal') {
         await interaction.deferReply({ ephemeral: true });
 
-        const email = interaction.fields.getTextInputValue('account_email').trim().toLowerCase();
-        const result = totp2fa.generate2FA(email);
+        const totpSecret = interaction.fields.getTextInputValue('totp_secret').trim().toUpperCase().replace(/\s+/g, '');
 
-        if (result.error) {
-          return interaction.editReply({ content: `❌ ${result.error}`, ephemeral: true });
+        // Validate base32 format (TOTP secrets are base32 encoded)
+        if (!/^[A-Z2-7]+=*$/.test(totpSecret)) {
+          return interaction.editReply({
+            content: '❌ Invalid TOTP secret format. Please enter a valid base32 secret (letters A-Z and numbers 2-7).\n\nExample: `JBSWY3DPEHPK3PXP`',
+            ephemeral: true
+          });
         }
 
-        const embed = new EmbedBuilder()
-          .setTitle('🔐 2FA Code Generated')
-          .setDescription(`**Account:** ${result.email}\n**Code:** \`${result.code}\``)
-          .addFields(
-            { name: 'Expires In', value: `${result.remaining} seconds`, inline: true },
-            { name: 'Valid Until', value: `<t:${Math.floor(result.expiresAt.getTime() / 1000)}:T>`, inline: true }
-          )
-          .setColor(0x00ff00)
-          .setFooter({ text: 'Codes refresh every 30 seconds' })
-          .setTimestamp();
+        // Generate code using TOTP module with the provided secret
+        try {
+          const crypto = require('crypto');
 
-        brandEmbed(embed, interaction.guild);
+          // TOTP implementation
+          const base32Decode = (encoded) => {
+            encoded = encoded.toUpperCase().replace(/=+$/, '');
+            const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+            let bits = '';
+            for (let i = 0; i < encoded.length; i++) {
+              const val = alphabet.indexOf(encoded[i]);
+              if (val === -1) throw new Error('Invalid base32 character');
+              bits += val.toString(2).padStart(5, '0');
+            }
+            const bytes = [];
+            for (let i = 0; i + 8 <= bits.length; i += 8) {
+              bytes.push(parseInt(bits.substr(i, 8), 2));
+            }
+            return Buffer.from(bytes);
+          };
 
-        const banner = getBannerAttachment();
-        const payload = { embeds: [embed], ephemeral: true };
-        if (banner) payload.files = [banner];
+          const secret = base32Decode(totpSecret);
+          const period = 30;
+          const timeCounter = Math.floor(Date.now() / 1000 / period);
 
-        return interaction.editReply(payload);
+          // Generate HMAC
+          const buffer = Buffer.alloc(8);
+          for (let i = 7; i >= 0; i--) {
+            buffer[i] = timeCounter & 0xff;
+            timeCounter = timeCounter >> 8;
+          }
+
+          const hmac = crypto.createHmac('sha1', secret);
+          hmac.update(buffer);
+          const hash = hmac.digest();
+
+          const offset = hash[hash.length - 1] & 0xf;
+          const binary =
+            ((hash[offset] & 0x7f) << 24) |
+            ((hash[offset + 1] & 0xff) << 16) |
+            ((hash[offset + 2] & 0xff) << 8) |
+            (hash[offset + 3] & 0xff);
+
+          const code = (binary % Math.pow(10, 6)).toString().padStart(6, '0');
+          const remaining = period - (Math.floor(Date.now() / 1000) % period);
+
+          const embed = new EmbedBuilder()
+            .setTitle('🔐 2FA Code Generated')
+            .setDescription(`**Your Code:** \`${code}\``)
+            .addFields(
+              { name: 'Expires In', value: `${remaining} seconds`, inline: true },
+              { name: 'Valid Until', value: `<t:${Math.floor((Date.now() / 1000) + remaining)}:T>`, inline: true }
+            )
+            .setColor(0x00ff00)
+            .setFooter({ text: 'Codes refresh every 30 seconds' })
+            .setTimestamp();
+
+          brandEmbed(embed, interaction.guild);
+
+          const banner = getBannerAttachment();
+          const payload = { embeds: [embed], ephemeral: true };
+          if (banner) payload.files = [banner];
+
+          return interaction.editReply(payload);
+        } catch (err) {
+          return interaction.editReply({
+            content: `❌ Failed to generate code: ${err.message}\n\nMake sure your TOTP secret is valid.`,
+            ephemeral: true
+          });
+        }
       }
 
       // Claim panel modal — verify a paid order → grant the Customer role
