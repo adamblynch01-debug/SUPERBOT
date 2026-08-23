@@ -443,7 +443,7 @@ const DOWNLOADS_URL = `${STORE_URL}/downloads`;
 // Applies consistent branding to any embed: logo top-left (author), thumbnail
 // top-right, and the banner image at the bottom. Call brandEmbed(embed, guild)
 // anywhere in the codebase — or brandEmbed(embed) when no guild is available.
-const ZEROPOINT_BANNER = 'https://i.imgur.com/mhpInjQ.png'; // Hosted on imgur
+const ZEROPOINT_BANNER = 'https://zeropoint.wtf/zeropoint_banner.png'; // Hosted on website
 function brandEmbed(embed, guild) {
   const iconURL = (guild && guild.iconURL({ size: 128 })) || null;
   const thumbURL = (guild && guild.iconURL({ size: 256 })) || null;
