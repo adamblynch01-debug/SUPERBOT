@@ -6973,9 +6973,10 @@ client.on('interactionCreate', async interaction => {
 
           // Generate HMAC
           const buffer = Buffer.alloc(8);
+          let tc = timeCounter;
           for (let i = 7; i >= 0; i--) {
-            buffer[i] = timeCounter & 0xff;
-            timeCounter = timeCounter >> 8;
+            buffer[i] = tc & 0xff;
+            tc = tc >> 8;
           }
 
           const hmac = crypto.createHmac('sha1', secret);
