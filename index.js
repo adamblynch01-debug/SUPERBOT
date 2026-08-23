@@ -443,13 +443,13 @@ const DOWNLOADS_URL = `${STORE_URL}/downloads`;
 // Applies consistent branding to any embed: logo top-left (author), thumbnail
 // top-right, and the banner image at the bottom. Call brandEmbed(embed, guild)
 // anywhere in the codebase — or brandEmbed(embed) when no guild is available.
-const ZEROPOINT_BANNER = 'attachment://zeropoint_banner.png'; // Using local file to avoid CDN expiration
+const ZEROPOINT_BANNER = 'https://i.imgur.com/mhpInjQ.png'; // Hosted on imgur
 function brandEmbed(embed, guild) {
   const iconURL = (guild && guild.iconURL({ size: 128 })) || null;
   const thumbURL = (guild && guild.iconURL({ size: 256 })) || null;
   if (iconURL) embed.setAuthor({ name: BOT_NAME, iconURL });
   if (thumbURL) embed.setThumbnail(thumbURL);
-  embed.setImage(ZEROPOINT_BANNER); // Uses attachment://zeropoint_banner.png
+  embed.setImage(ZEROPOINT_BANNER); // Banner at bottom of embed
   return embed;
 }
 
@@ -614,7 +614,7 @@ async function endGiveaway(msgId, why = 'timer') {
       .setFooter({ text: `${BOT_NAME} | ${SITE_URL} • ${MARK_GW_RESULTS}`, iconURL: client.user.displayAvatarURL() })
       .setTimestamp();
     brandEmbed(resultsEmbed, gwGuild);
-    await gwCh.send(withBanner(withLanguageRow({ content: winnersText || '❌ No participants — no winner.', embeds: [resultsEmbed] })));
+    await gwCh.send(withLanguageRow({ content: winnersText || '❌ No participants — no winner.', embeds: [resultsEmbed] }));
   } catch (e) { console.error(`Giveaway end error (${why}):`, e); }
 }
 
@@ -4188,7 +4188,7 @@ client.on('interactionCreate', async interaction => {
           new ButtonBuilder().setCustomId('check_invites').setLabel('📊 Check Your Invites').setStyle(ButtonStyle.Secondary),
           new ButtonBuilder().setCustomId('redeem_key').setLabel('🎁 Redeem Your Key').setStyle(ButtonStyle.Success),
         );
-        await invCh.send(withBanner(withLanguageRow({ embeds: [embed], components: [row] })));
+        await invCh.send(withLanguageRow({ embeds: [embed], components: [row] }));
         // Naming the channel, because the failure this fixes was silent: the
         // command said "set up!" while the panel went into the log. If the
         // answer below is not the channel the operator meant, they can see so
@@ -4642,7 +4642,7 @@ client.on('interactionCreate', async interaction => {
         const row = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('leave_vouch').setLabel('📝 Leave a Vouch').setStyle(ButtonStyle.Primary),
         );
-        await targetCh.send(withBanner(withLanguageRow({ embeds: [embed], components: [row] })));
+        await targetCh.send(withLanguageRow({ embeds: [embed], components: [row] }));
         // Store which channel to post received vouches into
         const existing = vouchData.get(interaction.guild.id) || { count: 0, channelId: resultsCh.id, entries: [] };
         existing.channelId = resultsCh.id;
@@ -4890,7 +4890,7 @@ client.on('interactionCreate', async interaction => {
         // post. It was the one that got missed. withLanguageRow drops the row
         // rather than the panel if the account types ever grow past four rows
         // of buttons.
-        await channel.send(withBanner(withLanguageRow({ embeds: [embed], components: [...genRows, utilRow] })));
+        await channel.send(withLanguageRow({ embeds: [embed], components: [...genRows, utilRow] }));
         await interaction.reply({ content: `✅ Posted the generator panel in <#${channel.id}>.`, flags: 64 });
         return;
       }
@@ -5172,7 +5172,7 @@ client.on('interactionCreate', async interaction => {
           new ButtonBuilder().setCustomId('redeem_open_modal').setLabel('Redeem Key').setEmoji('🔑').setStyle(ButtonStyle.Primary)
         );
 
-        await channel.send(withBanner(withLanguageRow({ embeds: [embed], components: [row] })));
+        await channel.send(withLanguageRow({ embeds: [embed], components: [row] }));
         await interaction.reply({ content: `✅ Posted the redeem panel in <#${channel.id}>.`, flags: 64 });
         return;
       }
@@ -5201,7 +5201,7 @@ client.on('interactionCreate', async interaction => {
           new ButtonBuilder().setCustomId('claim_customer_open').setLabel('Claim').setEmoji('🎫').setStyle(ButtonStyle.Success)
         );
 
-        await channel.send(withBanner(withLanguageRow({ embeds: [embed], components: [row] })));
+        await channel.send(withLanguageRow({ embeds: [embed], components: [row] }));
         await interaction.reply({ content: `✅ Posted the claim panel in <#${channel.id}>.`, flags: 64 });
         return;
       }
@@ -7233,7 +7233,7 @@ client.on('interactionCreate', async interaction => {
         try {
           // The ping and, under it, any link from the body as a bare URL — the
           // only place Discord will draw a preview card for it.
-          const posted = await targetCh.send(withBanner(withLanguageRow({ content: withPreview(pingText, body, { skip: [dlUrl] }), embeds: [embed], ...(buttonRow ? { components: [buttonRow] } : {}) })));
+          const posted = await targetCh.send(withLanguageRow({ content: withPreview(pingText, body, { skip: [dlUrl] }), embeds: [embed], ...(buttonRow ? { components: [buttonRow] } : {}) }));
           await interaction.reply({ content: `✅ Announcement posted to <#${targetCh.id}>`, flags: 64 }); autoDelete(interaction, 5000);
           // Offered here even when the announcement went to another channel:
           // the admin is typing in THIS one, so this is where they can drop a
@@ -7275,7 +7275,7 @@ client.on('interactionCreate', async interaction => {
         }
 
         try {
-          const posted = await statusCh.send(withBanner(withLanguageRow({ content: withPreview(pingText, ssNotes), embeds: [embed] })));
+          const posted = await statusCh.send(withLanguageRow({ content: withPreview(pingText, ssNotes), embeds: [embed] }));
           await interaction.editReply({ content: `✅ Status update posted to <#${statusCh.id}>${describeSync(siteSync)}` });
           autoDelete(interaction, siteSync && !siteSync.ok ? 30000 : 5000);
           offerImageUpload({ interaction, message: posted, embed, fileBase: `status-${posted.id}` });
