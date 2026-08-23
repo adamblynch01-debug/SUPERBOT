@@ -457,6 +457,16 @@ function brandEmbed(embed, guild) {
 function getBannerAttachment() {
   return getBanner();
 }
+
+// Helper to add banner to any message payload that uses brandEmbed
+function withBanner(payload) {
+  const banner = getBannerAttachment();
+  if (banner) {
+    if (!payload.files) payload.files = [];
+    payload.files.push(banner);
+  }
+  return payload;
+}
 // #downloads held two bot posts — a bare @everyone link, and the product
 // dropdowns — and the ask was to make them one. The marker is what lets the
 // command find and EDIT the merged panel instead of adding a third.
@@ -604,7 +614,7 @@ async function endGiveaway(msgId, why = 'timer') {
       .setFooter({ text: `${BOT_NAME} | ${SITE_URL} • ${MARK_GW_RESULTS}`, iconURL: client.user.displayAvatarURL() })
       .setTimestamp();
     brandEmbed(resultsEmbed, gwGuild);
-    await gwCh.send(withLanguageRow({ content: winnersText || '❌ No participants — no winner.', embeds: [resultsEmbed] }));
+    await gwCh.send(withBanner(withLanguageRow({ content: winnersText || '❌ No participants — no winner.', embeds: [resultsEmbed] })));
   } catch (e) { console.error(`Giveaway end error (${why}):`, e); }
 }
 
@@ -4178,7 +4188,7 @@ client.on('interactionCreate', async interaction => {
           new ButtonBuilder().setCustomId('check_invites').setLabel('📊 Check Your Invites').setStyle(ButtonStyle.Secondary),
           new ButtonBuilder().setCustomId('redeem_key').setLabel('🎁 Redeem Your Key').setStyle(ButtonStyle.Success),
         );
-        await invCh.send(withLanguageRow({ embeds: [embed], components: [row] }));
+        await invCh.send(withBanner(withLanguageRow({ embeds: [embed], components: [row] })));
         // Naming the channel, because the failure this fixes was silent: the
         // command said "set up!" while the panel went into the log. If the
         // answer below is not the channel the operator meant, they can see so
@@ -4632,7 +4642,7 @@ client.on('interactionCreate', async interaction => {
         const row = new ActionRowBuilder().addComponents(
           new ButtonBuilder().setCustomId('leave_vouch').setLabel('📝 Leave a Vouch').setStyle(ButtonStyle.Primary),
         );
-        await targetCh.send(withLanguageRow({ embeds: [embed], components: [row] }));
+        await targetCh.send(withBanner(withLanguageRow({ embeds: [embed], components: [row] })));
         // Store which channel to post received vouches into
         const existing = vouchData.get(interaction.guild.id) || { count: 0, channelId: resultsCh.id, entries: [] };
         existing.channelId = resultsCh.id;
@@ -4880,7 +4890,7 @@ client.on('interactionCreate', async interaction => {
         // post. It was the one that got missed. withLanguageRow drops the row
         // rather than the panel if the account types ever grow past four rows
         // of buttons.
-        await channel.send(withLanguageRow({ embeds: [embed], components: [...genRows, utilRow] }));
+        await channel.send(withBanner(withLanguageRow({ embeds: [embed], components: [...genRows, utilRow] })));
         await interaction.reply({ content: `✅ Posted the generator panel in <#${channel.id}>.`, flags: 64 });
         return;
       }
@@ -5162,7 +5172,7 @@ client.on('interactionCreate', async interaction => {
           new ButtonBuilder().setCustomId('redeem_open_modal').setLabel('Redeem Key').setEmoji('🔑').setStyle(ButtonStyle.Primary)
         );
 
-        await channel.send(withLanguageRow({ embeds: [embed], components: [row] }));
+        await channel.send(withBanner(withLanguageRow({ embeds: [embed], components: [row] })));
         await interaction.reply({ content: `✅ Posted the redeem panel in <#${channel.id}>.`, flags: 64 });
         return;
       }
@@ -5191,7 +5201,7 @@ client.on('interactionCreate', async interaction => {
           new ButtonBuilder().setCustomId('claim_customer_open').setLabel('Claim').setEmoji('🎫').setStyle(ButtonStyle.Success)
         );
 
-        await channel.send(withLanguageRow({ embeds: [embed], components: [row] }));
+        await channel.send(withBanner(withLanguageRow({ embeds: [embed], components: [row] })));
         await interaction.reply({ content: `✅ Posted the claim panel in <#${channel.id}>.`, flags: 64 });
         return;
       }
@@ -7223,7 +7233,7 @@ client.on('interactionCreate', async interaction => {
         try {
           // The ping and, under it, any link from the body as a bare URL — the
           // only place Discord will draw a preview card for it.
-          const posted = await targetCh.send(withLanguageRow({ content: withPreview(pingText, body, { skip: [dlUrl] }), embeds: [embed], ...(buttonRow ? { components: [buttonRow] } : {}) }));
+          const posted = await targetCh.send(withBanner(withLanguageRow({ content: withPreview(pingText, body, { skip: [dlUrl] }), embeds: [embed], ...(buttonRow ? { components: [buttonRow] } : {}) })));
           await interaction.reply({ content: `✅ Announcement posted to <#${targetCh.id}>`, flags: 64 }); autoDelete(interaction, 5000);
           // Offered here even when the announcement went to another channel:
           // the admin is typing in THIS one, so this is where they can drop a
@@ -7265,7 +7275,7 @@ client.on('interactionCreate', async interaction => {
         }
 
         try {
-          const posted = await statusCh.send(withLanguageRow({ content: withPreview(pingText, ssNotes), embeds: [embed] }));
+          const posted = await statusCh.send(withBanner(withLanguageRow({ content: withPreview(pingText, ssNotes), embeds: [embed] })));
           await interaction.editReply({ content: `✅ Status update posted to <#${statusCh.id}>${describeSync(siteSync)}` });
           autoDelete(interaction, siteSync && !siteSync.ok ? 30000 : 5000);
           offerImageUpload({ interaction, message: posted, embed, fileBase: `status-${posted.id}` });
