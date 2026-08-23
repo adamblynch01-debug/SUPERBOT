@@ -12,6 +12,7 @@ const db   = require('../db');
 // The language dropdown, appended to the support panel so a member who does
 // not read English can at least read the button labels' explanation.
 const { languageRow } = require('./translate');
+const brandEmbed = require('./brandEmbed');
 
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..');
 if (DATA_DIR !== path.join(__dirname, '..') && !fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -242,8 +243,10 @@ async function handleInteraction(interaction, client) {
         '**TYPE !close IF YOU HAVE MULTIPLE TICKETS**\n\n' +
         '**How it works**\n1. Click the appropriate button below\n2. I\'ll DM you to start a conversation\n3. Describe your issue and I\'ll help!\n\n' +
         '© 2026 ZEROPOINT. All rights reserved.'
-      )
-      .setImage('https://media.discordapp.net/attachments/1521288246573797418/1536183475630117034/ZEROPOINT_BANNER.png?ex=6a7a79d9&is=6a792859&hm=724513811a7f39bf0c2eab470e01765f8ebb7351c472869a1349a2bd970808f5&=&format=webp&quality=lossless&width=1280&height=511');
+      );
+
+    brandEmbed(embed, interaction.guild);
+
     // Exactly 5 buttons — Discord's limit for one action row. A sixth type
     // needs a second row, not another entry here.
     const row = new ActionRowBuilder().addComponents(
