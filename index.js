@@ -4870,7 +4870,8 @@ client.on('interactionCreate', async interaction => {
           genRows.push(new ActionRowBuilder().addComponents(...genButtons.slice(i, i + 5)));
         }
         const utilRow = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId('gensteam_check_stock').setLabel('Check Stock').setEmoji('📦').setStyle(ButtonStyle.Secondary)
+          new ButtonBuilder().setCustomId('gensteam_check_stock').setLabel('Check Stock').setEmoji('📦').setStyle(ButtonStyle.Secondary),
+          new ButtonBuilder().setCustomId('gensteam_get_2fa').setLabel('Get 2FA Code').setEmoji('🔐').setStyle(ButtonStyle.Secondary)
         );
 
         // The generator panel is a post customers READ before they press
@@ -6720,6 +6721,23 @@ client.on('interactionCreate', async interaction => {
         return interaction.reply({ embeds: [await buildStockEmbed(guild.id)], flags: 64 });
       }
 
+      // Steam stock panel — Get 2FA Code button
+      if (customId === 'gensteam_get_2fa') {
+        const modal = new ModalBuilder().setCustomId('gensteam_2fa_modal').setTitle('🔐 Get 2FA Code');
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+              .setCustomId('account_email')
+              .setLabel('Account Email')
+              .setStyle(TextInputStyle.Short)
+              .setPlaceholder('example@outlook.com')
+              .setRequired(true)
+              .setMaxLength(100)
+          )
+        );
+        return interaction.showModal(modal);
+      }
+
       // Legacy single "Generate Account" button, kept for any panel posted
       // before the 4-button layout — safe to leave in even after re-posting.
       // Redeem panel — opens the key-entry modal
@@ -6912,6 +6930,37 @@ client.on('interactionCreate', async interaction => {
       if (interaction.customId === 'redeem_modal') {
         const keyInput = interaction.fields.getTextInputValue('redeem_key_input');
         return redeemKey(interaction, keyInput);
+      }
+
+      // 2FA Code Generator modal
+      if (interaction.customId === 'gensteam_2fa_modal') {
+        await interaction.deferReply({ ephemeral: true });
+
+        const email = interaction.fields.getTextInputValue('account_email').trim().toLowerCase();
+        const result = totp2fa.generate2FA(email);
+
+        if (result.error) {
+          return interaction.editReply({ content: `❌ ${result.error}`, ephemeral: true });
+        }
+
+        const embed = new EmbedBuilder()
+          .setTitle('🔐 2FA Code Generated')
+          .setDescription(`**Account:** ${result.email}\n**Code:** \`${result.code}\``)
+          .addFields(
+            { name: 'Expires In', value: `${result.remaining} seconds`, inline: true },
+            { name: 'Valid Until', value: `<t:${Math.floor(result.expiresAt.getTime() / 1000)}:T>`, inline: true }
+          )
+          .setColor(0x00ff00)
+          .setFooter({ text: 'Codes refresh every 30 seconds' })
+          .setTimestamp();
+
+        brandEmbed(embed, interaction.guild);
+
+        const banner = getBannerAttachment();
+        const payload = { embeds: [embed], ephemeral: true };
+        if (banner) payload.files = [banner];
+
+        return interaction.editReply(payload);
       }
 
       // Claim panel modal — verify a paid order → grant the Customer role
